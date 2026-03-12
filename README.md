@@ -2,9 +2,9 @@
 
 A collision-safe file organizer that sorts files into uppercase extension buckets such as `JPG`, `PNG`, and `MP4`.
 
-This project started as a Hermes skill helper and is useful on its own as a standalone script.
+This project began as a Hermes skill helper, but it is also useful as a standalone command-line tool and includes an optional macOS launcher.
 
-## Features
+## What it does
 
 - Organizes files into uppercase extension folders
 - Sends files without extensions to `NO_EXTENSION`
@@ -13,23 +13,18 @@ This project started as a Hermes skill helper and is useful on its own as a stan
 - Supports recursive organization in two modes:
   - `in-place`: each directory organizes its own direct files
   - `flatten-root`: move all files into root-level buckets
-- Optional normalization mode:
+- Optionally normalizes bucket names:
   - uppercases bucket folder names
   - folds `JPEG` and `JPE` into `JPG`
 - Excludes hidden files and folders by default
-- Emits structured JSON output for easy automation
-
-## Files
-
-- `scripts/organize_by_filetype.py` — main Python helper
-- `SKILL.md` — original Hermes skill documentation
-- `launchers/Organize Files by Type.command` — optional macOS quick launcher
+- Emits structured JSON output for scripting and automation
 
 ## Requirements
 
 - Python 3.9+
+- No third-party Python dependencies
 
-## Usage
+## Quick start
 
 Non-recursive:
 
@@ -57,7 +52,7 @@ python3 scripts/organize_by_filetype.py \
   --normalize standard
 ```
 
-Dry run:
+Dry run preview:
 
 ```bash
 python3 scripts/organize_by_filetype.py --path /path/to/folder --dry-run
@@ -78,6 +73,15 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 - `--normalize {none,standard}` — normalization mode
 - `--dry-run` — preview changes without writing
 
+## Behavior and safety
+
+- Buckets are uppercase extension folders such as `JPG`, `PNG`, and `MP4`
+- Alias folding maps `JPEG` and `JPE` to `JPG`
+- Hidden files and folders are skipped unless explicitly included
+- Existing files are never overwritten
+- Name collisions are resolved by suffixing `_1`, `_2`, and so on
+- `flatten-root` intentionally consolidates the directory tree and should only be used when that behavior is desired
+
 ## JSON output
 
 The script prints a JSON summary including:
@@ -91,8 +95,44 @@ The script prints a JSON summary including:
 - normalization stats
 - verification summary
 
-## Notes
+## macOS launcher
 
-- `flatten-root` is intentionally more destructive to directory layout than `in-place`; use it only when you want full consolidation.
-- Hidden files and folders are skipped unless explicitly included.
-- Normalization is especially useful after recursive runs.
+An optional launcher is included at:
+
+- `launchers/Organize Files by Type.command`
+
+It prompts for the target folder and options, runs a dry run preview first, and then asks for confirmation before making changes.
+
+## Repository layout
+
+- `scripts/organize_by_filetype.py` — main Python helper
+- `launchers/Organize Files by Type.command` — optional macOS quick launcher
+- `SKILL.md` — Hermes skill instructions
+- `README.md` — repository-facing documentation
+- `LICENSE` — repository license
+
+## Using with Hermes
+
+This repository is intended to be the canonical source for the Hermes skill as it evolves.
+
+A Hermes install can use this repository directly by linking or copying these files into a skill directory such as:
+
+```text
+~/.hermes/skills/productivity/organize-folder-by-filetype/
+```
+
+At minimum, Hermes needs:
+
+- `SKILL.md`
+- `scripts/organize_by_filetype.py`
+
+If behavior changes, keep the following in sync:
+
+- `scripts/organize_by_filetype.py`
+- `SKILL.md`
+- `README.md`
+- `launchers/Organize Files by Type.command` when relevant
+
+## License
+
+MIT. See `LICENSE`.
