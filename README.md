@@ -1,8 +1,8 @@
 # Organize Folder by File Type
 
-A collision-safe file organizer that sorts files into uppercase extension buckets such as `JPG`, `PNG`, and `MP4`.
+A collision-safe Python tool for sorting folders into uppercase extension buckets such as `JPG`, `PNG`, and `MP4`.
 
-This project began as a Hermes skill helper, but it is also useful as a standalone command-line tool and includes an optional macOS launcher.
+It supports recursive modes, dry-run previews, normalization, and an optional macOS launcher. The project began as a Hermes skill helper, but it is also useful as a standalone command-line tool.
 
 ## What it does
 
@@ -109,6 +109,7 @@ It prompts for the target folder and options, runs a dry run preview first, and 
 - `launchers/Organize Files by Type.command` — optional macOS quick launcher
 - `SKILL.md` — Hermes skill instructions
 - `README.md` — repository-facing documentation
+- `CHANGELOG.md` — notable project history
 - `LICENSE` — repository license
 
 ## Using with Hermes
@@ -132,6 +133,10 @@ If behavior changes, keep the following in sync:
 - `SKILL.md`
 - `README.md`
 - `launchers/Organize Files by Type.command` when relevant
+
+## Changelog
+
+See `CHANGELOG.md` for notable project history.
 
 ## License
 
