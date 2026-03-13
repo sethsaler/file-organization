@@ -8,6 +8,19 @@ This project tracks changes using the Hermes skill version as its public version
 
 - Ongoing improvements, cleanup, and repository polish.
 
+## [1.4.0] - 2026-03-13
+
+### Added
+
+- Optional `--collect-empty-dirs` mode to move collectable empty folder trees into a root-level `For Deletion` folder.
+- Empty-folder collection reporting in the JSON summary, including collision counts and sample moves.
+- Launcher prompt for sending empty folders to `For Deletion`.
+
+### Changed
+
+- Recursive traversal now skips the `For Deletion` review folder so repeated runs leave quarantined empties alone.
+- Updated `README.md` and `SKILL.md` to document empty-folder collection workflow and safety rules.
+
 ## [1.3.1] - 2026-03-12
 
 ### Added

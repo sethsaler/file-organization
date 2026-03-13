@@ -5,9 +5,10 @@ import argparse
 import json
 import os
 import shutil
+import tempfile
 import uuid
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
@@ -16,6 +17,9 @@ ALIAS_MAP_DEFAULT: Dict[str, str] = {
     "JPEG": "JPG",
     "JPE": "JPG",
 }
+
+FOR_DELETION_DIR_NAME = "For Deletion"
+EMPTY_DIR_SAMPLE_LIMIT = 20
 
 
 @dataclass
@@ -34,6 +38,13 @@ class NormalizeStats:
     source_folders_removed: int = 0
 
 
+@dataclass
+class EmptyDirStats:
+    folders_moved: int = 0
+    name_collisions_resolved: int = 0
+    sample_moves: List[Dict[str, str]] = field(default_factory=list)
+
+
 class Organizer:
     def __init__(
         self,
@@ -42,6 +53,7 @@ class Organizer:
         strategy: str,
         include_hidden: bool,
         normalize: str,
+        collect_empty_dirs: bool,
         dry_run: bool,
     ) -> None:
         self.base = base
@@ -49,12 +61,14 @@ class Organizer:
         self.strategy = strategy
         self.include_hidden = include_hidden
         self.normalize = normalize
+        self.collect_empty_dirs = collect_empty_dirs
         self.dry_run = dry_run
 
         self.alias_map = dict(ALIAS_MAP_DEFAULT)
         self.ext_counts = Counter()
         self.move_stats = MoveStats()
         self.normalize_stats = NormalizeStats()
+        self.empty_dir_stats = EmptyDirStats()
 
         # Destination reservation map used for deterministic collision-safe naming.
         # Helps keep behavior predictable, especially in dry-run mode.
@@ -65,11 +79,24 @@ class Organizer:
     def _visible_name(self, name: str) -> bool:
         return self.include_hidden or not name.startswith(".")
 
+    def _is_for_deletion_name(self, name: str) -> bool:
+        return name.casefold() == FOR_DELETION_DIR_NAME.casefold()
+
+    def _should_skip_traversal_dir(self, name: str) -> bool:
+        return name.upper() in self.bucket_names or self._is_for_deletion_name(name)
+
+    def _note_collision(self, collision_counter: str) -> None:
+        if collision_counter == "files":
+            self.move_stats.name_collisions_resolved += 1
+        else:
+            self.empty_dir_stats.name_collisions_resolved += 1
+
     def _collect_extensions(self) -> Set[str]:
         exts: Set[str] = set()
         for root, dirs, files in os.walk(self.base, topdown=True):
             if not self.include_hidden:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
+            dirs[:] = [d for d in dirs if not self._is_for_deletion_name(d)]
             for fn in files:
                 if not self._visible_name(fn):
                     continue
@@ -96,7 +123,7 @@ class Organizer:
                     existing = set()
             self.reserved_names[directory] = existing
 
-    def _collision_safe_target(self, dest_dir: Path, original_name: str) -> Path:
+    def _collision_safe_target(self, dest_dir: Path, original_name: str, collision_counter: str = "files") -> Path:
         self._init_reserved_dir(dest_dir)
         reserved = self.reserved_names[dest_dir]
 
@@ -104,7 +131,7 @@ class Organizer:
             reserved.add(original_name)
             return dest_dir / original_name
 
-        self.move_stats.name_collisions_resolved += 1
+        self._note_collision(collision_counter)
         p = Path(original_name)
         stem, suffix = p.stem, p.suffix
 
@@ -159,8 +186,8 @@ class Organizer:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
                 files = [f for f in files if self._visible_name(f)]
 
-            # Skip traversing known bucket directories.
-            dirs[:] = [d for d in dirs if d.upper() not in self.bucket_names]
+            # Skip traversing organization output directories.
+            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(d)]
 
             if not files:
                 continue
@@ -183,8 +210,8 @@ class Organizer:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
                 files = [f for f in files if self._visible_name(f)]
 
-            # Skip bucket trees to avoid reprocessing newly-created organization folders.
-            dirs[:] = [d for d in dirs if d.upper() not in self.bucket_names]
+            # Skip organization output trees to avoid reprocessing newly-created folders.
+            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(d)]
 
             if not files:
                 continue
@@ -203,9 +230,13 @@ class Organizer:
 
         for root, _, _ in os.walk(self.base, topdown=False):
             parent = Path(root)
+            if self._is_for_deletion_name(parent.name):
+                continue
 
             # Query live state each iteration (safer if earlier operations renamed dirs).
             for child in [p for p in parent.iterdir() if p.is_dir()]:
+                if self._is_for_deletion_name(child.name):
+                    continue
                 if not self._visible_name(child.name):
                     continue
 
@@ -274,6 +305,152 @@ class Organizer:
                     except Exception:
                         pass
 
+    def _copy_placeholder_tree(self, src: Path, dst: Path) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
+        for entry in src.iterdir():
+            target = dst / entry.name
+            if entry.is_symlink():
+                try:
+                    os.symlink(os.readlink(entry), target)
+                except Exception:
+                    target.touch()
+                continue
+
+            if entry.is_dir():
+                self._copy_placeholder_tree(entry, target)
+                continue
+
+            target.touch()
+
+    def _simulate_empty_dir_collection(self) -> Optional[EmptyDirStats]:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                sim_base = Path(tmpdir) / "sim"
+                self._copy_placeholder_tree(self.base, sim_base)
+                sim_org = Organizer(
+                    base=sim_base,
+                    recursive=self.recursive,
+                    strategy=self.strategy,
+                    include_hidden=self.include_hidden,
+                    normalize=self.normalize,
+                    collect_empty_dirs=True,
+                    dry_run=False,
+                )
+                sim_org.run()
+                return EmptyDirStats(
+                    folders_moved=sim_org.empty_dir_stats.folders_moved,
+                    name_collisions_resolved=sim_org.empty_dir_stats.name_collisions_resolved,
+                    sample_moves=list(sim_org.empty_dir_stats.sample_moves),
+                )
+        except Exception:
+            return None
+
+    def _inspect_empty_dir_tree(self, directory: Path) -> tuple[bool, List[Path]]:
+        if directory.is_symlink():
+            return False, []
+
+        try:
+            entries = list(directory.iterdir())
+        except Exception:
+            return False, []
+
+        if not entries:
+            return True, []
+
+        collectable = True
+        topmost_children: List[Path] = []
+
+        for entry in entries:
+            if self._is_for_deletion_name(entry.name):
+                collectable = False
+                continue
+
+            if not self.include_hidden and not self._visible_name(entry.name):
+                collectable = False
+                continue
+
+            if entry.is_symlink():
+                collectable = False
+                continue
+
+            if entry.is_dir():
+                child_collectable, child_topmost = self._inspect_empty_dir_tree(entry)
+                if child_collectable:
+                    topmost_children.append(entry)
+                else:
+                    collectable = False
+                    topmost_children.extend(child_topmost)
+                continue
+
+            collectable = False
+
+        if collectable:
+            return True, []
+        return False, topmost_children
+
+    def _find_empty_dir_candidates(self) -> List[Path]:
+        candidates: List[Path] = []
+        seen: Set[Path] = set()
+
+        for child in sorted(self.base.iterdir(), key=lambda p: p.name.lower()):
+            if not child.is_dir() or child.is_symlink():
+                continue
+            if not self._visible_name(child.name):
+                continue
+            if self._is_for_deletion_name(child.name):
+                continue
+
+            child_collectable, child_topmost = self._inspect_empty_dir_tree(child)
+            if child_collectable:
+                paths_to_add = [child]
+            elif self.recursive:
+                paths_to_add = child_topmost
+            else:
+                paths_to_add = []
+
+            for path in paths_to_add:
+                if path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(path)
+
+        return candidates
+
+    def _maybe_collect_empty_dirs(self) -> None:
+        if not self.collect_empty_dirs:
+            return
+
+        if self.dry_run:
+            simulated = self._simulate_empty_dir_collection()
+            if simulated is not None:
+                self.empty_dir_stats = simulated
+                return
+
+        candidates = self._find_empty_dir_candidates()
+        if not candidates:
+            return
+
+        dest_root = self.base / FOR_DELETION_DIR_NAME
+        if not self.dry_run:
+            dest_root.mkdir(parents=True, exist_ok=True)
+        else:
+            self._init_reserved_dir(dest_root)
+
+        for src_dir in candidates:
+            target = self._collision_safe_target(dest_root, src_dir.name, collision_counter="empty_dirs")
+            if len(self.empty_dir_stats.sample_moves) < EMPTY_DIR_SAMPLE_LIMIT:
+                self.empty_dir_stats.sample_moves.append(
+                    {
+                        "from": str(src_dir.relative_to(self.base)),
+                        "to": str(target.relative_to(self.base)),
+                    }
+                )
+
+            if not self.dry_run:
+                shutil.move(str(src_dir), str(target))
+
+            self.empty_dir_stats.folders_moved += 1
+
     def _verify(self) -> Dict[str, object]:
         root_visible = 0
         root_all = 0
@@ -287,6 +464,7 @@ class Organizer:
         for root, dirs, _ in os.walk(self.base, topdown=True):
             if not self.include_hidden:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
+            dirs[:] = [d for d in dirs if not self._is_for_deletion_name(d)]
             parent = Path(root)
             for d in dirs:
                 c = self._canonical_folder_name(d)
@@ -310,7 +488,7 @@ class Organizer:
                 remaining_unorganized_visible_files += len(files)
 
                 # Don't descend into bucket folders for verification of non-bucket dirs.
-                dirs[:] = [d for d in dirs if d.upper() not in self.bucket_names]
+                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(d)]
 
         return {
             "root_files_remaining_visible": root_visible,
@@ -337,6 +515,7 @@ class Organizer:
             self._run_non_recursive()
 
         self._maybe_normalize()
+        self._maybe_collect_empty_dirs()
 
         summary = {
             "target": str(self.base),
@@ -356,6 +535,13 @@ class Organizer:
                 "merge_collisions_resolved": self.normalize_stats.merge_collisions_resolved,
                 "source_folders_removed": self.normalize_stats.source_folders_removed,
                 "alias_map": self.alias_map,
+            },
+            "empty_folder_collection": {
+                "enabled": self.collect_empty_dirs,
+                "destination": str(self.base / FOR_DELETION_DIR_NAME) if self.collect_empty_dirs else None,
+                "folders_moved": self.empty_dir_stats.folders_moved,
+                "name_collisions_resolved": self.empty_dir_stats.name_collisions_resolved,
+                "sample_moves": self.empty_dir_stats.sample_moves,
             },
             "verification": self._verify(),
         }
@@ -378,6 +564,11 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "standard"],
         default="none",
         help="Normalization mode (standard applies alias merge + uppercase bucket casing)",
+    )
+    parser.add_argument(
+        "--collect-empty-dirs",
+        action="store_true",
+        help="Move collectable empty folders into a root-level 'For Deletion' folder",
     )
     parser.add_argument("--dry-run", action="store_true", help="Simulate operations without writing changes")
     return parser.parse_args()
@@ -402,6 +593,7 @@ def main() -> None:
         strategy=args.strategy,
         include_hidden=args.include_hidden,
         normalize=normalize,
+        collect_empty_dirs=args.collect_empty_dirs,
         dry_run=args.dry_run,
     )
     result = org.run()

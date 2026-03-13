@@ -2,7 +2,7 @@
 
 A collision-safe Python tool for sorting folders into uppercase extension buckets such as `JPG`, `PNG`, and `MP4`.
 
-It supports recursive modes, dry-run previews, normalization, and an optional macOS launcher. The project began as a Hermes skill helper, but it is also useful as a standalone command-line tool.
+It supports recursive modes, dry-run previews, normalization, optional empty-folder collection into `For Deletion`, and an optional macOS launcher. The project began as a Hermes skill helper, but it is also useful as a standalone command-line tool.
 
 ## What it does
 
@@ -16,6 +16,7 @@ It supports recursive modes, dry-run previews, normalization, and an optional ma
 - Optionally normalizes bucket names:
   - uppercases bucket folder names
   - folds `JPEG` and `JPE` into `JPG`
+- Optionally moves collectable empty folder trees into a root-level `For Deletion` folder
 - Excludes hidden files and folders by default
 - Emits structured JSON output for scripting and automation
 
@@ -58,6 +59,17 @@ Dry run preview:
 python3 scripts/organize_by_filetype.py --path /path/to/folder --dry-run
 ```
 
+Collect empty folders into `For Deletion`:
+
+```bash
+python3 scripts/organize_by_filetype.py \
+  --path /path/to/folder \
+  --recursive \
+  --strategy flatten-root \
+  --normalize standard \
+  --collect-empty-dirs
+```
+
 Include hidden files:
 
 ```bash
@@ -71,6 +83,7 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 - `--strategy {in-place,flatten-root}` — recursive strategy
 - `--include-hidden` — include hidden files and folders
 - `--normalize {none,standard}` — normalization mode
+- `--collect-empty-dirs` — move collectable empty folder trees into `For Deletion`
 - `--dry-run` — preview changes without writing
 
 ## Behavior and safety
@@ -80,6 +93,8 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 - Hidden files and folders are skipped unless explicitly included
 - Existing files are never overwritten
 - Name collisions are resolved by suffixing `_1`, `_2`, and so on
+- `--collect-empty-dirs` never deletes folders; it only moves collectable empty folder trees into a review bucket named `For Deletion`
+- Hidden content blocks empty-folder collection unless `--include-hidden` is explicitly enabled
 - `flatten-root` intentionally consolidates the directory tree and should only be used when that behavior is desired
 
 ## JSON output
@@ -93,6 +108,7 @@ The script prints a JSON summary including:
 - collision count
 - folders touched
 - normalization stats
+- empty-folder collection stats
 - verification summary
 
 ## macOS launcher
@@ -101,7 +117,7 @@ An optional launcher is included at:
 
 - `launchers/Organize Files by Type.command`
 
-It prompts for the target folder and options, runs a dry run preview first, and then asks for confirmation before making changes.
+It prompts for the target folder and options, including whether to move empty folders into `For Deletion`, runs a dry run preview first, and then asks for confirmation before making changes.
 
 ## Repository layout
 
