@@ -123,13 +123,6 @@ else
   INCLUDE_HIDDEN_FLAG=""
 fi
 
-read -r -p "Move collectable empty folders into 'For Deletion'? [y/N]: " EMPTY_DIRS_IN
-if is_yes "$EMPTY_DIRS_IN"; then
-  EMPTY_DIRS_FLAG="--collect-empty-dirs"
-else
-  EMPTY_DIRS_FLAG=""
-fi
-
 CMD=(python3 "$HELPER" --path "$TARGET" --strategy "$STRATEGY" --normalize "$NORMALIZE")
 if [[ -n "$RECURSIVE_FLAG" ]]; then
   CMD+=(--recursive)
@@ -137,10 +130,10 @@ fi
 if [[ -n "$INCLUDE_HIDDEN_FLAG" ]]; then
   CMD+=(--include-hidden)
 fi
-if [[ -n "$EMPTY_DIRS_FLAG" ]]; then
-  CMD+=(--collect-empty-dirs)
-fi
 
+echo
+echo "Empty folders will automatically be staged into 'For Deletion'."
+echo "Use the CLI with --no-collect-empty-dirs if you want to disable that behavior."
 echo
 echo "----- Dry run preview -----"
 "${CMD[@]}" --dry-run

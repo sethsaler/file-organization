@@ -565,10 +565,19 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="Normalization mode (standard applies alias merge + uppercase bucket casing)",
     )
-    parser.add_argument(
+    empty_dir_group = parser.add_mutually_exclusive_group()
+    parser.set_defaults(collect_empty_dirs=True)
+    empty_dir_group.add_argument(
         "--collect-empty-dirs",
+        dest="collect_empty_dirs",
         action="store_true",
-        help="Move collectable empty folders into a root-level 'For Deletion' folder",
+        help="Move collectable empty folders into a root-level 'For Deletion' folder (default)",
+    )
+    empty_dir_group.add_argument(
+        "--no-collect-empty-dirs",
+        dest="collect_empty_dirs",
+        action="store_false",
+        help="Disable automatic empty-folder collection into 'For Deletion'",
     )
     parser.add_argument("--dry-run", action="store_true", help="Simulate operations without writing changes")
     return parser.parse_args()

@@ -8,6 +8,15 @@ This project tracks changes using the Hermes skill version as its public version
 
 - Ongoing improvements, cleanup, and repository polish.
 
+## [1.5.0] - 2026-03-13
+
+### Changed
+
+- Empty-folder collection into `For Deletion` is now enabled by default.
+- Added `--no-collect-empty-dirs` as the explicit opt-out for CLI usage.
+- Simplified the macOS launcher so empty-folder staging happens automatically without an extra prompt.
+- Updated `README.md` and `SKILL.md` to describe the new default behavior.
+
 ## [1.4.0] - 2026-03-13
 
 ### Added

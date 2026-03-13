@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
-description: Efficient file-type organization with a single optimized Python helper (non-recursive/recursive, optional normalization, dry-run, collision-safe moves, and empty-folder collection).
-version: 1.4.0
+description: Efficient file-type organization with a single optimized Python helper (non-recursive/recursive, optional normalization, dry-run, collision-safe moves, and automatic empty-folder collection).
+version: 1.5.0
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -33,7 +33,7 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 - Files without extension go to NO_EXTENSION.
 - No overwrite ever; collisions are suffixed (_1, _2, ...).
 - Hidden files and folders are excluded by default.
-- Optional empty-folder collection moves collectable empty folder trees into a root-level `For Deletion` review folder.
+- Automatic empty-folder collection moves collectable empty folder trees into a root-level `For Deletion` review folder by default.
 
 ## Modes
 
@@ -82,7 +82,7 @@ Performance characteristics:
 - strategy (if recursive)
 - include hidden (default no)
 - normalization mode
-- collect empty dirs into `For Deletion` (default no unless user asks)
+- empty-folder collection is automatic by default; only ask if the user wants to disable it
 - dry-run yes/no
 
 2) Run helper script
@@ -109,7 +109,7 @@ Always report:
 - Never overwrite files.
 - Do not flatten unless explicitly requested.
 - Preserve hierarchy in recursive in-place mode.
-- Empty-folder collection must move folders into `For Deletion`, not remove them outright.
+- Empty-folder collection is on by default and must move folders into `For Deletion`, not remove them outright.
 - Treat case-only folder normalization safely on case-insensitive filesystems (temporary rename sequence).
 
 ## Notes
@@ -117,5 +117,5 @@ Always report:
 - For very large trees, do a dry run first to estimate scope.
 - If hidden files should be included, the user must explicitly request it.
 - If the user asks to normalize aliases or casing after organization, run with `--normalize standard`.
-- If the user wants empty folders staged for review, run with `--collect-empty-dirs`.
+- Empty-folder staging is automatic; use `--no-collect-empty-dirs` only if the user explicitly wants to disable it.
 - If CLI behavior changes, update both `README.md` and the launcher if needed.
