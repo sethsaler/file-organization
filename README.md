@@ -118,9 +118,40 @@ An optional launcher is included at:
 
 It prompts for the target folder and core options, automatically stages collectable empty folders into `For Deletion`, runs a dry run preview first, and then asks for confirmation before making changes.
 
+## Image text extraction (OCR)
+
+`scripts/extract_image_text.py` reads PNG and JPEG images, runs [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR, and writes a spreadsheet with columns `file_name` and `extracted_text` (CSV or Excel).
+
+### Requirements
+
+- Python 3.9+
+- The Tesseract OCR engine on your PATH (for example `apt install tesseract-ocr` on Debian/Ubuntu, or `brew install tesseract` on macOS)
+- Python packages: `pip install -r requirements-ocr.txt` (or install `pytesseract`, `Pillow`, and `openpyxl` yourself)
+
+### Examples
+
+Single image to CSV (default output: `ocr_results.csv` next to the image):
+
+```bash
+python3 scripts/extract_image_text.py /path/to/scan.png
+```
+
+Folder of images, recursive, Excel output:
+
+```bash
+python3 scripts/extract_image_text.py /path/to/folder \
+  --recursive \
+  --format excel \
+  -o /path/to/results.xlsx
+```
+
+Optional `--lang eng+deu` passes Tesseract language packs. Use `--include-errors` to add an `error` column when a file fails.
+
 ## Repository layout
 
 - `scripts/organize_by_filetype.py` — main Python helper
+- `scripts/extract_image_text.py` — OCR helper: image text to CSV/Excel
+- `requirements-ocr.txt` — optional dependencies for the OCR script
 - `launchers/Organize Files by Type.command` — optional macOS quick launcher
 - `SKILL.md` — Hermes skill instructions
 - `README.md` — repository-facing documentation

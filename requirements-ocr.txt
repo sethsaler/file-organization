@@ -1,0 +1,7 @@
+# Optional: image text extraction (scripts/extract_image_text.py)
+# Also install the Tesseract OCR engine on your system, e.g.:
+#   Debian/Ubuntu: sudo apt install tesseract-ocr
+#   macOS: brew install tesseract
+pytesseract>=0.3.10
+Pillow>=10.0.0
+openpyxl>=3.1.0
