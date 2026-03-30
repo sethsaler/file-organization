@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
 description: Efficient file-type organization with a single optimized Python helper (non-recursive/recursive, optional normalization, dry-run, collision-safe moves, and automatic empty-folder collection).
-version: 1.5.0
+version: 1.5.1
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -70,7 +70,8 @@ Performance characteristics:
 ## Project structure
 
 - `scripts/organize_by_filetype.py` — main helper
-- `launchers/Organize Files by Type.command` — optional macOS quick launcher
+- `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive in-place, standard normalization, `--no-collect-empty-dirs`)
+- `launchers/Organize Files by Type.command` — optional macOS quick launcher for arbitrary paths
 - `README.md` — repository-facing documentation
 - `SKILL.md` — agent-facing skill instructions
 

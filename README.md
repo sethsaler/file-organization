@@ -112,16 +112,16 @@ The script prints a JSON summary including:
 
 ## macOS launcher
 
-An optional launcher is included at:
+Optional launchers are included at:
 
-- `launchers/Organize Files by Type.command`
-
-It prompts for the target folder and core options, automatically stages collectable empty folders into `For Deletion`, runs a dry run preview first, and then asks for confirmation before making changes.
+- `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively (files only into extension folders; no overwrites; duplicate names get `_1`, `_2`, … before the extension). Does not stage empty folders into `For Deletion` so the Desktop stays predictable.
+- `launchers/Organize Files by Type.command` — prompts for any folder and options, stages collectable empty folders into `For Deletion`, runs a dry-run preview first, then asks for confirmation before making changes.
 
 ## Repository layout
 
 - `scripts/organize_by_filetype.py` — main Python helper
-- `launchers/Organize Files by Type.command` — optional macOS quick launcher
+- `launchers/Organize Desktop by File Type.command` — one-click Desktop organizer (macOS)
+- `launchers/Organize Files by Type.command` — optional macOS quick launcher for any folder
 - `SKILL.md` — Hermes skill instructions
 - `README.md` — repository-facing documentation
 - `CHANGELOG.md` — notable project history
