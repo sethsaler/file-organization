@@ -25,6 +25,27 @@ It supports recursive modes, dry-run previews, normalization, automatic empty-fo
 - Python 3.9+
 - No third-party Python dependencies
 
+## Install with curl (one line)
+
+Downloads the latest `main` tree from GitHub into `~/.local/share/organize-folder-by-filetype` (override with `FILE_ORG_INSTALL_DIR`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sethsaler/file-organization/main/scripts/install.sh | bash
+```
+
+Use a specific branch or tag (fetch `install.sh` from that ref so the script matches what you unpack):
+
+```bash
+BRANCH=main
+curl -fsSL "https://raw.githubusercontent.com/sethsaler/file-organization/${BRANCH}/scripts/install.sh" | FILE_ORG_REF="$BRANCH" bash
+```
+
+After install, run the GUI (macOS or any OS with Tk):
+
+```bash
+python3 ~/.local/share/organize-folder-by-filetype/scripts/tinker_gui.py
+```
+
 ## Quick start
 
 Non-recursive:
@@ -112,11 +133,11 @@ The script prints a JSON summary including:
 
 ## macOS launcher
 
-An optional launcher is included at:
+Optional launchers are included at:
 
-- `launchers/Organize Files by Type.command`
-
-It prompts for the target folder and core options, automatically stages collectable empty folders into `For Deletion`, runs a dry run preview first, and then asks for confirmation before making changes.
+- `launchers/Organize by File Type (Tinker).command` — opens a small **Tk GUI** to pick a folder, set recursive/normalization/empty-folder options, then **Dry run** or **Run** (JSON shown in the window).
+- `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively (files only into extension folders; no overwrites; duplicate names get `_1`, `_2`, … before the extension). Does not stage empty folders into `For Deletion` so the Desktop stays predictable.
+- `launchers/Organize Files by Type.command` — prompts for any folder and options, stages collectable empty folders into `For Deletion`, runs a dry-run preview first, then asks for confirmation before making changes.
 
 ## Image text extraction (OCR)
 
@@ -151,8 +172,12 @@ Optional `--lang eng+deu` passes Tesseract language packs. Use `--include-errors
 
 - `scripts/organize_by_filetype.py` — main Python helper
 - `scripts/extract_image_text.py` — OCR helper: image text to CSV/Excel
+- `scripts/tinker_gui.py` — optional Tkinter UI for exploring options and JSON output
+- `scripts/install.sh` — curl-friendly installer (clone-less download from GitHub)
 - `requirements-ocr.txt` — optional dependencies for the OCR script
-- `launchers/Organize Files by Type.command` — optional macOS quick launcher
+- `launchers/Organize by File Type (Tinker).command` — double-click GUI launcher (macOS)
+- `launchers/Organize Desktop by File Type.command` — one-click Desktop organizer (macOS)
+- `launchers/Organize Files by Type.command` — optional macOS quick launcher for any folder
 - `SKILL.md` — Hermes skill instructions
 - `README.md` — repository-facing documentation
 - `CHANGELOG.md` — notable project history
@@ -178,6 +203,7 @@ If behavior changes, keep the following in sync:
 - `scripts/organize_by_filetype.py`
 - `SKILL.md`
 - `README.md`
+- `scripts/tinker_gui.py` when CLI flags or defaults change
 - `launchers/Organize Files by Type.command` when relevant
 
 ## Changelog

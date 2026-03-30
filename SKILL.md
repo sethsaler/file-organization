@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
 description: Efficient file-type organization with a single optimized Python helper (non-recursive/recursive, optional normalization, dry-run, collision-safe moves, and automatic empty-folder collection).
-version: 1.5.0
+version: 1.5.1
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -24,6 +24,7 @@ Keep changes synchronized across:
 - `SKILL.md`
 - `README.md`
 - `launchers/Organize Files by Type.command` when launcher behavior is affected
+- `scripts/tinker_gui.py` when CLI flags or GUI options should stay aligned
 
 Use `README.md` for repository-facing documentation and `SKILL.md` for agent-facing operating instructions.
 
@@ -70,7 +71,11 @@ Performance characteristics:
 ## Project structure
 
 - `scripts/organize_by_filetype.py` — main helper
-- `launchers/Organize Files by Type.command` — optional macOS quick launcher
+- `scripts/tinker_gui.py` — optional Tk UI for folder pick, flags, dry-run/run, JSON output
+- `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
+- `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI
+- `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive in-place, standard normalization, `--no-collect-empty-dirs`)
+- `launchers/Organize Files by Type.command` — optional macOS quick launcher for arbitrary paths
 - `README.md` — repository-facing documentation
 - `SKILL.md` — agent-facing skill instructions
 

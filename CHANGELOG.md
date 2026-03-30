@@ -9,6 +9,18 @@ This project tracks changes using the Hermes skill version as its public version
 - Ongoing improvements, cleanup, and repository polish.
 - Added `scripts/extract_image_text.py` to extract text from PNG/JPEG images via Tesseract and write CSV or Excel (`file_name`, `extracted_text`), plus `requirements-ocr.txt` and README documentation.
 
+### Added
+
+- `scripts/install.sh`: curl-friendly installer that unpacks a GitHub ref into `~/.local/share/organize-folder-by-filetype` (configurable via `FILE_ORG_*` env vars).
+- `scripts/tinker_gui.py`: Tkinter UI to configure options and run dry-run or live organize with JSON output.
+- `launchers/Organize by File Type (Tinker).command`: macOS launcher for the tinker GUI.
+
+## [1.5.1] - 2026-03-30
+
+### Added
+
+- `launchers/Organize Desktop by File Type.command`: one-click organization of `~/Desktop` by file type (recursive in-place, standard normalization, collision-safe renames, no empty-folder staging into `For Deletion`).
+
 ## [1.5.0] - 2026-03-13
 
 ### Changed
