@@ -8,6 +8,12 @@ This project tracks changes using the Hermes skill version as its public version
 
 - Ongoing improvements, cleanup, and repository polish.
 
+### Added
+
+- `scripts/install.sh`: curl-friendly installer that unpacks a GitHub ref into `~/.local/share/organize-folder-by-filetype` (configurable via `FILE_ORG_*` env vars).
+- `scripts/tinker_gui.py`: Tkinter UI to configure options and run dry-run or live organize with JSON output.
+- `launchers/Organize by File Type (Tinker).command`: macOS launcher for the tinker GUI.
+
 ## [1.5.1] - 2026-03-30
 
 ### Added
