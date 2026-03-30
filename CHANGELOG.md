@@ -8,6 +8,12 @@ This project tracks changes using the Hermes skill version as its public version
 
 - Ongoing improvements, cleanup, and repository polish.
 
+## [1.5.1] - 2026-03-30
+
+### Added
+
+- `launchers/Organize Desktop by File Type.command`: one-click organization of `~/Desktop` by file type (recursive in-place, standard normalization, collision-safe renames, no empty-folder staging into `For Deletion`).
+
 ## [1.5.0] - 2026-03-13
 
 ### Changed
