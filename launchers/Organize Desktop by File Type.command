@@ -34,13 +34,12 @@ if [[ ! -d "$DESKTOP" ]]; then
   exit 1
 fi
 
-# Recursive in-place: each folder on Desktop keeps its own type subfolders.
+# Recursive flatten-root: all files consolidate into Desktop-level type buckets.
 # Standard normalization: JPEG/JPE -> JPG, uppercase buckets.
-# No empty-folder staging: only moves files into type folders (no folder quarantine).
+# No empty-folder staging: flatten-root deletes empty subdirs directly.
 JSON="$(python3 "$HELPER" \
   --path "$DESKTOP" \
-  --recursive \
-  --strategy in-place \
+  --strategy flatten-root \
   --normalize standard \
   --no-collect-empty-dirs)"
 

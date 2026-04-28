@@ -9,14 +9,15 @@ It supports recursive modes, dry-run previews, normalization, automatic empty-fo
 - Organizes files into uppercase extension folders
 - Sends files without extensions to `NO_EXTENSION`
 - Never overwrites files; resolves collisions with `_1`, `_2`, etc.
-- Supports non-recursive organization
-- Supports recursive organization in two modes:
+- Supports recursive organization (default) in two modes:
+  - `flatten-root` (default): move all files into root-level buckets, then delete empty subdirectories
   - `in-place`: each directory organizes its own direct files
-  - `flatten-root`: move all files into root-level buckets
+- Supports non-recursive organization (root files only with `--no-recursive`)
 - Optionally normalizes bucket names:
   - uppercases bucket folder names
   - folds `JPEG` and `JPE` into `JPG`
-- Automatically moves collectable empty folder trees into a root-level `For Deletion` folder by default
+- In flatten-root mode (default), empty subdirectories are removed after organization
+- In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default
 - Excludes hidden files and folders by default
 - Emits structured JSON output for scripting and automation
 
@@ -48,10 +49,16 @@ python3 ~/.local/share/organize-folder-by-filetype/scripts/tinker_gui.py
 
 ## Quick start
 
-Non-recursive:
+Default (recursive flatten-root, standard normalization):
 
 ```bash
-python3 scripts/organize_by_filetype.py --path /path/to/folder
+python3 scripts/organize_by_filetype.py --path /path/to/folder --normalize standard
+```
+
+Non-recursive (root files only):
+
+```bash
+python3 scripts/organize_by_filetype.py --path /path/to/folder --no-recursive
 ```
 
 Recursive in-place:
@@ -59,18 +66,7 @@ Recursive in-place:
 ```bash
 python3 scripts/organize_by_filetype.py \
   --path /path/to/folder \
-  --recursive \
   --strategy in-place \
-  --normalize standard
-```
-
-Recursive flatten-to-root:
-
-```bash
-python3 scripts/organize_by_filetype.py \
-  --path /path/to/folder \
-  --recursive \
-  --strategy flatten-root \
   --normalize standard
 ```
 
@@ -80,7 +76,7 @@ Dry run preview:
 python3 scripts/organize_by_filetype.py --path /path/to/folder --dry-run
 ```
 
-Disable automatic empty-folder collection:
+Disable automatic empty-folder collection (or deletion in flatten-root mode):
 
 ```bash
 python3 scripts/organize_by_filetype.py \
@@ -97,12 +93,13 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 ## CLI arguments
 
 - `--path PATH` — target directory
-- `--recursive` — enable recursive organization
-- `--strategy {in-place,flatten-root}` — recursive strategy
+- `--recursive` — enable recursive organization (default)
+- `--no-recursive` — disable recursive, root files only
+- `--strategy {flatten-root,in-place}` — recursive strategy (default: flatten-root)
 - `--include-hidden` — include hidden files and folders
 - `--normalize {none,standard}` — normalization mode
-- `--collect-empty-dirs` — explicitly enable empty-folder collection into `For Deletion` (already the default)
-- `--no-collect-empty-dirs` — disable automatic empty-folder collection
+- `--collect-empty-dirs` — explicitly enable empty-folder collection into `For Deletion` (default; in flatten-root mode, empty dirs are deleted instead)
+- `--no-collect-empty-dirs` — disable automatic empty-folder handling
 - `--dry-run` — preview changes without writing
 
 ## Behavior and safety
@@ -112,10 +109,10 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 - Hidden files and folders are skipped unless explicitly included
 - Existing files are never overwritten
 - Name collisions are resolved by suffixing `_1`, `_2`, and so on
-- Empty-folder collection is enabled by default and never deletes folders; it only moves collectable empty folder trees into a review bucket named `For Deletion`
-- Use `--no-collect-empty-dirs` to disable that automatic staging behavior
+- In flatten-root mode (default), empty subdirectories are removed automatically after files are moved
+- In non-recursive and in-place modes, empty-folder collection is enabled by default and moves collectable empty folder trees into a review bucket named `For Deletion` — folders are never deleted outright in these modes
+- Use `--no-collect-empty-dirs` to disable empty-folder handling entirely
 - Hidden content blocks empty-folder collection unless `--include-hidden` is explicitly enabled
-- `flatten-root` intentionally consolidates the directory tree and should only be used when that behavior is desired
 
 ## JSON output
 

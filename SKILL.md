@@ -34,14 +34,15 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 - Files without extension go to NO_EXTENSION.
 - No overwrite ever; collisions are suffixed (_1, _2, ...).
 - Hidden files and folders are excluded by default.
-- Automatic empty-folder collection moves collectable empty folder trees into a root-level `For Deletion` review folder by default.
+- In flatten-root mode (default), empty subdirectories are automatically removed after files are moved to root-level buckets.
+- In non-recursive and in-place modes, automatic empty-folder collection moves collectable empty folder trees into a root-level `For Deletion` review folder by default.
 
 ## Modes
 
-- Non-recursive (default): only target folder direct files.
-- Recursive:
-  - in-place (default): each directory organizes its own direct files.
-  - flatten-root (explicit only): full tree consolidates into root buckets.
+- Non-recursive: only target folder direct files.
+- Recursive (default):
+  - flatten-root (default): full tree consolidates into root buckets, empty subdirectories are removed.
+  - in-place: each directory organizes its own direct files.
 
 ## Normalization
 
@@ -83,11 +84,11 @@ Performance characteristics:
 
 1) Confirm user inputs
 - target path
-- recursive or non-recursive
-- strategy (if recursive)
+- recursive or non-recursive (recursive is default)
+- strategy (if recursive; flatten-root is default)
 - include hidden (default no)
 - normalization mode
-- empty-folder collection is automatic by default; only ask if the user wants to disable it
+- empty-folder collection / deletion behavior (flatten-root deletes empty dirs; other modes stage into `For Deletion`)
 - dry-run yes/no
 
 2) Run helper script
@@ -105,16 +106,17 @@ Always report:
 - collisions resolved
 - folders touched
 - normalization stats
-- empty-folder collection stats
+- empty-folder collection / removal stats
 - verification summary (root remaining files, noncanonical dirs)
 
 ## Required safety rules
 
 - Never delete user files.
 - Never overwrite files.
-- Do not flatten unless explicitly requested.
+- Flatten-root is the default mode; files are consolidated into root-level buckets and empty subdirectories are removed.
 - Preserve hierarchy in recursive in-place mode.
-- Empty-folder collection is on by default and must move folders into `For Deletion`, not remove them outright.
+- Empty-folder collection is on by default for non-recursive and in-place modes, and must move folders into `For Deletion`, not remove them outright.
+- In flatten-root mode, empty subdirectories are removed directly (not staged into `For Deletion`).
 - Treat case-only folder normalization safely on case-insensitive filesystems (temporary rename sequence).
 
 ## Notes

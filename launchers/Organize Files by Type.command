@@ -73,25 +73,25 @@ fi
 
 echo "Choose mode:"
 echo "  1) Non-recursive (root files only)"
-echo "  2) Recursive in-place (recommended)"
-echo "  3) Recursive flatten-to-root (advanced)"
+echo "  2) Recursive flatten-to-root (recommended)"
+echo "  3) Recursive in-place (each folder sorts its own files)"
 read -r -p "Mode [1/2/3] (default 2): " MODE
 MODE="${MODE:-2}"
 
 RECURSIVE_FLAG=""
-STRATEGY="in-place"
+STRATEGY="flatten-root"
 case "$MODE" in
   1)
-    RECURSIVE_FLAG=""
-    STRATEGY="in-place"
+    RECURSIVE_FLAG="--no-recursive"
+    STRATEGY="flatten-root"
     ;;
   2)
     RECURSIVE_FLAG="--recursive"
-    STRATEGY="in-place"
+    STRATEGY="flatten-root"
     ;;
   3)
     RECURSIVE_FLAG="--recursive"
-    STRATEGY="flatten-root"
+    STRATEGY="in-place"
     ;;
   *)
     echo "Invalid mode. Exiting."

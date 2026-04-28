@@ -23,7 +23,7 @@ class TinkerApp:
 
         self.path_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=True)
-        self.strategy_var = tk.StringVar(value="in-place")
+        self.strategy_var = tk.StringVar(value="flatten-root")
         self.normalize_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=False)
         self.collect_empty_var = tk.BooleanVar(value=True)
@@ -50,10 +50,10 @@ class TinkerApp:
 
         strat = ttk.LabelFrame(frm, text="Recursive strategy", padding=6)
         strat.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Radiobutton(strat, text="In-place (each folder sorts its own files)", variable=self.strategy_var, value="in-place").pack(
+        ttk.Radiobutton(strat, text="Flatten to root buckets (default)", variable=self.strategy_var, value="flatten-root").pack(
             anchor="w"
         )
-        ttk.Radiobutton(strat, text="Flatten to root buckets", variable=self.strategy_var, value="flatten-root").pack(anchor="w")
+        ttk.Radiobutton(strat, text="In-place (each folder sorts its own files)", variable=self.strategy_var, value="in-place").pack(anchor="w")
         row += 1
 
         norm = ttk.LabelFrame(frm, text="Normalization", padding=6)
@@ -116,6 +116,8 @@ class TinkerApp:
         ]
         if self.recursive_var.get():
             cmd.append("--recursive")
+        else:
+            cmd.append("--no-recursive")
         if self.hidden_var.get():
             cmd.append("--include-hidden")
         if self.collect_empty_var.get():

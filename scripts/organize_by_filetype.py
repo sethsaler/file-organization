@@ -69,6 +69,7 @@ class Organizer:
         self.move_stats = MoveStats()
         self.normalize_stats = NormalizeStats()
         self.empty_dir_stats = EmptyDirStats()
+        self.empty_dirs_removed = 0
 
         # Destination reservation map used for deterministic collision-safe naming.
         # Helps keep behavior predictable, especially in dry-run mode.
@@ -451,6 +452,24 @@ class Organizer:
 
             self.empty_dir_stats.folders_moved += 1
 
+    def _remove_empty_subdirs(self) -> None:
+        for root, dirs, files in os.walk(self.base, topdown=False):
+            root_path = Path(root)
+            if root_path == self.base:
+                continue
+            if self._is_for_deletion_name(root_path.name):
+                continue
+            if self._should_skip_traversal_dir(root_path.name):
+                continue
+
+            try:
+                if not any(root_path.iterdir()):
+                    if not self.dry_run:
+                        root_path.rmdir()
+                    self.empty_dirs_removed += 1
+            except Exception:
+                pass
+
     def _verify(self) -> Dict[str, object]:
         root_visible = 0
         root_all = 0
@@ -511,6 +530,7 @@ class Organizer:
                 self._run_recursive_in_place()
             else:
                 self._run_recursive_flatten_root()
+                self._remove_empty_subdirs()
         else:
             self._run_non_recursive()
 
@@ -528,6 +548,7 @@ class Organizer:
             "moved_by_extension": dict(sorted(self.ext_counts.items())),
             "name_collisions_resolved": self.move_stats.name_collisions_resolved,
             "folders_touched": self.move_stats.folders_touched,
+            "empty_dirs_removed": self.empty_dirs_removed,
             "normalization": {
                 "folders_case_renamed": self.normalize_stats.folders_case_renamed,
                 "folders_merged": self.normalize_stats.folders_merged,
@@ -551,11 +572,12 @@ class Organizer:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Organize files by extension folders with optional recursive mode and normalization.")
     parser.add_argument("--path", required=True, help="Target directory path")
-    parser.add_argument("--recursive", action="store_true", help="Enable recursive organization")
+    parser.add_argument("--recursive", action="store_true", default=True, help="Enable recursive organization (default)")
+    parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="Disable recursive, root files only")
     parser.add_argument(
         "--strategy",
         choices=["in-place", "flatten-root"],
-        default="in-place",
+        default="flatten-root",
         help="Recursive strategy (ignored when not recursive)",
     )
     parser.add_argument("--include-hidden", action="store_true", help="Include hidden files/folders")
