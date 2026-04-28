@@ -83,8 +83,36 @@ class Organizer:
     def _is_for_deletion_name(self, name: str) -> bool:
         return name.casefold() == FOR_DELETION_DIR_NAME.casefold()
 
-    def _should_skip_traversal_dir(self, name: str) -> bool:
-        return name.upper() in self.bucket_names or self._is_for_deletion_name(name)
+    def _should_skip_traversal_dir(self, parent_path: Path, dir_name: str) -> bool:
+        """Skip descending only into organizer output dirs directly under base.
+
+        Nested folders whose names match an extension (e.g. photos/JPG/) must still
+        be walked so files inside are flattened into root buckets.
+        """
+        if parent_path != self.base:
+            return False
+        if self._is_for_deletion_name(dir_name):
+            return True
+        return dir_name.upper() in self.bucket_names
+
+    def _is_root_level_bucket_dir(self, path: Path) -> bool:
+        """Extension bucket folder placed directly under base — never removed when pruning empties."""
+        return path.parent == self.base and path.name.upper() in self.bucket_names
+
+    def _purge_hidden_files_for_cleanup(self, directory: Path) -> None:
+        """Remove ignored dotfiles (e.g. .DS_Store) so shells empty after organize can be deleted."""
+        if self.include_hidden:
+            return
+        try:
+            for entry in list(directory.iterdir()):
+                if entry.is_file() and not self._visible_name(entry.name):
+                    if not self.dry_run:
+                        try:
+                            entry.unlink()
+                        except OSError:
+                            pass
+        except OSError:
+            pass
 
     def _note_collision(self, collision_counter: str) -> None:
         if collision_counter == "files":
@@ -187,8 +215,8 @@ class Organizer:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
                 files = [f for f in files if self._visible_name(f)]
 
-            # Skip traversing organization output directories.
-            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(d)]
+            # Skip traversing root-level bucket dirs only (see _should_skip_traversal_dir).
+            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
 
             if not files:
                 continue
@@ -211,8 +239,8 @@ class Organizer:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
                 files = [f for f in files if self._visible_name(f)]
 
-            # Skip organization output trees to avoid reprocessing newly-created folders.
-            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(d)]
+            # Skip traversing root-level bucket dirs only (nested JPG/PDF/… folders still scanned).
+            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
 
             if not files:
                 continue
@@ -453,22 +481,54 @@ class Organizer:
             self.empty_dir_stats.folders_moved += 1
 
     def _remove_empty_subdirs(self) -> None:
-        for root, dirs, files in os.walk(self.base, topdown=False):
+        """Remove leftover folders under base after flatten-root (deepest first).
+
+        Skips descending into root-level extension buckets so large JPG/MP4 trees are not scanned.
+        Deletes ignored hidden files first — otherwise folders that only contain `.DS_Store` would
+        never count as empty.
+        """
+        candidates: List[Path] = []
+        for root, dirs, files in os.walk(self.base, topdown=True):
             root_path = Path(root)
+            # Exclude root-level bucket / For Deletion trees from descent (large JPG/MP4 dirs).
+            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
+            if self._is_for_deletion_name(root_path.name):
+                dirs[:] = []
+                continue
             if root_path == self.base:
                 continue
+            if self._is_root_level_bucket_dir(root_path):
+                continue
+            candidates.append(root_path)
+
+        for root_path in sorted(candidates, key=lambda p: len(p.parts), reverse=True):
             if self._is_for_deletion_name(root_path.name):
                 continue
-            if self._should_skip_traversal_dir(root_path.name):
+            if self._is_root_level_bucket_dir(root_path):
+                continue
+            try:
+                entries = list(root_path.iterdir())
+            except OSError:
                 continue
 
-            try:
-                if not any(root_path.iterdir()):
-                    if not self.dry_run:
-                        root_path.rmdir()
-                    self.empty_dirs_removed += 1
-            except Exception:
-                pass
+            can_remove = False
+            if not entries:
+                can_remove = True
+            elif not self.include_hidden:
+                can_remove = all(e.is_file() and not self._visible_name(e.name) for e in entries)
+
+            if not can_remove:
+                continue
+
+            if not self.dry_run:
+                self._purge_hidden_files_for_cleanup(root_path)
+                try:
+                    if any(root_path.iterdir()):
+                        continue
+                    root_path.rmdir()
+                except OSError:
+                    continue
+            self.empty_dirs_removed += 1
 
     def _verify(self) -> Dict[str, object]:
         root_visible = 0
@@ -506,8 +566,8 @@ class Organizer:
                 checked_non_bucket_directories += 1
                 remaining_unorganized_visible_files += len(files)
 
-                # Don't descend into bucket folders for verification of non-bucket dirs.
-                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(d)]
+                # Don't descend into root-level bucket dirs only.
+                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(Path(root), d)]
 
         return {
             "root_files_remaining_visible": root_visible,
@@ -535,6 +595,9 @@ class Organizer:
             self._run_non_recursive()
 
         self._maybe_normalize()
+        # Normalization can empty folders that were not removed in the first pass.
+        if self.recursive and self.strategy == "flatten-root" and not self.collect_empty_dirs:
+            self._remove_empty_subdirs()
         self._maybe_collect_empty_dirs()
 
         summary = {
@@ -580,7 +643,20 @@ def parse_args() -> argparse.Namespace:
         default="flatten-root",
         help="Recursive strategy (ignored when not recursive)",
     )
-    parser.add_argument("--include-hidden", action="store_true", help="Include hidden files/folders")
+    hidden_group = parser.add_mutually_exclusive_group()
+    parser.set_defaults(include_hidden=True)
+    hidden_group.add_argument(
+        "--include-hidden",
+        dest="include_hidden",
+        action="store_true",
+        help="Include hidden files and folders (default)",
+    )
+    hidden_group.add_argument(
+        "--no-include-hidden",
+        dest="include_hidden",
+        action="store_false",
+        help="Exclude dotfiles and dot-directories from organizing and empty-folder cleanup",
+    )
     parser.add_argument(
         "--normalize",
         choices=["none", "standard"],

@@ -25,7 +25,7 @@ class TinkerApp:
         self.recursive_var = tk.BooleanVar(value=True)
         self.strategy_var = tk.StringVar(value="flatten-root")
         self.normalize_var = tk.StringVar(value="standard")
-        self.hidden_var = tk.BooleanVar(value=False)
+        self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
 
         pad = {"padx": 8, "pady": 4}
@@ -118,8 +118,8 @@ class TinkerApp:
             cmd.append("--recursive")
         else:
             cmd.append("--no-recursive")
-        if self.hidden_var.get():
-            cmd.append("--include-hidden")
+        if not self.hidden_var.get():
+            cmd.append("--no-include-hidden")
         if self.collect_empty_var.get():
             cmd.append("--collect-empty-dirs")
         else:

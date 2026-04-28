@@ -33,16 +33,14 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 - Buckets are uppercase extension folders (for example jpg -> JPG).
 - Files without extension go to NO_EXTENSION.
 - No overwrite ever; collisions are suffixed (_1, _2, ...).
-- Hidden files and folders are excluded by default.
+- Hidden files and folders are included by default (`--no-include-hidden` to exclude dotfiles).
 - In flatten-root mode (default), empty subdirectories are automatically removed after files are moved to root-level buckets.
 - In non-recursive and in-place modes, automatic empty-folder collection moves collectable empty folder trees into a root-level `For Deletion` review folder by default.
 
 ## Modes
 
 - Non-recursive: only target folder direct files.
-- Recursive (default):
-  - flatten-root (default): full tree consolidates into root buckets, empty subdirectories are removed.
-  - in-place: each directory organizes its own direct files.
+- `flatten-root`: every file under the tree (any depth) moves into extension buckets **directly under the chosen folder**. Traversal skips only **root-level** bucket/`For Deletion` dirs so nested folders named like extensions (e.g. `project/JPG/`) are still scanned.
 
 ## Normalization
 
@@ -75,8 +73,8 @@ Performance characteristics:
 - `scripts/tinker_gui.py` — optional Tk UI for folder pick, flags, dry-run/run, JSON output
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI
-- `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive in-place, standard normalization, `--no-collect-empty-dirs`)
-- `launchers/Organize Files by Type.command` — optional macOS quick launcher for arbitrary paths
+- `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive flatten-root, standard normalization, `--no-collect-empty-dirs`)
+- `launchers/Organize Files by Type.command` — prompts for a folder, then flatten-root + standard normalization + empty-folder deletion (dry-run preview, then confirm)
 - `README.md` — repository-facing documentation
 - `SKILL.md` — agent-facing skill instructions
 
@@ -84,12 +82,8 @@ Performance characteristics:
 
 1) Confirm user inputs
 - target path
-- recursive or non-recursive (recursive is default)
-- strategy (if recursive; flatten-root is default)
-- include hidden (default no)
-- normalization mode
-- empty-folder collection / deletion behavior (flatten-root deletes empty dirs; other modes stage into `For Deletion`)
-- dry-run yes/no
+- For CLI/Tinker: recursive vs non-recursive, strategy, normalization, hidden, empty-folder handling, dry-run as needed
+- For `Organize Files by Type.command`: only the folder path (behavior is fixed: recursive flatten-root, standard normalization, delete empty dirs, dry-run then confirm)
 
 2) Run helper script
 - Script location: `scripts/organize_by_filetype.py`
@@ -122,7 +116,8 @@ Always report:
 ## Notes
 
 - For very large trees, do a dry run first to estimate scope.
-- If hidden files should be included, the user must explicitly request it.
+- Use `--no-include-hidden` when the user wants dotfiles and dot-directories left alone.
 - If the user asks to normalize aliases or casing after organization, run with `--normalize standard`.
-- Empty-folder staging is automatic; use `--no-collect-empty-dirs` only if the user explicitly wants to disable it.
+- For non-recursive and in-place modes, empty-folder staging into `For Deletion` is the default unless `--no-collect-empty-dirs` is set.
+- Flatten-root with `--no-collect-empty-dirs` removes empty subdirectories instead of staging them.
 - If CLI behavior changes, update both `README.md` and the launcher if needed.

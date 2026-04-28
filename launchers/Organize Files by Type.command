@@ -1,4 +1,6 @@
 #!/bin/bash
+# Prompt for a folder, move every file (recursive) into top-level extension buckets,
+# then delete empty folders. Safe moves only — collisions become name_1.ext, name_2.ext, …
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,8 +38,13 @@ clean_path() {
 clear
 
 echo "=============================================="
-echo " Organize Folder by File Type (Quick Launch)"
+echo " Organize Folder by File Type"
 echo "=============================================="
+echo
+echo "This gathers every file (including inside subfolders) into"
+echo "folders at the top of your chosen directory named by type"
+echo "(PDF, JPG, …). Then it deletes leftover empty folders."
+echo "Nothing is overwritten — duplicates get _1, _2, … before the extension."
 echo
 
 if [[ ! -f "$HELPER" ]]; then
@@ -48,7 +55,7 @@ if [[ ! -f "$HELPER" ]]; then
   exit 1
 fi
 
-read -r -p "Enter folder path (you can drag folder here): " TARGET_RAW
+read -r -p "Folder path (you can drag a folder here): " TARGET_RAW
 TARGET="$(clean_path "$TARGET_RAW")"
 
 if [[ ! -d "$TARGET" && "$TARGET" == *\\* ]]; then
@@ -71,70 +78,15 @@ if [[ ! -d "$TARGET" ]]; then
   exit 1
 fi
 
-echo "Choose mode:"
-echo "  1) Non-recursive (root files only)"
-echo "  2) Recursive flatten-to-root (recommended)"
-echo "  3) Recursive in-place (each folder sorts its own files)"
-read -r -p "Mode [1/2/3] (default 2): " MODE
-MODE="${MODE:-2}"
+CMD=(
+  python3 "$HELPER"
+  --path "$TARGET"
+  --recursive
+  --strategy flatten-root
+  --normalize standard
+  --no-collect-empty-dirs
+)
 
-RECURSIVE_FLAG=""
-STRATEGY="flatten-root"
-case "$MODE" in
-  1)
-    RECURSIVE_FLAG="--no-recursive"
-    STRATEGY="flatten-root"
-    ;;
-  2)
-    RECURSIVE_FLAG="--recursive"
-    STRATEGY="flatten-root"
-    ;;
-  3)
-    RECURSIVE_FLAG="--recursive"
-    STRATEGY="in-place"
-    ;;
-  *)
-    echo "Invalid mode. Exiting."
-    read -r -p "Press Enter to close..." _
-    exit 1
-    ;;
-esac
-
-if [[ -n "$RECURSIVE_FLAG" ]]; then
-  read -r -p "Use standard normalization (JPEG->JPG + uppercase buckets)? [Y/n]: " NORM_IN
-  if [[ -z "${NORM_IN:-}" ]] || is_yes "$NORM_IN"; then
-    NORMALIZE="standard"
-  else
-    NORMALIZE="none"
-  fi
-else
-  read -r -p "Use normalization? [y/N]: " NORM_IN
-  if is_yes "$NORM_IN"; then
-    NORMALIZE="standard"
-  else
-    NORMALIZE="none"
-  fi
-fi
-
-read -r -p "Include hidden files (e.g. .DS_Store)? [y/N]: " HIDDEN_IN
-if is_yes "$HIDDEN_IN"; then
-  INCLUDE_HIDDEN_FLAG="--include-hidden"
-else
-  INCLUDE_HIDDEN_FLAG=""
-fi
-
-CMD=(python3 "$HELPER" --path "$TARGET" --strategy "$STRATEGY" --normalize "$NORMALIZE")
-if [[ -n "$RECURSIVE_FLAG" ]]; then
-  CMD+=(--recursive)
-fi
-if [[ -n "$INCLUDE_HIDDEN_FLAG" ]]; then
-  CMD+=(--include-hidden)
-fi
-
-echo
-echo "Empty folders will automatically be staged into 'For Deletion'."
-echo "Use the CLI with --no-collect-empty-dirs if you want to disable that behavior."
-echo
 echo "----- Dry run preview -----"
 "${CMD[@]}" --dry-run
 

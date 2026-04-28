@@ -10,7 +10,7 @@ It supports recursive modes, dry-run previews, normalization, automatic empty-fo
 - Sends files without extensions to `NO_EXTENSION`
 - Never overwrites files; resolves collisions with `_1`, `_2`, etc.
 - Supports recursive organization (default) in two modes:
-  - `flatten-root` (default): move all files into root-level buckets, then delete empty subdirectories
+  - `flatten-root` (default): move all files from **any depth** into folders directly under the target path (`PDF`, `JPG`, …). Only root-level bucket folders are skipped when walking the tree, so a nested folder named like an extension (for example `Photos/JPG/`) is still fully scanned.
   - `in-place`: each directory organizes its own direct files
 - Supports non-recursive organization (root files only with `--no-recursive`)
 - Optionally normalizes bucket names:
@@ -18,7 +18,7 @@ It supports recursive modes, dry-run previews, normalization, automatic empty-fo
   - folds `JPEG` and `JPE` into `JPG`
 - In flatten-root mode (default), empty subdirectories are removed after organization
 - In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default
-- Excludes hidden files and folders by default
+- Includes hidden files and folders by default; use `--no-include-hidden` to skip dotfiles
 - Emits structured JSON output for scripting and automation
 
 ## Requirements
@@ -84,10 +84,10 @@ python3 scripts/organize_by_filetype.py \
   --no-collect-empty-dirs
 ```
 
-Include hidden files:
+Skip hidden files (default is to include them):
 
 ```bash
-python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
+python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidden
 ```
 
 ## CLI arguments
@@ -96,7 +96,8 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 - `--recursive` — enable recursive organization (default)
 - `--no-recursive` — disable recursive, root files only
 - `--strategy {flatten-root,in-place}` — recursive strategy (default: flatten-root)
-- `--include-hidden` — include hidden files and folders
+- `--include-hidden` — include hidden files and folders (default behavior)
+- `--no-include-hidden` — exclude dotfiles and dot-directories
 - `--normalize {none,standard}` — normalization mode
 - `--collect-empty-dirs` — explicitly enable empty-folder collection into `For Deletion` (default; in flatten-root mode, empty dirs are deleted instead)
 - `--no-collect-empty-dirs` — disable automatic empty-folder handling
@@ -106,14 +107,12 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --include-hidden
 
 - Buckets are uppercase extension folders such as `JPG`, `PNG`, and `MP4`
 - Alias folding maps `JPEG` and `JPE` to `JPG`
-- Hidden files and folders are skipped unless explicitly included
+- Hidden files and folders are organized like visible ones unless `--no-include-hidden` is set
 - Existing files are never overwritten
 - Name collisions are resolved by suffixing `_1`, `_2`, and so on
 - In flatten-root mode (default), empty subdirectories are removed automatically after files are moved
 - In non-recursive and in-place modes, empty-folder collection is enabled by default and moves collectable empty folder trees into a review bucket named `For Deletion` — folders are never deleted outright in these modes
 - Use `--no-collect-empty-dirs` to disable empty-folder handling entirely
-- Hidden content blocks empty-folder collection unless `--include-hidden` is explicitly enabled
-
 ## JSON output
 
 The script prints a JSON summary including:
@@ -134,7 +133,7 @@ Optional launchers are included at:
 
 - `launchers/Organize by File Type (Tinker).command` — opens a small **Tk GUI** to pick a folder, set recursive/normalization/empty-folder options, then **Dry run** or **Run** (JSON shown in the window).
 - `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively (files only into extension folders; no overwrites; duplicate names get `_1`, `_2`, … before the extension). Does not stage empty folders into `For Deletion` so the Desktop stays predictable.
-- `launchers/Organize Files by Type.command` — prompts for any folder and options, stages collectable empty folders into `For Deletion`, runs a dry-run preview first, then asks for confirmation before making changes.
+- `launchers/Organize Files by Type.command` — prompts for a folder: moves all files (recursive) into top-level type folders, deletes empty folders afterward, dry-run preview then confirmation (same defaults as Desktop: flatten-root, standard normalization, no `For Deletion` staging).
 
 ## Image text extraction (OCR)
 
