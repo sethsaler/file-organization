@@ -154,6 +154,7 @@ class ScheduleApp:
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._cfg_lock = threading.Lock()
 
@@ -308,9 +309,11 @@ class ScheduleApp:
         v = max(1, min(10080, v))
         self.interval_var.set(v)
         self.cfg.interval_minutes = v
+        self._wake_event.set()
 
     def _on_scheduler_toggle(self) -> None:
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
+        self._wake_event.set()
         if self.cfg.scheduler_enabled:
             self._ensure_worker()
             self._append_log("Automatic runs enabled (keep this window open).\n")
@@ -321,36 +324,56 @@ class ScheduleApp:
         if self._worker is not None and self._worker.is_alive():
             return
         self._stop_event.clear()
+        self._wake_event.clear()
         self._worker = threading.Thread(target=self._worker_loop, name="schedule-worker", daemon=True)
         self._worker.start()
 
+    def _interruptible_wait(self, seconds: float) -> bool:
+        """Wait up to `seconds`. Return True if shutdown requested."""
+        remaining = float(seconds)
+        while remaining > 0:
+            if self._stop_event.is_set():
+                return True
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return False
+            chunk = min(remaining, 1.0)
+            if self._stop_event.wait(timeout=chunk):
+                return True
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return False
+            remaining -= chunk
+        return False
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
-            if not self.scheduler_var.get():
-                if self._stop_event.wait(timeout=1):
+            if not self.cfg.scheduler_enabled:
+                if self._interruptible_wait(1.0):
                     break
                 continue
-            try:
-                minutes = max(1, min(10080, int(self.interval_var.get())))
-            except (tk.TclError, ValueError):
-                minutes = 60
+            minutes = max(1, min(10080, int(self.cfg.interval_minutes)))
             wait_sec = minutes * 60
-            if self._stop_event.wait(timeout=wait_sec):
+            if self._interruptible_wait(wait_sec):
                 break
-            if not self.scheduler_var.get():
+            if not self.cfg.scheduler_enabled:
                 continue
             self._run_scheduled_batch()
 
     def _run_scheduled_batch(self) -> None:
         with self._cfg_lock:
-            snapshot = [(i, build_organize_cmd(j), j.path) for i, j in enumerate(self.cfg.folders) if j.enabled]
+            snapshot = [(build_organize_cmd(j), j.path) for j in self.cfg.folders if j.enabled]
 
-        for idx, cmd, _path in snapshot:
+        for cmd, path_key in snapshot:
             with self._cfg_lock:
-                if not (0 <= idx < len(self.cfg.folders)):
-                    continue
-                job = self.cfg.folders[idx]
-                if not job.enabled:
+                job = None
+                idx: Optional[int] = None
+                for i, j in enumerate(self.cfg.folders):
+                    if j.path == path_key:
+                        job = j
+                        idx = i
+                        break
+                if job is None or not job.enabled:
                     continue
                 base = Path(job.path).expanduser()
                 if not base.is_dir():
@@ -364,23 +387,45 @@ class ScheduleApp:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
             except subprocess.TimeoutExpired:
                 with self._cfg_lock:
-                    if 0 <= idx < len(self.cfg.folders):
-                        self.cfg.folders[idx].last_error = "timed out after 1 hour"
-                        self.cfg.folders[idx].last_run = datetime.now(timezone.utc).isoformat()
-                self._queue_ui(lambda i=idx: self._after_job_update(i))
+                    job = None
+                    idx = None
+                    for i, j in enumerate(self.cfg.folders):
+                        if j.path == path_key:
+                            job = j
+                            idx = i
+                            break
+                    if job is not None:
+                        job.last_error = "timed out after 1 hour"
+                        job.last_run = datetime.now(timezone.utc).isoformat()
+                if idx is not None:
+                    self._queue_ui(lambda i=idx: self._after_job_update(i))
                 continue
             except OSError as e:
                 with self._cfg_lock:
-                    if 0 <= idx < len(self.cfg.folders):
-                        self.cfg.folders[idx].last_error = str(e)
-                        self.cfg.folders[idx].last_run = datetime.now(timezone.utc).isoformat()
-                self._queue_ui(lambda i=idx: self._after_job_update(i))
+                    job = None
+                    idx = None
+                    for i, j in enumerate(self.cfg.folders):
+                        if j.path == path_key:
+                            job = j
+                            idx = i
+                            break
+                    if job is not None:
+                        job.last_error = str(e)
+                        job.last_run = datetime.now(timezone.utc).isoformat()
+                if idx is not None:
+                    self._queue_ui(lambda i=idx: self._after_job_update(i))
                 continue
             out = (proc.stdout or "").strip()
             err = (proc.stderr or "").strip()
             with self._cfg_lock:
-                if 0 <= idx < len(self.cfg.folders):
-                    job = self.cfg.folders[idx]
+                job = None
+                idx = None
+                for i, j in enumerate(self.cfg.folders):
+                    if j.path == path_key:
+                        job = j
+                        idx = i
+                        break
+                if job is not None:
                     if proc.returncode != 0:
                         job.last_error = err or f"exit {proc.returncode}"
                     else:
@@ -391,7 +436,8 @@ class ScheduleApp:
                 self._log_queue.put(err + "\n")
             if snippet:
                 self._log_queue.put(snippet + "\n")
-            self._queue_ui(lambda i=idx: self._after_job_update(i))
+            if idx is not None:
+                self._queue_ui(lambda i=idx: self._after_job_update(i))
 
         self._queue_ui(self._save_quiet)
 
@@ -491,7 +537,8 @@ class ScheduleApp:
             if Path(existing.path).expanduser().resolve() == Path(path).expanduser().resolve():
                 messagebox.showinfo("Folder", "That folder is already in the list.")
                 return
-        self.cfg.folders.append(FolderJob(path=path))
+        with self._cfg_lock:
+            self.cfg.folders.append(FolderJob(path=path))
         self._refresh_tree()
         children = self.tree.get_children()
         if children:
@@ -508,7 +555,8 @@ class ScheduleApp:
         idx = self._tree_item_to_index.get(sel[0])
         if idx is None:
             return
-        del self.cfg.folders[idx]
+        with self._cfg_lock:
+            del self.cfg.folders[idx]
         self._refresh_tree()
         self._save_quiet()
 
