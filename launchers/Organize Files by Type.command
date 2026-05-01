@@ -1,7 +1,7 @@
 #!/bin/bash
 # Prompt for a folder, move every file (recursive) into top-level category buckets
 # (Images, Videos, GIFs, Other),
-# then delete empty folders. Safe moves only — collisions become name_1.ext, name_2.ext, …
+# then stage empty folder trees under For Deletion. Safe moves only — collisions become name_1.ext, name_2.ext, …
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,8 +44,9 @@ echo "=============================================="
 echo
 echo "This gathers every file (including inside subfolders) into"
 echo "folders at the top of your chosen directory (Images, Videos,"
-echo "GIFs, Other). Then it deletes leftover empty folders."
-echo "Nothing is overwritten — duplicates get _1, _2, … before the extension."
+echo "GIFs, Other). Leftover empty folder trees are moved into “For Deletion” at the"
+echo "top level (then any stray empty directories are removed). Nothing is overwritten —"
+echo "duplicates get _1, _2, … before the extension."
 echo
 
 if [[ ! -f "$HELPER" ]]; then
@@ -85,7 +86,6 @@ CMD=(
   --recursive
   --strategy flatten-root
   --normalize standard
-  --no-collect-empty-dirs
 )
 
 echo "----- Dry run preview -----"

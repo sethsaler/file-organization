@@ -11,16 +11,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 
-ALIAS_MAP_DEFAULT: Dict[str, str] = {
-    "JPEG": "JPG",
-    "JPE": "JPG",
-}
-
-# Extensions (uppercase, no dot) for default category-bucket mode. GIF is handled first so it
-# never lands in Images.
+# Extensions (uppercase, no dot). GIF is checked first so it never lands in Images.
 GIF_EXTS: Set[str] = {"GIF"}
 
 VIDEO_EXTS: Set[str] = {
@@ -76,8 +70,6 @@ IMAGE_EXTS: Set[str] = {
     "JP2",
     "J2K",
 }
-
-CATEGORY_BUCKET_FOLDERS: Set[str] = {"Images", "Videos", "GIFs", "Other"}
 
 _CATEGORY_DIR_CANONICAL: Dict[str, str] = {
     "images": "Images",
@@ -144,7 +136,6 @@ class Organizer:
         collect_empty_dirs: bool,
         dry_run: bool,
         create_backup: bool = True,
-        category_buckets: bool = True,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -154,9 +145,7 @@ class Organizer:
         self.collect_empty_dirs = collect_empty_dirs
         self.dry_run = dry_run
         self.create_backup = create_backup
-        self.category_buckets = category_buckets
 
-        self.alias_map = dict(ALIAS_MAP_DEFAULT)
         self.ext_counts = Counter()
         self.move_stats = MoveStats()
         self.normalize_stats = NormalizeStats()
@@ -168,8 +157,6 @@ class Organizer:
 
         self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
 
-        self.bucket_names: Set[str] = set()
-
     def _visible_name(self, name: str) -> bool:
         return self.include_hidden or not name.startswith(".")
 
@@ -179,17 +166,36 @@ class Organizer:
     def _is_organizer_dir(self, name: str) -> bool:
         return name.casefold() == ORGANIZER_DIR_NAME.casefold()
 
-    def _should_skip_traversal_dir(self, parent_path: Path, dir_name: str) -> bool:
-        if parent_path != self.base:
+    def _at_organize_root(self, parent_path: Path) -> bool:
+        try:
+            return parent_path.resolve() == self.base
+        except OSError:
             return False
+
+    def _should_skip_traversal_dir(self, parent_path: Path, dir_name: str) -> bool:
+        """Do not descend into review/backup dirs. Legacy bucket folders (JPG, Images, …) are always entered."""
+        _ = parent_path
         if self._is_for_deletion_name(dir_name):
             return True
         if self._is_organizer_dir(dir_name):
             return True
-        return dir_name.upper() in self.bucket_names
+        return False
 
-    def _is_root_level_bucket_dir(self, path: Path) -> bool:
-        return path.parent == self.base and path.name.upper() in self.bucket_names
+    def _walk_topdown_organize(self) -> Iterator[Tuple[Path, List[str], List[str]]]:
+        """Walk the tree for file moves: follow symlinks into directories, break symlink cycles via inode."""
+        visited: Set[Tuple[int, int]] = set()
+        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=True):
+            root_path = Path(root)
+            try:
+                st = os.stat(root_path, follow_symlinks=False)
+                key = (st.st_dev, st.st_ino)
+                if key in visited:
+                    dirs[:] = []
+                    continue
+                visited.add(key)
+            except OSError:
+                pass
+            yield root_path, dirs, files
 
     def _purge_hidden_files_for_cleanup(self, directory: Path) -> None:
         if self.include_hidden:
@@ -211,32 +217,10 @@ class Organizer:
         else:
             self.empty_dir_stats.name_collisions_resolved += 1
 
-    def _collect_extensions(self) -> Set[str]:
-        exts: Set[str] = set()
-        for root, dirs, files in os.walk(self.base, topdown=True):
-            if not self.include_hidden:
-                dirs[:] = [d for d in dirs if self._visible_name(d)]
-            dirs[:] = [d for d in dirs if not self._is_for_deletion_name(d)]
-            dirs[:] = [d for d in dirs if not self._is_organizer_dir(d)]
-            for fn in files:
-                if not self._visible_name(fn):
-                    continue
-                suffix = Path(fn).suffix
-                ext = suffix[1:].upper() if suffix else "NO_EXTENSION"
-                exts.add(ext)
-        return exts
-
     def _canonical_folder_name(self, name: str) -> Optional[str]:
-        if self.category_buckets:
-            canon = _CATEGORY_DIR_CANONICAL.get(name.casefold())
-            if canon is not None and canon != name:
-                return canon
-            return None
-        u = name.upper()
-        if u in self.alias_map:
-            return self.alias_map[u]
-        if u in self.bucket_names:
-            return u
+        canon = _CATEGORY_DIR_CANONICAL.get(name.casefold())
+        if canon is not None and canon != name:
+            return canon
         return None
 
     def _init_reserved_dir(self, directory: Path) -> None:
@@ -272,18 +256,21 @@ class Organizer:
     def _bucket_for_file(self, file_name: str) -> str:
         suffix = Path(file_name).suffix
         ext = suffix[1:].upper() if suffix else ""
-        if self.category_buckets:
-            if ext in GIF_EXTS:
-                return "GIFs"
-            if ext in VIDEO_EXTS:
-                return "Videos"
-            if ext in IMAGE_EXTS:
-                return "Images"
-            return "Other"
-        ext_bucket = ext if ext else "NO_EXTENSION"
-        return self.alias_map.get(ext_bucket, ext_bucket)
+        if ext in GIF_EXTS:
+            return "GIFs"
+        if ext in VIDEO_EXTS:
+            return "Videos"
+        if ext in IMAGE_EXTS:
+            return "Images"
+        return "Other"
 
     def _move_one_file(self, src: Path, dest_dir: Path) -> None:
+        try:
+            if src.resolve().parent.resolve() == dest_dir.resolve():
+                return
+        except OSError:
+            pass
+
         dest_dir_name = dest_dir.name
         self.ext_counts[dest_dir_name] += 1
 
@@ -316,9 +303,7 @@ class Organizer:
     def _run_recursive_in_place(self) -> None:
         touched_dirs: Set[Path] = set()
 
-        for root, dirs, files in os.walk(self.base, topdown=True):
-            root_path = Path(root)
-
+        for root_path, dirs, files in self._walk_topdown_organize():
             if not self.include_hidden:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
                 files = [f for f in files if self._visible_name(f)]
@@ -339,9 +324,7 @@ class Organizer:
     def _run_recursive_flatten_root(self) -> None:
         touched_dirs: Set[Path] = set()
 
-        for root, dirs, files in os.walk(self.base, topdown=True):
-            root_path = Path(root)
-
+        for root_path, dirs, files in self._walk_topdown_organize():
             if not self.include_hidden:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
                 files = [f for f in files if self._visible_name(f)]
@@ -470,7 +453,6 @@ class Organizer:
                     normalize=self.normalize,
                     collect_empty_dirs=True,
                     dry_run=False,
-                    category_buckets=self.category_buckets,
                 )
                 sim_org.run()
                 return EmptyDirStats(
@@ -557,20 +539,8 @@ class Organizer:
 
         return candidates
 
-    def _maybe_collect_empty_dirs(self) -> None:
-        if not self.collect_empty_dirs:
-            return
-
-        if self.dry_run:
-            simulated = self._simulate_empty_dir_collection()
-            if simulated is not None:
-                self.empty_dir_stats = simulated
-                return
-
-        candidates = self._find_empty_dir_candidates()
-        if not candidates:
-            return
-
+    def _collect_empty_dirs_batch(self, candidates: List[Path]) -> None:
+        """Move one batch of empty-folder candidates into root-level For Deletion."""
         dest_root = self.base / FOR_DELETION_DIR_NAME
         if not self.dry_run:
             dest_root.mkdir(parents=True, exist_ok=True)
@@ -595,9 +565,26 @@ class Organizer:
 
             self.empty_dir_stats.folders_moved += 1
 
+    def _maybe_collect_empty_dirs(self) -> None:
+        if not self.collect_empty_dirs:
+            return
+
+        if self.dry_run:
+            simulated = self._simulate_empty_dir_collection()
+            if simulated is not None:
+                self.empty_dir_stats = simulated
+                return
+
+        max_rounds = 500
+        for _ in range(max_rounds):
+            candidates = self._find_empty_dir_candidates()
+            if not candidates:
+                break
+            self._collect_empty_dirs_batch(candidates)
+
     def _remove_empty_subdirs(self) -> None:
         candidates: List[Path] = []
-        for root, dirs, files in os.walk(self.base, topdown=True):
+        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
             root_path = Path(root)
             dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
             if self._is_for_deletion_name(root_path.name):
@@ -606,16 +593,12 @@ class Organizer:
             if self._is_organizer_dir(root_path.name):
                 dirs[:] = []
                 continue
-            if root_path == self.base:
-                continue
-            if self._is_root_level_bucket_dir(root_path):
+            if self._at_organize_root(root_path):
                 continue
             candidates.append(root_path)
 
         for root_path in sorted(candidates, key=lambda p: len(p.parts), reverse=True):
             if self._is_for_deletion_name(root_path.name):
-                continue
-            if self._is_root_level_bucket_dir(root_path):
                 continue
             try:
                 entries = list(root_path.iterdir())
@@ -652,12 +635,12 @@ class Organizer:
                     root_visible += 1
 
         noncanonical_dirs = []
-        for root, dirs, _ in os.walk(self.base, topdown=True):
+        for root_path, dirs, _ in self._walk_topdown_organize():
             if not self.include_hidden:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
             dirs[:] = [d for d in dirs if not self._is_for_deletion_name(d)]
             dirs[:] = [d for d in dirs if not self._is_organizer_dir(d)]
-            parent = Path(root)
+            parent = root_path
             for d in dirs:
                 c = self._canonical_folder_name(d)
                 if c is not None and c != d:
@@ -670,7 +653,7 @@ class Organizer:
             remaining_unorganized_visible_files = 0
             checked_non_bucket_directories = 0
 
-            for root, dirs, files in os.walk(self.base, topdown=True):
+            for root_path, dirs, files in self._walk_topdown_organize():
                 if not self.include_hidden:
                     dirs[:] = [d for d in dirs if self._visible_name(d)]
                     files = [f for f in files if self._visible_name(f)]
@@ -678,13 +661,13 @@ class Organizer:
                 checked_non_bucket_directories += 1
                 remaining_unorganized_visible_files += len(files)
 
-                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(Path(root), d)]
+                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
 
         return {
             "root_files_remaining_visible": root_visible,
             "root_files_remaining_all": root_all,
-            "noncanonical_extension_dirs_count": len(noncanonical_dirs),
-            "noncanonical_extension_dirs_sample": noncanonical_dirs[:10],
+            "noncanonical_bucket_dirs_count": len(noncanonical_dirs),
+            "noncanonical_bucket_dirs_sample": noncanonical_dirs[:10],
             "remaining_unorganized_visible_files_in_checked_dirs": remaining_unorganized_visible_files,
             "checked_non_bucket_directories": checked_non_bucket_directories,
         }
@@ -769,28 +752,24 @@ read -r -p "Press Enter to close..." _
         }
 
     def run(self) -> Dict[str, object]:
-        if self.category_buckets:
-            self.bucket_names = set(CATEGORY_BUCKET_FOLDERS)
-        else:
-            exts = self._collect_extensions()
-            self.bucket_names = set(exts)
-            self.bucket_names.update({"NO_EXTENSION"})
-            self.bucket_names.update(self.alias_map.keys())
-            self.bucket_names.update(self.alias_map.values())
+        try:
+            self.base = self.base.resolve()
+        except OSError:
+            pass
 
         if self.recursive:
             if self.strategy == "in-place":
                 self._run_recursive_in_place()
             else:
                 self._run_recursive_flatten_root()
-                self._remove_empty_subdirs()
+                if not self.collect_empty_dirs:
+                    self._remove_empty_subdirs()
         else:
             self._run_non_recursive()
 
         self._maybe_normalize()
-        if self.recursive and self.strategy == "flatten-root" and not self.collect_empty_dirs:
-            self._remove_empty_subdirs()
         self._maybe_collect_empty_dirs()
+        self._remove_empty_subdirs()
 
         manifest_info = self.save_manifest()
 
@@ -798,12 +777,12 @@ read -r -p "Press Enter to close..." _
             "target": str(self.base),
             "mode": "recursive" if self.recursive else "non-recursive",
             "strategy": self.strategy if self.recursive else "root-only",
-            "bucket_mode": "categories" if self.category_buckets else "extension",
+            "buckets": ["Images", "Videos", "GIFs", "Other"],
             "include_hidden": self.include_hidden,
             "normalization_mode": self.normalize,
             "dry_run": self.dry_run,
             "files_moved": self.move_stats.files_moved,
-            "moved_by_extension": dict(sorted(self.ext_counts.items())),
+            "moved_by_category": dict(sorted(self.ext_counts.items())),
             "name_collisions_resolved": self.move_stats.name_collisions_resolved,
             "folders_touched": self.move_stats.folders_touched,
             "empty_dirs_removed": self.empty_dirs_removed,
@@ -813,7 +792,6 @@ read -r -p "Press Enter to close..." _
                 "items_moved_in_merges": self.normalize_stats.items_moved_in_merges,
                 "merge_collisions_resolved": self.normalize_stats.merge_collisions_resolved,
                 "source_folders_removed": self.normalize_stats.source_folders_removed,
-                "alias_map": self.alias_map,
             },
             "empty_folder_collection": {
                 "enabled": self.collect_empty_dirs,
@@ -907,8 +885,8 @@ def restore_from_manifest(manifest_path: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Organize files into category folders (Images, Videos, GIFs, Other) or per-extension "
-            "folders, with optional recursive mode and normalization."
+            "Organize files into Images, Videos, GIFs, and Other at the target root "
+            "(recursive modes, optional normalization, empty-folder staging)."
         )
     )
     parser.add_argument("--path", help="Target directory path")
@@ -938,7 +916,7 @@ def parse_args() -> argparse.Namespace:
         "--normalize",
         choices=["none", "standard"],
         default="none",
-        help="Normalization mode (standard applies alias merge + uppercase bucket casing)",
+        help="Normalization mode (standard fixes Images/Videos/GIFs/Other folder casing)",
     )
     empty_dir_group = parser.add_mutually_exclusive_group()
     parser.set_defaults(collect_empty_dirs=True)
@@ -974,11 +952,6 @@ def parse_args() -> argparse.Namespace:
         metavar="MANIFEST",
         help="Restore files from a backup manifest instead of organizing",
     )
-    parser.add_argument(
-        "--by-extension",
-        action="store_true",
-        help="Use one folder per extension (JPG, PNG, MP4, …) instead of Images/Videos/GIFs/Other",
-    )
     return parser.parse_args()
 
 
@@ -1007,7 +980,6 @@ def main() -> None:
         collect_empty_dirs=args.collect_empty_dirs,
         dry_run=args.dry_run,
         create_backup=args.create_backup,
-        category_buckets=not args.by_extension,
     )
     result = org.run()
     print(json.dumps(result, indent=2))

@@ -27,7 +27,6 @@ class TinkerApp:
         self.normalize_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
-        self.category_buckets_var = tk.BooleanVar(value=True)
 
         pad = {"padx": 8, "pady": 4}
         row = 0
@@ -49,13 +48,6 @@ class TinkerApp:
         )
         row += 1
 
-        ttk.Checkbutton(
-            frm,
-            text="Group into Images / Videos / GIFs / Other (uncheck for one folder per extension)",
-            variable=self.category_buckets_var,
-        ).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
-        row += 1
-
         strat = ttk.LabelFrame(frm, text="Recursive strategy", padding=6)
         strat.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
         ttk.Radiobutton(strat, text="Flatten to root buckets (default)", variable=self.strategy_var, value="flatten-root").pack(
@@ -66,7 +58,7 @@ class TinkerApp:
 
         norm = ttk.LabelFrame(frm, text="Normalization", padding=6)
         norm.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Radiobutton(norm, text="Standard (uppercase buckets, JPEG→JPG)", variable=self.normalize_var, value="standard").pack(
+        ttk.Radiobutton(norm, text="Standard (bucket folder casing)", variable=self.normalize_var, value="standard").pack(
             anchor="w"
         )
         ttk.Radiobutton(norm, text="None", variable=self.normalize_var, value="none").pack(anchor="w")
@@ -132,8 +124,6 @@ class TinkerApp:
             cmd.append("--collect-empty-dirs")
         else:
             cmd.append("--no-collect-empty-dirs")
-        if not self.category_buckets_var.get():
-            cmd.append("--by-extension")
         if dry_run:
             cmd.append("--dry-run")
         return cmd

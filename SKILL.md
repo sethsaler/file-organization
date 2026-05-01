@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
-description: Efficient file-type organization (default buckets Images/Videos/GIFs/Other, or per-extension with --by-extension) via one Python helper — non-recursive/recursive, optional normalization, dry-run, collision-safe moves, automatic empty-folder collection.
-version: 1.6.0
+description: Organize files into Images, Videos, GIFs, and Other via one Python helper — non-recursive/recursive, optional normalization, dry-run, collision-safe moves, automatic empty-folder collection into For Deletion.
+version: 1.7.0
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -12,7 +12,7 @@ metadata:
 
 ## When to use
 
-Use this skill when a user wants a folder or folder tree reorganized into **Images**, **Videos**, **GIFs**, and **Other**, or into per-extension buckets (`--by-extension`).
+Use this skill when a user wants a folder or folder tree reorganized into **Images**, **Videos**, **GIFs**, and **Other** at the target path (flatten-root pulls files from all subfolders into those four root folders by default).
 
 ## Canonical source
 
@@ -30,26 +30,23 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 
 ## Core behavior
 
-- **Default:** buckets are four category folders: `Images`, `Videos`, `GIFs`, and `Other`. Files with `.gif` go to **GIFs** (not Images). Everything else unknown or without an extension goes to **Other**.
-- **`--by-extension`:** buckets are uppercase extension folders (for example jpg → JPG). Files without extension go to `NO_EXTENSION`.
+- Buckets are **only** `Images`, `Videos`, `GIFs`, and `Other`. Files with `.gif` go to **GIFs** (not Images). Everything else unknown or without an extension goes to **Other**.
 - No overwrite ever; collisions are suffixed (_1, _2, ...).
 - Hidden files and folders are included by default (`--no-include-hidden` to exclude dotfiles).
-- In flatten-root mode (default), empty subdirectories are automatically removed after files are moved to root-level buckets.
-- In non-recursive and in-place modes, automatic empty-folder collection moves collectable empty folder trees into a root-level `For Deletion` review folder by default.
+- With default empty-folder handling (`--collect-empty-dirs`), collectable empty folder trees move to root-level `For Deletion` (multi-round passes), then leftover empty directories are removed (including empty bucket folders). Applies to flatten-root, in-place, and non-recursive runs. Use `--no-collect-empty-dirs` to skip staging.
 
 ## Modes
 
 - Non-recursive: only target folder direct files.
-- `flatten-root`: every file under the tree (any depth) moves into buckets **directly under the chosen folder** (`Images` / `Videos` / `GIFs` / `Other` by default). Traversal skips only **root-level** bucket/`For Deletion` dirs so nested folders named like buckets (e.g. `project/Images/`) are still scanned.
+- `flatten-root`: every file under the tree (any depth) moves into buckets **directly under the chosen folder**. Traversal skips only **directories named** `For Deletion` or `.organizer` (at any depth). Legacy folders from an older sort (`JPG`, `MP4`, `PNG`, …) are always entered so files inside merge into the four category buckets.
 
 ## Normalization
 
 - none: skip normalization.
-- standard:
-  - **Category mode (default):** canonical folder names for `Images`, `Videos`, `GIFs`, `Other` (case fixes).
-  - **Extension mode (`--by-extension`):** canonical uppercase bucket names (for example WebP -> WEBP), alias folds JPEG -> JPG, JPE -> JPG.
+- standard: canonical folder names for `Images`, `Videos`, `GIFs`, `Other` (case fixes on case-insensitive volumes).
 
 Default recommendation:
+
 - Recursive runs: use standard normalization.
 - Non-recursive runs: normalization optional.
 
@@ -58,9 +55,10 @@ Default recommendation:
 This skill uses one reusable helper script at `scripts/organize_by_filetype.py` to reduce tool chatter and repeated scans.
 
 Performance characteristics:
+
 - single command execution for main operation
 - O(N) directory walk for movement stage
-- top-down pruning of known bucket folders (prevents redundant traversal)
+- top-down walk skips only `For Deletion` / `.organizer`; follows directory symlinks with inode cycle guard
 - optional bottom-up normalization pass only when requested
 - structured JSON output for direct reporting
 - dry-run mode for fast planning and validation without writes
@@ -71,53 +69,56 @@ Performance characteristics:
 - `scripts/tinker_gui.py` — optional Tk UI for folder pick, flags, dry-run/run, JSON output
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI
-- `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive flatten-root, standard normalization, `--no-collect-empty-dirs`)
-- `launchers/Organize Files by Type.command` — prompts for a folder, then flatten-root + standard normalization + empty-folder deletion (dry-run preview, then confirm)
+- `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive flatten-root, standard normalization, `For Deletion` staging by default)
+- `launchers/Organize Files by Type.command` — prompts for a folder, then flatten-root + standard normalization + `For Deletion` staging (dry-run preview, then confirm)
 - `README.md` — repository-facing documentation
 - `SKILL.md` — agent-facing skill instructions
 
 ## Execution workflow
 
-1) Confirm user inputs
+1. Confirm user inputs
+
 - target path
 - For CLI/Tinker: recursive vs non-recursive, strategy, normalization, hidden, empty-folder handling, dry-run as needed
-- For `Organize Files by Type.command`: only the folder path (behavior is fixed: recursive flatten-root, standard normalization, delete empty dirs, dry-run then confirm)
+- For `Organize Files by Type.command`: only the folder path (behavior is fixed: recursive flatten-root, standard normalization, `For Deletion` staging, dry-run then confirm)
 
-2) Run helper script
+2. Run helper script
+
 - Script location: `scripts/organize_by_filetype.py`
 - Use terminal to run the Python script with the requested flags.
 - Prefer one call per job (optionally a dry-run first, then real run).
 
-3) Parse JSON output and report
+3. Parse JSON output and report
+
 Always report:
+
 - target
 - mode and strategy
-- `bucket_mode` (`categories` or `extension`)
 - normalization mode
 - files moved total
-- counts by bucket (`moved_by_extension` in JSON — category or per-extension keys depending on mode)
+- counts by bucket (`moved_by_category`)
 - collisions resolved
 - folders touched
 - normalization stats
 - empty-folder collection / removal stats
-- verification summary (root remaining files, noncanonical dirs)
+- verification summary (root remaining files, noncanonical bucket dirs)
 
 ## Required safety rules
 
 - Never delete user files.
 - Never overwrite files.
-- Flatten-root is the default mode; files are consolidated into root-level buckets and empty subdirectories are removed.
+- Flatten-root is the default mode; files consolidate into root-level buckets. Collectable empty trees go to `For Deletion` by default, then leftover empties are removed.
 - Preserve hierarchy in recursive in-place mode.
-- Empty-folder collection is on by default for non-recursive and in-place modes, and must move folders into `For Deletion`, not remove them outright.
-- In flatten-root mode, empty subdirectories are removed directly (not staged into `For Deletion`).
+- Empty-folder collection is on by default and must move folders into `For Deletion`, not delete them outright, before the final empty-dir trim.
+- With `--no-collect-empty-dirs`, staging is skipped and empty directories are only removed in place.
 - Treat case-only folder normalization safely on case-insensitive filesystems (temporary rename sequence).
 
 ## Notes
 
 - For very large trees, do a dry run first to estimate scope.
 - Use `--no-include-hidden` when the user wants dotfiles and dot-directories left alone.
-- If the user asks to normalize aliases or casing after organization, run with `--normalize standard`.
-- Per-extension folders (`JPG`, `PNG`, …): pass `--by-extension`.
-- For non-recursive and in-place modes, empty-folder staging into `For Deletion` is the default unless `--no-collect-empty-dirs` is set.
-- Flatten-root with `--no-collect-empty-dirs` removes empty subdirectories instead of staging them.
+- If the user asks to normalize folder casing after organization, run with `--normalize standard`.
+- For non-recursive and in-place modes, empty-folder staging into `For Deletion` is the default unless `--no-collect-empty-dirs` is set; flatten-root uses the same default.
+- With `--no-collect-empty-dirs`, empty subdirectories are removed in place only (no staging).
+- iCloud Drive paths (`Mobile Documents/com~apple~CloudDocs/...`) work like normal folders; ensure files are downloaded locally if moves fail on placeholders.
 - If CLI behavior changes, update both `README.md` and the launcher if needed.

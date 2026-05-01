@@ -11,7 +11,13 @@ This project tracks changes using the Hermes skill version as its public version
 
 ### Changed
 
-- **Default bucket mode** is now **categories**: `Images`, `Videos`, `GIFs`, and `Other` (GIFs are separated from still images). Per-extension folders are available with `--by-extension`. JSON summary includes `bucket_mode`. Tinker GUI adds a checkbox for category vs per-extension grouping; docs and launchers describe the new defaults.
+- **Removed per-extension mode:** `--by-extension` is gone. Output JSON uses `moved_by_category`, `buckets`, and `noncanonical_bucket_dirs_*`; `alias_map` dropped from normalization stats.
+
+- **Traversal / legacy buckets:** Directory walking no longer skips folders whose names look like extension or category buckets (e.g. root-level `JPG/` or `Images/`). Only `For Deletion` and `.organizer` are skipped, so trees like iCloud `PreSorted/JPG/` are scanned. **Idempotent moves:** files already inside the correct destination folder are not moved again.
+
+- **Flatten-root + empty folders:** With default `--collect-empty-dirs`, flatten-root no longer deletes empty trees before collection; collectable trees are moved to `For Deletion` in multiple rounds, then a final pass removes leftover empty dirs (including empty bucket folders). Repo launchers and Desktop helper now use staging for flatten as well. `--no-collect-empty-dirs` still skips staging.
+
+- **Category-only buckets:** Default organization is **Images**, **Videos**, **GIFs**, and **Other** (GIFs separate from still images). Tinker no longer offers an extension-folder toggle.
 
 ### Added
 

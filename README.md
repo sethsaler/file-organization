@@ -1,23 +1,20 @@
 # Organize Folder by File Type
 
-A collision-safe Python tool for sorting folders into a few **category** buckets by default — `Images`, `Videos`, `GIFs`, and `Other` (everything else, including files with no extension). You can still use **per-extension** folders (`JPG`, `PNG`, `MP4`, …) with `--by-extension`.
+A collision-safe Python tool for sorting files into **Images**, **Videos**, **GIFs**, and **Other** at the folder you choose (including everything nested under it when recursive). Unknown or extensionless files go to **Other**.
 
 It supports recursive modes, dry-run previews, normalization, automatic empty-folder collection into `For Deletion` by default, and an optional macOS launcher. The project began as a Hermes skill helper, but it is also useful as a standalone command-line tool.
 
 ## What it does
 
-- **Default:** organizes files into `Images`, `Videos`, `GIFs`, and `Other` (animated GIFs use `.gif` and go to **GIFs**, not Images)
-- **`--by-extension`:** organizes into uppercase extension folders (previous behavior), with files without extensions in `NO_EXTENSION`
+- Organizes files into `Images`, `Videos`, `GIFs`, and `Other` (animated GIFs use `.gif` and go to **GIFs**, not Images)
 - Never overwrites files; resolves collisions with `_1`, `_2`, etc.
 - Supports recursive organization (default) in two modes:
-  - `flatten-root` (default): move all files from **any depth** into folders directly under the target path (`Images`, `Videos`, `GIFs`, `Other` by default). Only root-level bucket folders are skipped when walking the tree, so a nested folder named like a bucket (for example `Photos/Images/`) is still fully scanned.
+  - `flatten-root` (default): move all files from **any depth** into folders directly under the target path (`Images`, `Videos`, `GIFs`, `Other` by default). Traversal skips only `For Deletion` and `.organizer`, so **legacy extension folders at the root** (for example a prior `JPG/` or `PNG/` sort) are still fully scanned.
   - `in-place`: each directory organizes its own direct files
 - Supports non-recursive organization (root files only with `--no-recursive`)
-- Optionally normalizes bucket names (`--normalize standard`):
-  - **Category mode (default):** fixes folder casing for `Images`, `Videos`, `GIFs`, `Other`
-  - **Extension mode (`--by-extension`):** uppercases bucket folder names and folds `JPEG` / `JPE` into `JPG`
-- In flatten-root mode (default), empty subdirectories are removed after organization
-- In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default
+- Optionally normalizes bucket names (`--normalize standard`): canonical casing for `Images`, `Videos`, `GIFs`, `Other`
+- In flatten-root mode (default), collectable empty folder trees are staged into `For Deletion` first (multi-round), then any remaining empty directories (including empty bucket folders) are removed
+- In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default; a final pass removes leftover empties
 - Includes hidden files and folders by default; use `--no-include-hidden` to skip dotfiles
 - Emits structured JSON output for scripting and automation
 
@@ -55,12 +52,6 @@ Default (recursive flatten-root, standard normalization):
 python3 scripts/organize_by_filetype.py --path /path/to/folder --normalize standard
 ```
 
-Per-extension folders (legacy behavior):
-
-```bash
-python3 scripts/organize_by_filetype.py --path /path/to/folder --by-extension --normalize standard
-```
-
 Non-recursive (root files only):
 
 ```bash
@@ -82,7 +73,7 @@ Dry run preview:
 python3 scripts/organize_by_filetype.py --path /path/to/folder --dry-run
 ```
 
-Disable automatic empty-folder collection (or deletion in flatten-root mode):
+Disable automatic empty-folder staging into `For Deletion` (flatten-root will only remove empties on disk):
 
 ```bash
 python3 scripts/organize_by_filetype.py \
@@ -104,31 +95,31 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--strategy {flatten-root,in-place}` — recursive strategy (default: flatten-root)
 - `--include-hidden` — include hidden files and folders (default behavior)
 - `--no-include-hidden` — exclude dotfiles and dot-directories
-- `--by-extension` — use one folder per file extension instead of Images/Videos/GIFs/Other
-- `--normalize {none,standard}` — normalization mode
-- `--collect-empty-dirs` — explicitly enable empty-folder collection into `For Deletion` (default; in flatten-root mode, empty dirs are deleted instead)
-- `--no-collect-empty-dirs` — disable automatic empty-folder handling
+- `--normalize {none,standard}` — normalization mode (standard fixes bucket folder casing)
+- `--collect-empty-dirs` — stage collectable empty folder trees into root-level `For Deletion` (default)
+- `--no-collect-empty-dirs` — skip staging; only remove empty directories in place after organizing
 - `--dry-run` — preview changes without writing
 
 ## Behavior and safety
 
-- **Default buckets:** `Images`, `Videos`, `GIFs`, `Other` (see the script for the extension lists; unknown or missing extensions go to `Other`)
-- **`--by-extension`:** buckets are uppercase extension folders such as `JPG`, `PNG`, and `MP4`; alias folding maps `JPEG` and `JPE` to `JPG`
+- **Buckets:** `Images`, `Videos`, `GIFs`, `Other` (see the script for extension lists)
 - Hidden files and folders are organized like visible ones unless `--no-include-hidden` is set
 - Existing files are never overwritten
 - Name collisions are resolved by suffixing `_1`, `_2`, and so on
-- In flatten-root mode (default), empty subdirectories are removed automatically after files are moved
-- In non-recursive and in-place modes, empty-folder collection is enabled by default and moves collectable empty folder trees into a review bucket named `For Deletion` — folders are never deleted outright in these modes
-- Use `--no-collect-empty-dirs` to disable empty-folder handling entirely
+- In flatten-root mode (default), empty trees are staged into `For Deletion` when collection is enabled; afterward, remaining empty directories are removed (including unused bucket folders)
+- When `--no-collect-empty-dirs` is set, empty folders are removed in place only (nothing moved to `For Deletion`)
+- In non-recursive and in-place modes, behavior matches: stage collectable trees to `For Deletion` by default, then trim leftover empties
+- Use `--no-collect-empty-dirs` to disable staging entirely
 
 ## JSON output
 
 The script prints a JSON summary including:
 
 - target path
-- mode, strategy, and `bucket_mode` (`categories` or `extension`)
+- mode and strategy
+- `buckets` (always Images / Videos / GIFs / Other)
 - files moved
-- move counts by bucket (`moved_by_extension` in JSON — category or extension names depending on mode)
+- `moved_by_category` — counts per bucket folder
 - collision count
 - folders touched
 - normalization stats
@@ -140,8 +131,8 @@ The script prints a JSON summary including:
 Optional launchers are included at:
 
 - `launchers/Organize by File Type (Tinker).command` — opens a small **Tk GUI** to pick a folder, set recursive/normalization/empty-folder options, then **Dry run** or **Run** (JSON shown in the window).
-- `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively into **Images / Videos / GIFs / Other** (flatten-root, standard normalization, no `For Deletion` staging).
-- `launchers/Organize Files by Type.command` — prompts for a folder: moves all files (recursive) into those **four top-level** folders, deletes empty folders afterward, dry-run preview then confirmation (same defaults as Desktop: flatten-root, standard normalization, no `For Deletion` staging).
+- `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively into **Images / Videos / GIFs / Other** (flatten-root, standard normalization; empty trees staged to `For Deletion` by default).
+- `launchers/Organize Files by Type.command` — prompts for a folder: same as Desktop (flatten-root, standard normalization, `For Deletion` staging, dry-run preview then confirm).
 
 ## Image text extraction (OCR)
 

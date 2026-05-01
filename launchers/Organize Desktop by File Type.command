@@ -34,14 +34,12 @@ if [[ ! -d "$DESKTOP" ]]; then
   exit 1
 fi
 
-# Recursive flatten-root: all files consolidate into Desktop-level type buckets.
-# Standard normalization: canonical bucket folder names (category mode).
-# No empty-folder staging: flatten-root deletes empty subdirs directly.
+# Recursive flatten-root: files consolidate into Desktop-level buckets; empty folder trees
+# stage under ~/Desktop/For Deletion (default); leftover empty dirs are removed afterward.
 JSON="$(python3 "$HELPER" \
   --path "$DESKTOP" \
   --strategy flatten-root \
-  --normalize standard \
-  --no-collect-empty-dirs)"
+  --normalize standard)"
 
 echo "$JSON" | python3 -c "
 import json, sys
