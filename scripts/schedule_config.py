@@ -221,6 +221,8 @@ def run_enabled_folders(
                     log(snippet + "\n")
                 if rc != 0:
                     log(f"(exit {rc})\n")
+                if last_err and not err and not out and rc == 0:
+                    log(last_err + "\n")
 
     try:
         save_config(config_path, cfg)

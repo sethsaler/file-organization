@@ -510,21 +510,7 @@ class ScheduleApp:
             return
 
         def worker() -> None:
-            try:
-                mp = int(self.max_parallel_var.get())
-            except (tk.TclError, ValueError):
-                mp = None
-
-            def log(msg: str) -> None:
-                self._log_queue.put(msg)
-
-            with self._cfg_lock:
-                path = self.config_path
-            cfg = load_config(path)
-            run_enabled_folders(cfg, path, max_parallel=mp, log=log, label="manual all enabled")
-            with self._cfg_lock:
-                self.cfg = load_config(self.config_path)
-            self._queue_ui(self._refresh_tree)
+            self._execute_folder_batch(label="manual all enabled")
 
         self._append_log("\n--- Run all enabled (parallel) ---\n")
         threading.Thread(target=worker, daemon=True).start()
