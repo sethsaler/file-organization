@@ -1,0 +1,13 @@
+[Unit]
+Description=File organization scheduler
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=INSTALL_DIR/scripts
+ExecStart=/usr/bin/python3 INSTALL_DIR/scripts/schedule_daemon.py --foreground
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

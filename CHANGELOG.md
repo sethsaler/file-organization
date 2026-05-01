@@ -7,6 +7,7 @@ This project tracks changes using the Hermes skill version as its public version
 ## [Unreleased]
 
 - Ongoing improvements, cleanup, and repository polish.
+- Added `scripts/schedule_config.py`, `scripts/schedule_daemon.py`, and parallel `schedule.json` runs; `install/systemd/` and `install/launchd/` examples for long-running background scheduling.
 - Added `scripts/extract_image_text.py` to extract text from PNG/JPEG images via Tesseract and write CSV or Excel (`file_name`, `extracted_text`), plus `requirements-ocr.txt` and README documentation.
 
 ### Changed
