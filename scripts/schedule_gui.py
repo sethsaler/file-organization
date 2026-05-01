@@ -216,8 +216,10 @@ class ScheduleApp:
             v = 60
         v = max(1, min(10080, v))
         self.interval_var.set(v)
+        prev = self.cfg.interval_minutes
         self.cfg.interval_minutes = v
-        self._wake_event.set()
+        if v != prev:
+            self._wake_event.set()
 
     def _sync_parallel_to_cfg(self) -> None:
         try:
@@ -236,6 +238,7 @@ class ScheduleApp:
             self._append_log("Automatic runs enabled in this window (parallel batches).\n")
         else:
             self._append_log("Automatic runs in this window disabled.\n")
+        self._save_quiet()
 
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -263,39 +266,63 @@ class ScheduleApp:
             remaining -= chunk
         return False
 
+    def _wait_interval(self, seconds: float) -> str:
+        """Wait up to `seconds`. Return 'stop', 'wake' (early interrupt), or 'done' (full elapsed)."""
+        remaining = float(seconds)
+        while remaining > 0:
+            if self._stop_event.is_set():
+                return "stop"
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return "wake"
+            chunk = min(remaining, 1.0)
+            if self._stop_event.wait(timeout=chunk):
+                return "stop"
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return "wake"
+            remaining -= chunk
+        return "done"
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             if not self.cfg.scheduler_enabled:
                 if self._interruptible_wait(1.0):
                     break
                 continue
-            minutes = max(1, min(10080, int(self.cfg.interval_minutes)))
-            wait_sec = minutes * 60
-            if self._interruptible_wait(wait_sec):
+            self._execute_folder_batch(label="scheduled")
+            if self._stop_event.is_set():
                 break
-            if not self.cfg.scheduler_enabled:
-                continue
-            self._run_scheduled_batch()
+            while self.cfg.scheduler_enabled and not self._stop_event.is_set():
+                minutes = max(1, min(10080, int(self.cfg.interval_minutes)))
+                wait_sec = minutes * 60
+                why = self._wait_interval(wait_sec)
+                if why == "stop":
+                    return
+                if not self.cfg.scheduler_enabled:
+                    break
+                if why == "wake":
+                    continue
+                self._execute_folder_batch(label="scheduled")
+                if self._stop_event.is_set():
+                    break
 
-    def _run_scheduled_batch(self) -> None:
-        def worker() -> None:
-            try:
-                mp = int(self.max_parallel_var.get())
-            except (tk.TclError, ValueError):
-                mp = None
-            with self._cfg_lock:
-                path = self.config_path
-            cfg = load_config(path)
+    def _execute_folder_batch(self, label: str) -> None:
+        try:
+            mp = int(self.max_parallel_var.get())
+        except (tk.TclError, ValueError):
+            mp = None
+        with self._cfg_lock:
+            path = self.config_path
+        cfg = load_config(path)
 
-            def log(msg: str) -> None:
-                self._log_queue.put(msg)
+        def log(msg: str) -> None:
+            self._log_queue.put(msg)
 
-            run_enabled_folders(cfg, path, max_parallel=mp, log=log, label="scheduled")
-            with self._cfg_lock:
-                self.cfg = load_config(self.config_path)
-            self._queue_ui(self._refresh_tree)
-
-        threading.Thread(target=worker, daemon=True).start()
+        run_enabled_folders(cfg, path, max_parallel=mp, log=log, label=label)
+        with self._cfg_lock:
+            self.cfg = load_config(self.config_path)
+        self._queue_ui(self._refresh_tree)
 
     def _queue_ui(self, fn: Any) -> None:
         try:
@@ -431,28 +458,50 @@ class ScheduleApp:
             messagebox.showerror("Folder", f"Not a directory:\n{base}")
             return
         cmd = build_organize_cmd(job)
+        path_key = str(Path(job.path).expanduser().resolve())
         self._append_log("\n--- manual run (one folder) ---\n$ " + " ".join(cmd) + "\n\n")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        except subprocess.TimeoutExpired:
-            self._append_log("Timed out after 1 hour.\n")
-            return
-        except OSError as e:
-            self._append_log(f"Could not run helper: {e}\n")
-            return
-        err = (proc.stderr or "").strip()
-        out = (proc.stdout or "").strip()
-        if err:
-            self._append_log(err + "\n")
-        if out:
-            self._append_log(out + "\n")
-        if proc.returncode != 0:
-            self._append_log(f"\n(exit code {proc.returncode})\n")
-        else:
-            job.last_run = datetime.now(timezone.utc).isoformat()
-            job.last_error = None
-            self._refresh_tree_row(idx)
-            self._save_quiet()
+
+        def worker() -> None:
+            def log(msg: str) -> None:
+                self._log_queue.put(msg)
+
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            except subprocess.TimeoutExpired:
+                log("Timed out after 1 hour.\n")
+                return
+            except OSError as e:
+                log(f"Could not run helper: {e}\n")
+                return
+            err = (proc.stderr or "").strip()
+            out = (proc.stdout or "").strip()
+            if err:
+                log(err + "\n")
+            if out:
+                log(out + "\n")
+            if proc.returncode != 0:
+                log(f"\n(exit code {proc.returncode})\n")
+                return
+
+            def apply_success() -> None:
+                idx2 = None
+                for i, j in enumerate(self.cfg.folders):
+                    try:
+                        if str(Path(j.path).expanduser().resolve()) == path_key:
+                            idx2 = i
+                            break
+                    except OSError:
+                        continue
+                if idx2 is None:
+                    return
+                self.cfg.folders[idx2].last_run = datetime.now(timezone.utc).isoformat()
+                self.cfg.folders[idx2].last_error = None
+                self._refresh_tree_row(idx2)
+                self._save_quiet()
+
+            self._queue_ui(apply_success)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _run_all_enabled_now(self) -> None:
         helper = organizer_script_path()
