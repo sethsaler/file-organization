@@ -1,21 +1,21 @@
 # Organize Folder by File Type
 
-A collision-safe Python tool for sorting folders into uppercase extension buckets such as `JPG`, `PNG`, and `MP4`.
+A collision-safe Python tool for sorting folders into a few **category** buckets by default — `Images`, `Videos`, `GIFs`, and `Other` (everything else, including files with no extension). You can still use **per-extension** folders (`JPG`, `PNG`, `MP4`, …) with `--by-extension`.
 
 It supports recursive modes, dry-run previews, normalization, automatic empty-folder collection into `For Deletion` by default, and an optional macOS launcher. The project began as a Hermes skill helper, but it is also useful as a standalone command-line tool.
 
 ## What it does
 
-- Organizes files into uppercase extension folders
-- Sends files without extensions to `NO_EXTENSION`
+- **Default:** organizes files into `Images`, `Videos`, `GIFs`, and `Other` (animated GIFs use `.gif` and go to **GIFs**, not Images)
+- **`--by-extension`:** organizes into uppercase extension folders (previous behavior), with files without extensions in `NO_EXTENSION`
 - Never overwrites files; resolves collisions with `_1`, `_2`, etc.
 - Supports recursive organization (default) in two modes:
-  - `flatten-root` (default): move all files from **any depth** into folders directly under the target path (`PDF`, `JPG`, …). Only root-level bucket folders are skipped when walking the tree, so a nested folder named like an extension (for example `Photos/JPG/`) is still fully scanned.
+  - `flatten-root` (default): move all files from **any depth** into folders directly under the target path (`Images`, `Videos`, `GIFs`, `Other` by default). Only root-level bucket folders are skipped when walking the tree, so a nested folder named like a bucket (for example `Photos/Images/`) is still fully scanned.
   - `in-place`: each directory organizes its own direct files
 - Supports non-recursive organization (root files only with `--no-recursive`)
-- Optionally normalizes bucket names:
-  - uppercases bucket folder names
-  - folds `JPEG` and `JPE` into `JPG`
+- Optionally normalizes bucket names (`--normalize standard`):
+  - **Category mode (default):** fixes folder casing for `Images`, `Videos`, `GIFs`, `Other`
+  - **Extension mode (`--by-extension`):** uppercases bucket folder names and folds `JPEG` / `JPE` into `JPG`
 - In flatten-root mode (default), empty subdirectories are removed after organization
 - In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default
 - Includes hidden files and folders by default; use `--no-include-hidden` to skip dotfiles
@@ -53,6 +53,12 @@ Default (recursive flatten-root, standard normalization):
 
 ```bash
 python3 scripts/organize_by_filetype.py --path /path/to/folder --normalize standard
+```
+
+Per-extension folders (legacy behavior):
+
+```bash
+python3 scripts/organize_by_filetype.py --path /path/to/folder --by-extension --normalize standard
 ```
 
 Non-recursive (root files only):
@@ -98,6 +104,7 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--strategy {flatten-root,in-place}` — recursive strategy (default: flatten-root)
 - `--include-hidden` — include hidden files and folders (default behavior)
 - `--no-include-hidden` — exclude dotfiles and dot-directories
+- `--by-extension` — use one folder per file extension instead of Images/Videos/GIFs/Other
 - `--normalize {none,standard}` — normalization mode
 - `--collect-empty-dirs` — explicitly enable empty-folder collection into `For Deletion` (default; in flatten-root mode, empty dirs are deleted instead)
 - `--no-collect-empty-dirs` — disable automatic empty-folder handling
@@ -105,22 +112,23 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 
 ## Behavior and safety
 
-- Buckets are uppercase extension folders such as `JPG`, `PNG`, and `MP4`
-- Alias folding maps `JPEG` and `JPE` to `JPG`
+- **Default buckets:** `Images`, `Videos`, `GIFs`, `Other` (see the script for the extension lists; unknown or missing extensions go to `Other`)
+- **`--by-extension`:** buckets are uppercase extension folders such as `JPG`, `PNG`, and `MP4`; alias folding maps `JPEG` and `JPE` to `JPG`
 - Hidden files and folders are organized like visible ones unless `--no-include-hidden` is set
 - Existing files are never overwritten
 - Name collisions are resolved by suffixing `_1`, `_2`, and so on
 - In flatten-root mode (default), empty subdirectories are removed automatically after files are moved
 - In non-recursive and in-place modes, empty-folder collection is enabled by default and moves collectable empty folder trees into a review bucket named `For Deletion` — folders are never deleted outright in these modes
 - Use `--no-collect-empty-dirs` to disable empty-folder handling entirely
+
 ## JSON output
 
 The script prints a JSON summary including:
 
 - target path
-- mode and strategy
+- mode, strategy, and `bucket_mode` (`categories` or `extension`)
 - files moved
-- moves by extension
+- move counts by bucket (`moved_by_extension` in JSON — category or extension names depending on mode)
 - collision count
 - folders touched
 - normalization stats
@@ -132,8 +140,8 @@ The script prints a JSON summary including:
 Optional launchers are included at:
 
 - `launchers/Organize by File Type (Tinker).command` — opens a small **Tk GUI** to pick a folder, set recursive/normalization/empty-folder options, then **Dry run** or **Run** (JSON shown in the window).
-- `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively (files only into extension folders; no overwrites; duplicate names get `_1`, `_2`, … before the extension). Does not stage empty folders into `For Deletion` so the Desktop stays predictable.
-- `launchers/Organize Files by Type.command` — prompts for a folder: moves all files (recursive) into top-level type folders, deletes empty folders afterward, dry-run preview then confirmation (same defaults as Desktop: flatten-root, standard normalization, no `For Deletion` staging).
+- `launchers/Organize Desktop by File Type.command` — **one-click**: organizes `~/Desktop` recursively into **Images / Videos / GIFs / Other** (flatten-root, standard normalization, no `For Deletion` staging).
+- `launchers/Organize Files by Type.command` — prompts for a folder: moves all files (recursive) into those **four top-level** folders, deletes empty folders afterward, dry-run preview then confirmation (same defaults as Desktop: flatten-root, standard normalization, no `For Deletion` staging).
 
 ## Image text extraction (OCR)
 

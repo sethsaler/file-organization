@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
-description: Efficient file-type organization with a single optimized Python helper (non-recursive/recursive, optional normalization, dry-run, collision-safe moves, and automatic empty-folder collection).
-version: 1.5.1
+description: Efficient file-type organization (default buckets Images/Videos/GIFs/Other, or per-extension with --by-extension) via one Python helper — non-recursive/recursive, optional normalization, dry-run, collision-safe moves, automatic empty-folder collection.
+version: 1.6.0
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -12,7 +12,7 @@ metadata:
 
 ## When to use
 
-Use this skill when a user wants a folder or folder tree reorganized into extension buckets like JPG, PNG, and MP4.
+Use this skill when a user wants a folder or folder tree reorganized into **Images**, **Videos**, **GIFs**, and **Other**, or into per-extension buckets (`--by-extension`).
 
 ## Canonical source
 
@@ -30,8 +30,8 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 
 ## Core behavior
 
-- Buckets are uppercase extension folders (for example jpg -> JPG).
-- Files without extension go to NO_EXTENSION.
+- **Default:** buckets are four category folders: `Images`, `Videos`, `GIFs`, and `Other`. Files with `.gif` go to **GIFs** (not Images). Everything else unknown or without an extension goes to **Other**.
+- **`--by-extension`:** buckets are uppercase extension folders (for example jpg → JPG). Files without extension go to `NO_EXTENSION`.
 - No overwrite ever; collisions are suffixed (_1, _2, ...).
 - Hidden files and folders are included by default (`--no-include-hidden` to exclude dotfiles).
 - In flatten-root mode (default), empty subdirectories are automatically removed after files are moved to root-level buckets.
@@ -40,16 +40,14 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 ## Modes
 
 - Non-recursive: only target folder direct files.
-- `flatten-root`: every file under the tree (any depth) moves into extension buckets **directly under the chosen folder**. Traversal skips only **root-level** bucket/`For Deletion` dirs so nested folders named like extensions (e.g. `project/JPG/`) are still scanned.
+- `flatten-root`: every file under the tree (any depth) moves into buckets **directly under the chosen folder** (`Images` / `Videos` / `GIFs` / `Other` by default). Traversal skips only **root-level** bucket/`For Deletion` dirs so nested folders named like buckets (e.g. `project/Images/`) are still scanned.
 
 ## Normalization
 
 - none: skip normalization.
 - standard:
-  - canonical uppercase bucket names (for example WebP -> WEBP)
-  - alias folds:
-    - JPEG -> JPG
-    - JPE -> JPG
+  - **Category mode (default):** canonical folder names for `Images`, `Videos`, `GIFs`, `Other` (case fixes).
+  - **Extension mode (`--by-extension`):** canonical uppercase bucket names (for example WebP -> WEBP), alias folds JPEG -> JPG, JPE -> JPG.
 
 Default recommendation:
 - Recursive runs: use standard normalization.
@@ -94,9 +92,10 @@ Performance characteristics:
 Always report:
 - target
 - mode and strategy
+- `bucket_mode` (`categories` or `extension`)
 - normalization mode
 - files moved total
-- counts by extension
+- counts by bucket (`moved_by_extension` in JSON — category or per-extension keys depending on mode)
 - collisions resolved
 - folders touched
 - normalization stats
@@ -118,6 +117,7 @@ Always report:
 - For very large trees, do a dry run first to estimate scope.
 - Use `--no-include-hidden` when the user wants dotfiles and dot-directories left alone.
 - If the user asks to normalize aliases or casing after organization, run with `--normalize standard`.
+- Per-extension folders (`JPG`, `PNG`, …): pass `--by-extension`.
 - For non-recursive and in-place modes, empty-folder staging into `For Deletion` is the default unless `--no-collect-empty-dirs` is set.
 - Flatten-root with `--no-collect-empty-dirs` removes empty subdirectories instead of staging them.
 - If CLI behavior changes, update both `README.md` and the launcher if needed.

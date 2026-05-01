@@ -9,6 +9,10 @@ This project tracks changes using the Hermes skill version as its public version
 - Ongoing improvements, cleanup, and repository polish.
 - Added `scripts/extract_image_text.py` to extract text from PNG/JPEG images via Tesseract and write CSV or Excel (`file_name`, `extracted_text`), plus `requirements-ocr.txt` and README documentation.
 
+### Changed
+
+- **Default bucket mode** is now **categories**: `Images`, `Videos`, `GIFs`, and `Other` (GIFs are separated from still images). Per-extension folders are available with `--by-extension`. JSON summary includes `bucket_mode`. Tinker GUI adds a checkbox for category vs per-extension grouping; docs and launchers describe the new defaults.
+
 ### Added
 
 - `scripts/install.sh`: curl-friendly installer that unpacks a GitHub ref into `~/.local/share/organize-folder-by-filetype` (configurable via `FILE_ORG_*` env vars).

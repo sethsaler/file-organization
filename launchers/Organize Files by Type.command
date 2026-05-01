@@ -1,5 +1,6 @@
 #!/bin/bash
-# Prompt for a folder, move every file (recursive) into top-level extension buckets,
+# Prompt for a folder, move every file (recursive) into top-level category buckets
+# (Images, Videos, GIFs, Other),
 # then delete empty folders. Safe moves only — collisions become name_1.ext, name_2.ext, …
 set -euo pipefail
 
@@ -42,8 +43,8 @@ echo " Organize Folder by File Type"
 echo "=============================================="
 echo
 echo "This gathers every file (including inside subfolders) into"
-echo "folders at the top of your chosen directory named by type"
-echo "(PDF, JPG, …). Then it deletes leftover empty folders."
+echo "folders at the top of your chosen directory (Images, Videos,"
+echo "GIFs, Other). Then it deletes leftover empty folders."
 echo "Nothing is overwritten — duplicates get _1, _2, … before the extension."
 echo
 

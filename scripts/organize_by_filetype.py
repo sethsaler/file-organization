@@ -19,6 +19,73 @@ ALIAS_MAP_DEFAULT: Dict[str, str] = {
     "JPE": "JPG",
 }
 
+# Extensions (uppercase, no dot) for default category-bucket mode. GIF is handled first so it
+# never lands in Images.
+GIF_EXTS: Set[str] = {"GIF"}
+
+VIDEO_EXTS: Set[str] = {
+    "MP4",
+    "M4V",
+    "MOV",
+    "AVI",
+    "MKV",
+    "WEBM",
+    "WMV",
+    "FLV",
+    "MPEG",
+    "MPG",
+    "M2TS",
+    "MTS",
+    "TS",
+    "3GP",
+    "3G2",
+    "OGV",
+    "ASF",
+    "F4V",
+    "VOB",
+    "DIVX",
+}
+
+IMAGE_EXTS: Set[str] = {
+    "JPG",
+    "JPEG",
+    "JPE",
+    "PNG",
+    "WEBP",
+    "BMP",
+    "TIFF",
+    "TIF",
+    "HEIC",
+    "HEIF",
+    "AVIF",
+    "JXL",
+    "SVG",
+    "ICO",
+    "RAW",
+    "CR2",
+    "NEF",
+    "ARW",
+    "DNG",
+    "ORF",
+    "RW2",
+    "PSD",
+    "TGA",
+    "PCX",
+    "HDR",
+    "EXR",
+    "JP2",
+    "J2K",
+}
+
+CATEGORY_BUCKET_FOLDERS: Set[str] = {"Images", "Videos", "GIFs", "Other"}
+
+_CATEGORY_DIR_CANONICAL: Dict[str, str] = {
+    "images": "Images",
+    "videos": "Videos",
+    "gifs": "GIFs",
+    "other": "Other",
+}
+
 FOR_DELETION_DIR_NAME = "For Deletion"
 ORGANIZER_DIR_NAME = ".organizer"
 EMPTY_DIR_SAMPLE_LIMIT = 20
@@ -77,6 +144,7 @@ class Organizer:
         collect_empty_dirs: bool,
         dry_run: bool,
         create_backup: bool = True,
+        category_buckets: bool = True,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -86,6 +154,7 @@ class Organizer:
         self.collect_empty_dirs = collect_empty_dirs
         self.dry_run = dry_run
         self.create_backup = create_backup
+        self.category_buckets = category_buckets
 
         self.alias_map = dict(ALIAS_MAP_DEFAULT)
         self.ext_counts = Counter()
@@ -158,6 +227,11 @@ class Organizer:
         return exts
 
     def _canonical_folder_name(self, name: str) -> Optional[str]:
+        if self.category_buckets:
+            canon = _CATEGORY_DIR_CANONICAL.get(name.casefold())
+            if canon is not None and canon != name:
+                return canon
+            return None
         u = name.upper()
         if u in self.alias_map:
             return self.alias_map[u]
@@ -197,8 +271,17 @@ class Organizer:
 
     def _bucket_for_file(self, file_name: str) -> str:
         suffix = Path(file_name).suffix
-        ext = suffix[1:].upper() if suffix else "NO_EXTENSION"
-        return self.alias_map.get(ext, ext)
+        ext = suffix[1:].upper() if suffix else ""
+        if self.category_buckets:
+            if ext in GIF_EXTS:
+                return "GIFs"
+            if ext in VIDEO_EXTS:
+                return "Videos"
+            if ext in IMAGE_EXTS:
+                return "Images"
+            return "Other"
+        ext_bucket = ext if ext else "NO_EXTENSION"
+        return self.alias_map.get(ext_bucket, ext_bucket)
 
     def _move_one_file(self, src: Path, dest_dir: Path) -> None:
         dest_dir_name = dest_dir.name
@@ -387,6 +470,7 @@ class Organizer:
                     normalize=self.normalize,
                     collect_empty_dirs=True,
                     dry_run=False,
+                    category_buckets=self.category_buckets,
                 )
                 sim_org.run()
                 return EmptyDirStats(
@@ -685,11 +769,14 @@ read -r -p "Press Enter to close..." _
         }
 
     def run(self) -> Dict[str, object]:
-        exts = self._collect_extensions()
-        self.bucket_names = set(exts)
-        self.bucket_names.update({"NO_EXTENSION"})
-        self.bucket_names.update(self.alias_map.keys())
-        self.bucket_names.update(self.alias_map.values())
+        if self.category_buckets:
+            self.bucket_names = set(CATEGORY_BUCKET_FOLDERS)
+        else:
+            exts = self._collect_extensions()
+            self.bucket_names = set(exts)
+            self.bucket_names.update({"NO_EXTENSION"})
+            self.bucket_names.update(self.alias_map.keys())
+            self.bucket_names.update(self.alias_map.values())
 
         if self.recursive:
             if self.strategy == "in-place":
@@ -711,6 +798,7 @@ read -r -p "Press Enter to close..." _
             "target": str(self.base),
             "mode": "recursive" if self.recursive else "non-recursive",
             "strategy": self.strategy if self.recursive else "root-only",
+            "bucket_mode": "categories" if self.category_buckets else "extension",
             "include_hidden": self.include_hidden,
             "normalization_mode": self.normalize,
             "dry_run": self.dry_run,
@@ -817,7 +905,12 @@ def restore_from_manifest(manifest_path: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Organize files by extension folders with optional recursive mode and normalization.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Organize files into category folders (Images, Videos, GIFs, Other) or per-extension "
+            "folders, with optional recursive mode and normalization."
+        )
+    )
     parser.add_argument("--path", help="Target directory path")
     parser.add_argument("--recursive", action="store_true", default=True, help="Enable recursive organization (default)")
     parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="Disable recursive, root files only")
@@ -881,6 +974,11 @@ def parse_args() -> argparse.Namespace:
         metavar="MANIFEST",
         help="Restore files from a backup manifest instead of organizing",
     )
+    parser.add_argument(
+        "--by-extension",
+        action="store_true",
+        help="Use one folder per extension (JPG, PNG, MP4, …) instead of Images/Videos/GIFs/Other",
+    )
     return parser.parse_args()
 
 
@@ -909,6 +1007,7 @@ def main() -> None:
         collect_empty_dirs=args.collect_empty_dirs,
         dry_run=args.dry_run,
         create_backup=args.create_backup,
+        category_buckets=not args.by_extension,
     )
     result = org.run()
     print(json.dumps(result, indent=2))

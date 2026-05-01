@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-click: organize all files on your Desktop into extension folders (JPG, PDF, …).
+# One-click: organize all files on your Desktop into Images, Videos, GIFs, Other (plus everything else in Other).
 # Safe moves only — never overwrites; duplicate names become name_1.ext, name_2.ext, …
 set -euo pipefail
 
@@ -35,7 +35,7 @@ if [[ ! -d "$DESKTOP" ]]; then
 fi
 
 # Recursive flatten-root: all files consolidate into Desktop-level type buckets.
-# Standard normalization: JPEG/JPE -> JPG, uppercase buckets.
+# Standard normalization: canonical bucket folder names (category mode).
 # No empty-folder staging: flatten-root deletes empty subdirs directly.
 JSON="$(python3 "$HELPER" \
   --path "$DESKTOP" \
