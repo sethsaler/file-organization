@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
 description: Organize files into Images, Videos, GIFs, and Other via one Python helper — non-recursive/recursive, optional normalization, dry-run, collision-safe moves, automatic empty-folder collection into For Deletion.
-version: 1.7.0
+version: 1.7.1
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -25,6 +25,7 @@ Keep changes synchronized across:
 - `README.md`
 - `launchers/Organize Files by Type.command` when launcher behavior is affected
 - `scripts/tinker_gui.py` when CLI flags or GUI options should stay aligned
+- `scripts/schedule_config.py`, `scripts/schedule_gui.py`, and `scripts/schedule_daemon.py` when schedule JSON or runner behavior changes
 
 Use `README.md` for repository-facing documentation and `SKILL.md` for agent-facing operating instructions.
 
@@ -67,7 +68,11 @@ Performance characteristics:
 
 - `scripts/organize_by_filetype.py` — main helper
 - `scripts/tinker_gui.py` — optional Tk UI for folder pick, flags, dry-run/run, JSON output
+- `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
+- `scripts/schedule_gui.py` — Tk UI to manage scheduled folders and options
+- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
+- `install/systemd/`, `install/launchd/` — example service files for long-running background scheduling
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI
 - `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive flatten-root, standard normalization, `For Deletion` staging by default)
 - `launchers/Organize Files by Type.command` — prompts for a folder, then flatten-root + standard normalization + `For Deletion` staging (dry-run preview, then confirm)

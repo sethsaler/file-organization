@@ -1,146 +1,36 @@
 #!/usr/bin/env python3
-"""Tk GUI: designate folders to organize on a repeating interval while this window stays open.
+"""Tk GUI: designate folders to organize on a schedule.
 
-Schedules are saved to a JSON file so your folder list and options persist. The scheduler
-runs in a background thread and invokes organize_by_filetype.py (same as the Tinker GUI).
-
-Keep this app running for automatic runs; closing the window stops the timer.
+Uses the same JSON config as `schedule_daemon.py` (~/.config/file-organization/schedule.json).
+Enable **automatic runs** for an in-window timer, or run **`schedule_daemon.py --foreground`**
+with systemd/cron for true background scheduling. Enabled folders run **in parallel** (see max parallel).
 """
 
 from __future__ import annotations
 
-import json
-import os
 import queue
 import subprocess
 import sys
 import threading
 import tkinter as tk
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
-CONFIG_VERSION = 1
-
-
-def _helper_script() -> Path:
-    return Path(__file__).resolve().parent / "organize_by_filetype.py"
-
-
-def default_config_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME", "").strip()
-    if base:
-        cfg = Path(base) / "file-organization"
-    else:
-        cfg = Path.home() / ".config" / "file-organization"
-    return cfg / "schedule.json"
-
-
-@dataclass
-class FolderJob:
-    path: str
-    enabled: bool = True
-    recursive: bool = True
-    strategy: str = "flatten-root"
-    normalize: str = "standard"
-    include_hidden: bool = True
-    collect_empty_dirs: bool = True
-    last_run: Optional[str] = None
-    last_error: Optional[str] = None
-
-
-@dataclass
-class ScheduleConfig:
-    version: int = CONFIG_VERSION
-    interval_minutes: int = 60
-    scheduler_enabled: bool = False
-    folders: List[FolderJob] = field(default_factory=list)
-
-    def to_json_dict(self) -> Dict[str, Any]:
-        return {
-            "version": self.version,
-            "interval_minutes": self.interval_minutes,
-            "scheduler_enabled": self.scheduler_enabled,
-            "folders": [asdict(f) for f in self.folders],
-        }
-
-    @classmethod
-    def from_json_dict(cls, data: Dict[str, Any]) -> ScheduleConfig:
-        ver = int(data.get("version", 1))
-        folders_raw = data.get("folders") or []
-        folders: List[FolderJob] = []
-        for item in folders_raw:
-            if not isinstance(item, dict):
-                continue
-            p = str(item.get("path", "")).strip()
-            if not p:
-                continue
-            folders.append(
-                FolderJob(
-                    path=p,
-                    enabled=bool(item.get("enabled", True)),
-                    recursive=bool(item.get("recursive", True)),
-                    strategy=str(item.get("strategy", "flatten-root")),
-                    normalize=str(item.get("normalize", "standard")),
-                    include_hidden=bool(item.get("include_hidden", True)),
-                    collect_empty_dirs=bool(item.get("collect_empty_dirs", True)),
-                    last_run=item.get("last_run"),
-                    last_error=item.get("last_error"),
-                )
-            )
-        return cls(
-            version=ver,
-            interval_minutes=max(1, min(10080, int(data.get("interval_minutes", 60)))),
-            scheduler_enabled=bool(data.get("scheduler_enabled", False)),
-            folders=folders,
-        )
-
-
-def load_config(path: Path) -> ScheduleConfig:
-    if not path.is_file():
-        return ScheduleConfig()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return ScheduleConfig()
-        return ScheduleConfig.from_json_dict(data)
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        return ScheduleConfig()
-
-
-def save_config(path: Path, cfg: ScheduleConfig) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(cfg.to_json_dict(), indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def build_organize_cmd(job: FolderJob) -> List[str]:
-    base = Path(job.path).expanduser()
-    cmd = [
-        sys.executable,
-        str(_helper_script()),
-        "--path",
-        str(base),
-        "--strategy",
-        job.strategy,
-        "--normalize",
-        job.normalize,
-    ]
-    if job.recursive:
-        cmd.append("--recursive")
-    else:
-        cmd.append("--no-recursive")
-    if not job.include_hidden:
-        cmd.append("--no-include-hidden")
-    if job.collect_empty_dirs:
-        cmd.append("--collect-empty-dirs")
-    else:
-        cmd.append("--no-collect-empty-dirs")
-    return cmd
+from schedule_config import (
+    FolderJob,
+    build_organize_cmd,
+    default_config_path,
+    load_config,
+    organizer_script_path,
+    run_enabled_folders,
+    save_config,
+)
 
 
 class ScheduleApp:
@@ -150,7 +40,7 @@ class ScheduleApp:
         self.cfg = load_config(self.config_path)
 
         self.root.title("Organize on a schedule")
-        self.root.minsize(640, 520)
+        self.root.minsize(640, 560)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._stop_event = threading.Event()
@@ -160,6 +50,7 @@ class ScheduleApp:
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
         self.scheduler_var = tk.BooleanVar(value=self.cfg.scheduler_enabled)
+        self.max_parallel_var = tk.IntVar(value=self.cfg.max_parallel)
 
         pad = {"padx": 8, "pady": 4}
         frm = ttk.Frame(root, padding=10)
@@ -172,26 +63,42 @@ class ScheduleApp:
         row = 0
         top = ttk.LabelFrame(frm, text="Schedule", padding=8)
         top.grid(row=row, column=0, sticky="ew", **pad)
-        top.columnconfigure(1, weight=1)
+        top.columnconfigure(2, weight=1)
 
         ttk.Label(top, text="Run every").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        spin = tk.Spinbox(
+        tk.Spinbox(
             top,
             from_=1,
             to=10080,
             width=8,
             textvariable=self.interval_var,
             command=self._sync_interval_to_cfg,
-        )
-        spin.grid(row=0, column=1, sticky="w")
-        ttk.Label(top, text="minutes (while this window is open)").grid(row=0, column=2, sticky="w", padx=(6, 0))
+        ).grid(row=0, column=1, sticky="w")
+        ttk.Label(top, text="minutes").grid(row=0, column=2, sticky="w", padx=(6, 0))
+
+        ttk.Label(top, text="Max parallel").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        tk.Spinbox(
+            top,
+            from_=0,
+            to=128,
+            width=8,
+            textvariable=self.max_parallel_var,
+            command=self._sync_parallel_to_cfg,
+        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=1, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
 
         ttk.Checkbutton(
             top,
-            text="Enable automatic runs",
+            text="Enable automatic runs (in this window)",
             variable=self.scheduler_var,
             command=self._on_scheduler_toggle,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        hint = (
+            "Background: run scripts/schedule_daemon.py --foreground under systemd, "
+            "or schedule_daemon.py --once via cron. Same config file as shown below."
+        )
+        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         row += 1
         path_row = ttk.Frame(frm)
@@ -235,7 +142,8 @@ class ScheduleApp:
         btn_row.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(btn_row, text="Add folder…", command=self._add_folder).pack(side="left", padx=(0, 6))
         ttk.Button(btn_row, text="Remove", command=self._remove_selected).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Run selected now", command=self._run_selected_now).pack(side="left")
+        ttk.Button(btn_row, text="Run selected now", command=self._run_selected_now).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_row, text="Run all enabled now", command=self._run_all_enabled_now).pack(side="left")
 
         row += 1
         detail = ttk.LabelFrame(frm, text="Selected folder options", padding=8)
@@ -294,7 +202,7 @@ class ScheduleApp:
         self._poll_log_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        helper = _helper_script()
+        helper = organizer_script_path()
         if not helper.is_file():
             self._append_log(f"Missing helper script:\n{helper}\n")
 
@@ -311,14 +219,23 @@ class ScheduleApp:
         self.cfg.interval_minutes = v
         self._wake_event.set()
 
+    def _sync_parallel_to_cfg(self) -> None:
+        try:
+            v = int(self.max_parallel_var.get())
+        except (tk.TclError, ValueError):
+            v = 0
+        v = max(0, min(128, v))
+        self.max_parallel_var.set(v)
+        self.cfg.max_parallel = v
+
     def _on_scheduler_toggle(self) -> None:
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         self._wake_event.set()
         if self.cfg.scheduler_enabled:
             self._ensure_worker()
-            self._append_log("Automatic runs enabled (keep this window open).\n")
+            self._append_log("Automatic runs enabled in this window (parallel batches).\n")
         else:
-            self._append_log("Automatic runs disabled.\n")
+            self._append_log("Automatic runs in this window disabled.\n")
 
     def _ensure_worker(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -361,85 +278,24 @@ class ScheduleApp:
             self._run_scheduled_batch()
 
     def _run_scheduled_batch(self) -> None:
-        with self._cfg_lock:
-            snapshot = [(build_organize_cmd(j), j.path) for j in self.cfg.folders if j.enabled]
-
-        for cmd, path_key in snapshot:
-            with self._cfg_lock:
-                job = None
-                idx: Optional[int] = None
-                for i, j in enumerate(self.cfg.folders):
-                    if j.path == path_key:
-                        job = j
-                        idx = i
-                        break
-                if job is None or not job.enabled:
-                    continue
-                base = Path(job.path).expanduser()
-                if not base.is_dir():
-                    job.last_error = "path missing or not a directory"
-                    job.last_run = datetime.now(timezone.utc).isoformat()
-                    self._queue_ui(lambda i=idx: self._after_job_update(i))
-                    continue
-
-            self._log_queue.put(f"\n--- scheduled ---\n$ {' '.join(cmd)}\n")
+        def worker() -> None:
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-            except subprocess.TimeoutExpired:
-                with self._cfg_lock:
-                    job = None
-                    idx = None
-                    for i, j in enumerate(self.cfg.folders):
-                        if j.path == path_key:
-                            job = j
-                            idx = i
-                            break
-                    if job is not None:
-                        job.last_error = "timed out after 1 hour"
-                        job.last_run = datetime.now(timezone.utc).isoformat()
-                if idx is not None:
-                    self._queue_ui(lambda i=idx: self._after_job_update(i))
-                continue
-            except OSError as e:
-                with self._cfg_lock:
-                    job = None
-                    idx = None
-                    for i, j in enumerate(self.cfg.folders):
-                        if j.path == path_key:
-                            job = j
-                            idx = i
-                            break
-                    if job is not None:
-                        job.last_error = str(e)
-                        job.last_run = datetime.now(timezone.utc).isoformat()
-                if idx is not None:
-                    self._queue_ui(lambda i=idx: self._after_job_update(i))
-                continue
-            out = (proc.stdout or "").strip()
-            err = (proc.stderr or "").strip()
+                mp = int(self.max_parallel_var.get())
+            except (tk.TclError, ValueError):
+                mp = None
             with self._cfg_lock:
-                job = None
-                idx = None
-                for i, j in enumerate(self.cfg.folders):
-                    if j.path == path_key:
-                        job = j
-                        idx = i
-                        break
-                if job is not None:
-                    if proc.returncode != 0:
-                        job.last_error = err or f"exit {proc.returncode}"
-                    else:
-                        job.last_error = None
-                    job.last_run = datetime.now(timezone.utc).isoformat()
-            snippet = out if len(out) < 4000 else out[:4000] + "\n…(truncated)\n"
-            if err:
-                self._log_queue.put(err + "\n")
-            if snippet:
-                self._log_queue.put(snippet + "\n")
-            if idx is not None:
-                self._queue_ui(lambda i=idx: self._after_job_update(i))
+                path = self.config_path
+            cfg = load_config(path)
 
-        self._queue_ui(self._save_quiet)
+            def log(msg: str) -> None:
+                self._log_queue.put(msg)
+
+            run_enabled_folders(cfg, path, max_parallel=mp, log=log, label="scheduled")
+            with self._cfg_lock:
+                self.cfg = load_config(self.config_path)
+            self._queue_ui(self._refresh_tree)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _queue_ui(self, fn: Any) -> None:
         try:
@@ -447,12 +303,9 @@ class ScheduleApp:
         except tk.TclError:
             pass
 
-    def _after_job_update(self, index: int) -> None:
-        if 0 <= index < len(self.cfg.folders):
-            self._refresh_tree_row(index)
-
     def _save_quiet(self) -> None:
         self._sync_interval_to_cfg()
+        self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
             save_config(self.config_path, self.cfg)
@@ -561,7 +414,7 @@ class ScheduleApp:
         self._save_quiet()
 
     def _run_selected_now(self) -> None:
-        helper = _helper_script()
+        helper = organizer_script_path()
         if not helper.is_file():
             messagebox.showerror("Missing script", f"Could not find:\n{helper}")
             return
@@ -578,7 +431,7 @@ class ScheduleApp:
             messagebox.showerror("Folder", f"Not a directory:\n{base}")
             return
         cmd = build_organize_cmd(job)
-        self._append_log("\n--- manual run ---\n$ " + " ".join(cmd) + "\n\n")
+        self._append_log("\n--- manual run (one folder) ---\n$ " + " ".join(cmd) + "\n\n")
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         except subprocess.TimeoutExpired:
@@ -601,8 +454,35 @@ class ScheduleApp:
             self._refresh_tree_row(idx)
             self._save_quiet()
 
+    def _run_all_enabled_now(self) -> None:
+        helper = organizer_script_path()
+        if not helper.is_file():
+            messagebox.showerror("Missing script", f"Could not find:\n{helper}")
+            return
+
+        def worker() -> None:
+            try:
+                mp = int(self.max_parallel_var.get())
+            except (tk.TclError, ValueError):
+                mp = None
+
+            def log(msg: str) -> None:
+                self._log_queue.put(msg)
+
+            with self._cfg_lock:
+                path = self.config_path
+            cfg = load_config(path)
+            run_enabled_folders(cfg, path, max_parallel=mp, log=log, label="manual all enabled")
+            with self._cfg_lock:
+                self.cfg = load_config(self.config_path)
+            self._queue_ui(self._refresh_tree)
+
+        self._append_log("\n--- Run all enabled (parallel) ---\n")
+        threading.Thread(target=worker, daemon=True).start()
+
     def _save(self) -> None:
         self._sync_interval_to_cfg()
+        self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
             save_config(self.config_path, self.cfg)
@@ -614,6 +494,7 @@ class ScheduleApp:
     def _on_close(self) -> None:
         self._stop_event.set()
         self._sync_interval_to_cfg()
+        self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
             save_config(self.config_path, self.cfg)

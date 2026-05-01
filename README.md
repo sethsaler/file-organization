@@ -38,11 +38,33 @@ BRANCH=main
 curl -fsSL "https://raw.githubusercontent.com/sethsaler/file-organization/${BRANCH}/scripts/install.sh" | FILE_ORG_REF="$BRANCH" bash
 ```
 
-After install, run the GUI (macOS or any OS with Tk):
+After install, run the folder-picker GUI (macOS or any OS with Tk):
 
 ```bash
 python3 ~/.local/share/organize-folder-by-filetype/scripts/tinker_gui.py
 ```
+
+### Scheduled folders (many folders, parallel, background)
+
+Edit folders and options in the schedule GUI (writes `~/.config/file-organization/schedule.json`):
+
+```bash
+python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_gui.py
+```
+
+Run a **true background** loop (reloads the config each cycle; enable `scheduler_enabled` in the JSON, or use `--force`):
+
+```bash
+python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_daemon.py --foreground
+```
+
+For **cron**, run one parallel batch per invocation (honors `scheduler_enabled` unless you pass `--force`):
+
+```bash
+python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_daemon.py --once
+```
+
+Set `max_parallel` in the JSON: **0** means all enabled folders at once (capped at 32); a positive number limits concurrent runs. Example unit files: `install/systemd/`, `install/launchd/`.
 
 ## Quick start
 
@@ -167,7 +189,10 @@ Optional `--lang eng+deu` passes Tesseract language packs. Use `--include-errors
 
 - `scripts/organize_by_filetype.py` — main Python helper
 - `scripts/extract_image_text.py` — OCR helper: image text to CSV/Excel
-- `scripts/tinker_gui.py` — optional Tkinter UI for exploring options and JSON output
+- `scripts/schedule_config.py` — shared `schedule.json` schema and parallel runs
+- `scripts/schedule_gui.py` — schedule editor (Tk)
+- `scripts/schedule_daemon.py` — background or `--once` (cron) runner
+- `install/systemd/`, `install/launchd/` — example service files
 - `scripts/install.sh` — curl-friendly installer (clone-less download from GitHub)
 - `requirements-ocr.txt` — optional dependencies for the OCR script
 - `launchers/Organize by File Type (Tinker).command` — double-click GUI launcher (macOS)
@@ -199,6 +224,7 @@ If behavior changes, keep the following in sync:
 - `SKILL.md`
 - `README.md`
 - `scripts/tinker_gui.py` when CLI flags or defaults change
+- `scripts/schedule_config.py`, `scripts/schedule_gui.py`, `scripts/schedule_daemon.py` when schedule JSON or runner behavior changes
 - `launchers/Organize Files by Type.command` when relevant
 
 ## Changelog

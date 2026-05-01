@@ -35,6 +35,9 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 cp -R "$SRC/scripts" "$SRC/launchers" "$INSTALL_DIR/"
+if [[ -d "$SRC/install" ]]; then
+  cp -R "$SRC/install" "$INSTALL_DIR/"
+fi
 for doc in README.md LICENSE SKILL.md CHANGELOG.md; do
   if [[ -f "$SRC/$doc" ]]; then
     cp "$SRC/$doc" "$INSTALL_DIR/"
@@ -52,8 +55,11 @@ echo "Done."
 echo
 echo "CLI helper:"
 echo "  python3 \"$INSTALL_DIR/scripts/organize_by_filetype.py\" --path /path/to/folder"
-echo "Scheduled folders GUI (Tk; keep window open for timer):"
+echo "Scheduled folders GUI (config file + optional in-window timer):"
 echo "  python3 \"$INSTALL_DIR/scripts/schedule_gui.py\""
+echo "Background scheduler (systemd / cron / launchd; see $INSTALL_DIR/install/):"
+echo "  python3 \"$INSTALL_DIR/scripts/schedule_daemon.py\" --foreground"
+echo "  python3 \"$INSTALL_DIR/scripts/schedule_daemon.py\" --once"
 echo
 echo "macOS double-click (after copying launchers to Desktop or opening in Finder):"
 echo "  $INSTALL_DIR/launchers/Organize by File Type (Tinker).command"
