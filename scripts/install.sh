@@ -52,6 +52,8 @@ echo "Done."
 echo
 echo "CLI helper:"
 echo "  python3 \"$INSTALL_DIR/scripts/organize_by_filetype.py\" --path /path/to/folder"
+echo "Scheduled folders GUI (Tk; keep window open for timer):"
+echo "  python3 \"$INSTALL_DIR/scripts/schedule_gui.py\""
 echo
 echo "macOS double-click (after copying launchers to Desktop or opening in Finder):"
 echo "  $INSTALL_DIR/launchers/Organize by File Type (Tinker).command"
