@@ -369,8 +369,7 @@ class ScheduleApp:
                 break
             while self.cfg.scheduler_enabled and not self._stop_event.is_set():
                 with self._cfg_lock:
-                    cfg = load_config(self.config_path)
-                wait_sec = wait_seconds_after_run(cfg)
+                    wait_sec = wait_seconds_after_run(self.cfg)
                 why = self._wait_interval(wait_sec)
                 if why == "stop":
                     return
