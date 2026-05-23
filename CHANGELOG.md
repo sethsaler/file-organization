@@ -26,6 +26,7 @@ This project tracks changes using the Hermes skill version as its public version
 ### Added
 
 - **Daily schedule:** `schedule.json` can use `"schedule_mode": "daily"` and `"daily_time": "00:00"` (local 24h time) so enabled folders run once per day at midnight (or another time). The schedule GUI adds “Once daily at”, and `schedule_daemon.py --foreground` sleeps until the next run time.
+- **Scheduler in main GUI:** `tinker_gui.py` has a **Schedule** tab (`schedule_panel.py`) with folder list, daily/interval timing, next-run status, and an in-process worker. **Add to schedule…** on the Organize tab links the current folder. `schedule_gui.py` remains a schedule-only window using the same panel.
 
 ### Changed
 

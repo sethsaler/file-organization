@@ -44,19 +44,13 @@ After install, run the folder-picker GUI (macOS or any OS with Tk):
 python3 ~/.local/share/organize-folder-by-filetype/scripts/tinker_gui.py
 ```
 
-### Scheduled folders (many folders, parallel, background)
+Use the **Schedule** tab in the same app (or the standalone `schedule_gui.py`) to auto-organize folders on a timer. Config is saved to `~/.config/file-organization/schedule.json`.
 
-Edit folders and options in the schedule GUI (writes `~/.config/file-organization/schedule.json`):
+1. On **Organize**, pick a folder and click **Add to schedule…**, or on **Schedule** click **Add folder…**
+2. Choose **Once daily at** `00:00` for midnight (local time), or **Run every** *N* **minutes**
+3. Enable **automatic runs** — the built-in scheduler runs while the app is open
 
-```bash
-python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_gui.py
-```
-
-1. Click **Add folder…** and pick the folder to auto-organize.
-2. Choose **Once daily at** `00:00` for midnight (local time), or **Run every** *N* **minutes** for interval mode.
-3. Enable **automatic runs** in the GUI, or run the background daemon below with `scheduler_enabled` set to true in the JSON.
-
-Run a **true background** loop (reloads the config each cycle; in daily mode sleeps until the next local run time; enable `scheduler_enabled` in the JSON, or use `--force`):
+Optional: run a **headless background** loop when the GUI is closed (reloads config each cycle; enable `scheduler_enabled` in the JSON, or use `--force`):
 
 ```bash
 python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_daemon.py --foreground

@@ -67,9 +67,10 @@ Performance characteristics:
 ## Project structure
 
 - `scripts/organize_by_filetype.py` — main helper
-- `scripts/tinker_gui.py` — optional Tk UI for folder pick, flags, dry-run/run, JSON output
+- `scripts/tinker_gui.py` — main Tk UI (Organize + Schedule tabs; built-in scheduler while open)
+- `scripts/schedule_panel.py` — shared Schedule tab / panel (folder list, timing, worker)
 - `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
-- `scripts/schedule_gui.py` — Tk UI to manage scheduled folders and options
+- `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
 - `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
 - `install/systemd/`, `install/launchd/` — example service files for long-running background scheduling
