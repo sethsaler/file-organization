@@ -167,6 +167,8 @@ class TinkerApp:
             normalize=self._effective_normalize(),
             include_hidden=self.hidden_var.get(),
             collect_empty_dirs=self.collect_empty_var.get(),
+            profile=self.profile_var.get(),
+            exclude_defaults=self.exclude_defaults_var.get(),
         )
         self.notebook.select(1)
 

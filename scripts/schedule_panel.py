@@ -274,15 +274,18 @@ class SchedulePanel(ttk.Frame):
 
     def _sync_schedule_timing_to_cfg(self) -> None:
         self._sync_interval_to_cfg(quiet=True)
-        self._sync_daily_time_to_cfg(quiet=True)
+        editing_daily = self.root.focus_get() == self.daily_time_entry
+        if not editing_daily:
+            self._sync_daily_time_to_cfg(quiet=True)
         mode = normalize_schedule_mode(self.schedule_mode_var.get())
         prev_mode = normalize_schedule_mode(self.cfg.schedule_mode)
         prev_time = normalize_daily_time(self.cfg.daily_time)
         time_val = normalize_daily_time(self.daily_time_var.get())
         self.cfg.schedule_mode = mode
-        self.cfg.daily_time = time_val
-        self.daily_time_var.set(time_val)
-        if mode != prev_mode or time_val != prev_time:
+        if not editing_daily:
+            self.cfg.daily_time = time_val
+            self.daily_time_var.set(time_val)
+        if mode != prev_mode or (not editing_daily and time_val != prev_time):
             self._wake_event.set()
 
     def _sync_interval_to_cfg(self, *, quiet: bool = False) -> None:
@@ -671,6 +674,8 @@ class SchedulePanel(ttk.Frame):
         normalize: Optional[str] = None,
         include_hidden: bool = True,
         collect_empty_dirs: bool = True,
+        profile: str = "standard",
+        exclude_defaults: bool = True,
         select: bool = True,
     ) -> bool:
         """Add a folder to the schedule list (or select it if already present)."""
@@ -698,6 +703,8 @@ class SchedulePanel(ttk.Frame):
             normalize=normalize,
             include_hidden=include_hidden,
             collect_empty_dirs=collect_empty_dirs,
+            profile=profile,
+            exclude_defaults=exclude_defaults,
         )
         ok, preview = run_dry_run_preview(job)
         if not ok:
