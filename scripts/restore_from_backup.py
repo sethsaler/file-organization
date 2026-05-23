@@ -29,7 +29,8 @@ def main() -> None:
     if not args.manifest:
         p.error("Provide a manifest path or use --list BASE")
 
-    restore_from_manifest(args.manifest)
+    if not restore_from_manifest(args.manifest):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -28,9 +28,9 @@ def sniff_bucket_from_file(path: Path, *, max_read: int = 16) -> Optional[str]:
         return None
     if not head:
         return None
+    if len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "Images"
     for sig, bucket in _SIGNATURES:
         if head.startswith(sig):
-            if sig == b"RIFF" and len(head) >= 12 and head[8:12] == b"WEBP":
-                return "Images"
             return bucket
     return None

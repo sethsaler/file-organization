@@ -204,6 +204,12 @@ class Organizer:
                 return dest_dir / candidate
             i += 1
 
+    def _allowed_bucket_names(self) -> Set[str]:
+        if self.profile_buckets:
+            return {name for name, _ in self.profile_buckets} | {"Other"}
+        prof = self.profile_label if self.profile_label in ("standard", "extended") else "standard"
+        return set(bucket_names_for_profile(prof))
+
     def _bucket_for_file(self, file_name: str, src: Optional[Path] = None) -> str:
         suffix = Path(file_name).suffix
         ext = suffix[1:].upper() if suffix else ""
@@ -214,7 +220,7 @@ class Organizer:
             bucket = bucket_for_extension(ext, prof)
         if bucket == "Other" and not ext and self.use_mime_sniff and src is not None:
             sniffed = sniff_bucket_from_file(src)
-            if sniffed:
+            if sniffed and sniffed in self._allowed_bucket_names():
                 return sniffed
         return bucket
 
@@ -409,6 +415,11 @@ class Organizer:
                     normalize=self.normalize,
                     collect_empty_dirs=True,
                     dry_run=False,
+                    profile_label=self.profile_label,
+                    profile_buckets=list(self.profile_buckets) if self.profile_buckets else None,
+                    exclude_patterns=list(self.exclude_patterns),
+                    follow_symlinks=self.follow_symlinks,
+                    use_mime_sniff=self.use_mime_sniff,
                 )
                 sim_org.run()
                 return EmptyDirStats(
@@ -439,6 +450,9 @@ class Organizer:
                 collectable = False
                 continue
             if self._is_organizer_dir(entry.name):
+                collectable = False
+                continue
+            if entry.is_dir() and self._should_skip_traversal_dir(directory, entry.name):
                 collectable = False
                 continue
 
@@ -477,6 +491,8 @@ class Organizer:
             if self._is_for_deletion_name(child.name):
                 continue
             if self._is_organizer_dir(child.name):
+                continue
+            if self._should_skip_traversal_dir(self.base, child.name):
                 continue
 
             child_collectable, child_topmost = self._inspect_empty_dir_tree(child)
@@ -675,8 +691,6 @@ class Organizer:
             except Exception as e:
                 err = str(e)
             rows.append((str(img.relative_to(self.base)), text_val, err or ""))
-        if self.dry_run:
-            return str(out_path)
         with out_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["file_name", "extracted_text", "error"])
@@ -706,11 +720,19 @@ class Organizer:
         manifest_info = self.save_manifest()
         ocr_path = self._maybe_write_ocr_index()
 
+        if self.profile_buckets:
+            summary_buckets: List[str] = [name for name, _ in self.profile_buckets] + ["Other"]
+        else:
+            prof = self.profile_label if self.profile_label in ("standard", "extended") else (
+                "extended" if len(self.profile_buckets) > 3 else "standard"
+            )
+            summary_buckets = bucket_names_for_profile(prof)
+
         summary = {
             "target": str(self.base),
             "mode": "recursive" if self.recursive else "non-recursive",
             "strategy": self.strategy if self.recursive else "root-only",
-            "buckets": bucket_names_for_profile(self.profile_label if self.profile_label in ("standard", "extended") else "extended" if len(self.profile_buckets) > 3 else "standard"),
+            "buckets": summary_buckets,
             "profile": self.profile_label,
             "include_hidden": self.include_hidden,
             "normalization_mode": self.normalize,

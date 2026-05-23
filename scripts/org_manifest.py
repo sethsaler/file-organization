@@ -102,21 +102,25 @@ read -r -p "Press Enter..." _
     }
 
 
-def restore_from_manifest(manifest_path: str) -> None:
+def restore_from_manifest(manifest_path: str) -> bool:
     manifest_file = Path(manifest_path)
     if not manifest_file.exists():
         print(json.dumps({"error": f"Manifest not found: {manifest_path}"}, indent=2))
-        return
+        return False
     try:
         data = json.loads(manifest_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         print(json.dumps({"error": f"Invalid manifest file: {e}"}, indent=2))
-        return
+        return False
 
-    base = Path(data["base_path"])
+    try:
+        base = Path(data["base_path"])
+    except (KeyError, TypeError):
+        print(json.dumps({"error": "Manifest missing or invalid base_path"}, indent=2))
+        return False
     if not base.exists():
         print(json.dumps({"error": f"Base path not found: {base}"}, indent=2))
-        return
+        return False
 
     restored_files = restored_dirs = collisions = 0
     for entry in reversed(data.get("empty_dir_moves", [])):
@@ -160,3 +164,4 @@ def restore_from_manifest(manifest_path: str) -> None:
             "profile": data.get("profile", "standard"),
         },
     }, indent=2))
+    return True

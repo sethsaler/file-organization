@@ -79,7 +79,8 @@ def main() -> None:
     args = parse_args()
 
     if args.restore:
-        restore_from_manifest(args.restore)
+        if not restore_from_manifest(args.restore):
+            sys.exit(1)
         return
 
     if not args.path:
