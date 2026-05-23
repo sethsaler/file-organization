@@ -24,6 +24,17 @@ def main() -> None:
     root.minsize(640, 560)
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
+    panel = SchedulePanel(root, root, embedded=False)
+    panel.grid(row=0, column=0, sticky="nsew")
+
+    def on_close() -> None:
+        panel.shutdown()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+
 class ScheduleApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -610,16 +621,6 @@ class ScheduleApp:
             messagebox.showerror("Save", str(e))
             return
         self._append_log(f"Saved: {self.config_path}\n")
-
-    panel = SchedulePanel(root, root, embedded=False)
-    panel.grid(row=0, column=0, sticky="nsew")
-
-    def on_close() -> None:
-        panel.shutdown()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
 
 
 if __name__ == "__main__":
