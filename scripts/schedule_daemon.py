@@ -26,7 +26,12 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import default_log_path
-from schedule_config import default_config_path, load_config, run_enabled_folders
+from schedule_config import (
+    default_config_path,
+    load_config,
+    run_enabled_folders,
+    wait_seconds_after_run,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--foreground",
         action="store_true",
-        help="Loop forever (use with systemd or tmux); respects interval_minutes and scheduler_enabled in JSON",
+        help="Loop forever (use with systemd or tmux); respects schedule_mode, interval/daily_time, and scheduler_enabled in JSON",
     )
     p.add_argument(
         "--once",
@@ -69,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-run-on-start",
         action="store_true",
-        help="With --foreground, sleep first so the first run waits one interval",
+        help="With --foreground, sleep first so the first run waits until the next interval or daily time",
     )
     return p.parse_args()
 
@@ -114,15 +119,20 @@ def main() -> None:
     first = True
     while not stop:
         cfg = load_config(config_path)
-        interval = args.interval_override if args.interval_override is not None else cfg.interval_minutes
-        interval = max(1, min(10080, int(interval)))
+        if args.interval_override is not None:
+            wait_sec = max(60.0, float(max(1, min(10080, int(args.interval_override))) * 60)
+        else:
+            wait_sec = wait_seconds_after_run(cfg)
 
         if first and args.no_run_on_start:
             first = False
-            for _ in range(interval * 60):
+            remaining = wait_sec
+            while remaining > 0:
                 if stop:
                     return
-                time.sleep(1)
+                step = min(remaining, 1.0)
+                time.sleep(step)
+                remaining -= step
             continue
 
         if args.force or cfg.scheduler_enabled:
@@ -136,10 +146,18 @@ def main() -> None:
             )
 
         first = False
-        for _ in range(interval * 60):
+        cfg = load_config(config_path)
+        if args.interval_override is not None:
+            wait_sec = max(60.0, float(max(1, min(10080, int(args.interval_override))) * 60)
+        else:
+            wait_sec = wait_seconds_after_run(cfg)
+        remaining = wait_sec
+        while remaining > 0:
             if stop:
                 return
-            time.sleep(1)
+            step = min(remaining, 1.0)
+            time.sleep(step)
+            remaining -= step
 
 
 if __name__ == "__main__":

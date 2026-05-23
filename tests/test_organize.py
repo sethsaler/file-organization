@@ -202,3 +202,50 @@ def test_schedule_dry_run_verified_legacy_v3():
         "folders": [{"path": "/tmp/x"}],
     })
     assert cfg.folders[0].dry_run_verified is True
+
+
+def test_daily_schedule_mode_roundtrip(tmp_path: Path):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from schedule_config import (
+        SCHEDULE_MODE_DAILY,
+        ScheduleConfig,
+        normalize_daily_time,
+        parse_daily_time,
+        save_config,
+        seconds_until_next_daily_run,
+        wait_seconds_after_run,
+    )
+
+    assert parse_daily_time("00:00") == (0, 0)
+    assert parse_daily_time("12:30") == (12, 30)
+    assert normalize_daily_time("9:5") == "09:05"
+    assert normalize_daily_time("nope") == "00:00"
+
+    cfg = ScheduleConfig(
+        schedule_mode=SCHEDULE_MODE_DAILY,
+        daily_time="00:00",
+        interval_minutes=60,
+    )
+    path = tmp_path / "schedule.json"
+    save_config(path, cfg)
+    loaded = ScheduleConfig.from_json_dict(json.loads(path.read_text(encoding="utf-8")))
+    assert loaded.schedule_mode == SCHEDULE_MODE_DAILY
+    assert loaded.daily_time == "00:00"
+
+    tz = ZoneInfo("UTC")
+    now = datetime(2026, 5, 23, 10, 0, tzinfo=tz)
+    sec = seconds_until_next_daily_run("00:00", now=now)
+    assert 13 * 3600 <= sec <= 14 * 3600 + 1
+
+    now2 = datetime(2026, 5, 23, 23, 30, tzinfo=tz)
+    sec2 = seconds_until_next_daily_run("00:00", now=now2)
+    assert 29 * 60 <= sec2 <= 31 * 60
+
+    cfg_daily = ScheduleConfig(schedule_mode=SCHEDULE_MODE_DAILY, daily_time="00:00")
+    wait = wait_seconds_after_run(cfg_daily)
+    assert wait > 0
+
+    cfg_interval = ScheduleConfig(interval_minutes=30)
+    assert wait_seconds_after_run(cfg_interval) == 30 * 60

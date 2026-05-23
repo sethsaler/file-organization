@@ -9,12 +9,16 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
+
+SCHEDULE_MODE_INTERVAL = "interval"
+SCHEDULE_MODE_DAILY = "daily"
+DEFAULT_DAILY_TIME = "00:00"
 
 
 def _helper_script() -> Path:
@@ -52,10 +56,63 @@ class FolderJob:
     last_error: Optional[str] = None
 
 
+def parse_daily_time(value: str) -> Tuple[int, int]:
+    """Parse HH:MM (24h local). Invalid input defaults to midnight."""
+    raw = (value or DEFAULT_DAILY_TIME).strip()
+    parts = raw.split(":")
+    if len(parts) != 2:
+        return 0, 0
+    try:
+        hour = max(0, min(23, int(parts[0])))
+        minute = max(0, min(59, int(parts[1])))
+        return hour, minute
+    except ValueError:
+        return 0, 0
+
+
+def format_daily_time(hour: int, minute: int) -> str:
+    return f"{hour:02d}:{minute:02d}"
+
+
+def normalize_daily_time(value: str) -> str:
+    h, m = parse_daily_time(value)
+    return format_daily_time(h, m)
+
+
+def normalize_schedule_mode(value: str) -> str:
+    mode = (value or SCHEDULE_MODE_INTERVAL).strip().casefold()
+    return SCHEDULE_MODE_DAILY if mode == SCHEDULE_MODE_DAILY else SCHEDULE_MODE_INTERVAL
+
+
+def seconds_until_next_daily_run(
+    daily_time: str,
+    *,
+    now: Optional[datetime] = None,
+) -> float:
+    """Seconds until the next local-time run at daily_time (HH:MM)."""
+    if now is None:
+        now = datetime.now().astimezone()
+    hour, minute = parse_daily_time(daily_time)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return max(0.0, (target - now).total_seconds())
+
+
+def wait_seconds_after_run(cfg: ScheduleConfig) -> float:
+    """How long to sleep after a batch before the next scheduled run."""
+    if normalize_schedule_mode(cfg.schedule_mode) == SCHEDULE_MODE_DAILY:
+        return seconds_until_next_daily_run(cfg.daily_time)
+    minutes = max(1, min(10080, int(cfg.interval_minutes)))
+    return float(minutes * 60)
+
+
 @dataclass
 class ScheduleConfig:
     version: int = CONFIG_VERSION
+    schedule_mode: str = SCHEDULE_MODE_INTERVAL
     interval_minutes: int = 60
+    daily_time: str = DEFAULT_DAILY_TIME
     scheduler_enabled: bool = False
     max_parallel: int = 0
     max_failures_before_disable: int = 5
@@ -64,10 +121,13 @@ class ScheduleConfig:
     def to_json_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
             "version": CONFIG_VERSION,
+            "schedule_mode": normalize_schedule_mode(self.schedule_mode),
             "interval_minutes": self.interval_minutes,
             "scheduler_enabled": self.scheduler_enabled,
             "folders": [asdict(f) for f in self.folders],
         }
+        if normalize_schedule_mode(self.schedule_mode) == SCHEDULE_MODE_DAILY:
+            d["daily_time"] = normalize_daily_time(self.daily_time)
         if self.max_parallel != 0:
             d["max_parallel"] = self.max_parallel
         if self.max_failures_before_disable != 5:
@@ -123,7 +183,9 @@ class ScheduleConfig:
         mfd = max(0, min(1000, mfd))
         return cls(
             version=max(int(data.get("version", 1)), 1),
+            schedule_mode=normalize_schedule_mode(str(data.get("schedule_mode", SCHEDULE_MODE_INTERVAL))),
             interval_minutes=max(1, min(10080, int(data.get("interval_minutes", 60)))),
+            daily_time=normalize_daily_time(str(data.get("daily_time", DEFAULT_DAILY_TIME))),
             scheduler_enabled=bool(data.get("scheduler_enabled", False)),
             max_parallel=max_parallel,
             max_failures_before_disable=mfd,

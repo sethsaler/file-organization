@@ -38,7 +38,13 @@ Set `scheduler_enabled` to true in `schedule.json` (via the GUI), or run the dae
 
 ## Option B: cron + `--once`
 
-Add a crontab line (example: every hour at minute 0):
+Add a crontab line. **Once per day at midnight** (set `"schedule_mode": "daily"` and `"daily_time": "00:00"` in `schedule.json`, or use interval mode with a long `interval_minutes`):
+
+```cron
+0 0 * * * /usr/bin/python3 /FULL/PATH/TO/scripts/schedule_daemon.py --once >>"$HOME/.cache/file-org-scheduler.log" 2>&1
+```
+
+Every hour at minute 0:
 
 ```cron
 0 * * * * /usr/bin/python3 /FULL/PATH/TO/scripts/schedule_daemon.py --once >>"$HOME/.cache/file-org-scheduler.log" 2>&1
