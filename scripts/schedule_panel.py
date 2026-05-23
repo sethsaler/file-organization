@@ -1,54 +1,62 @@
 #!/usr/bin/env python3
-"""Standalone window for scheduled folder organization.
+"""Reusable Tk panel: folder list, timing, and in-process scheduler worker.
 
-The same scheduler is built into the main app: open `tinker_gui.py` and use the Schedule tab.
+Embedded in `tinker_gui.py` (Schedule tab) or used standalone via `schedule_gui.py`.
+Persists to ~/.config/file-organization/schedule.json (same schema as `schedule_daemon.py`).
 """
 
 from __future__ import annotations
 
+import queue
+import subprocess
 import sys
+import threading
+import time
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import Any, Dict, Optional
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from schedule_panel import SchedulePanel
+from schedule_config import (
+    FolderJob,
+    SCHEDULE_MODE_DAILY,
+    SCHEDULE_MODE_INTERVAL,
+    build_organize_cmd,
+    effective_normalize,
+    default_config_path,
+    load_config,
+    normalize_daily_time,
+    normalize_schedule_mode,
+    organizer_script_path,
+    run_dry_run_preview,
+    run_enabled_folders,
+    save_config,
+    seconds_until_next_daily_run,
+    wait_seconds_after_run,
+)
 
 
-def main() -> None:
-    root = tk.Tk()
-    root.title("Organize on a schedule")
-    root.minsize(640, 560)
-    root.columnconfigure(0, weight=1)
-    root.rowconfigure(0, weight=1)
-    panel = SchedulePanel(root, root, embedded=False)
-    panel.grid(row=0, column=0, sticky="nsew")
+class SchedulePanel(ttk.Frame):
+    """Schedule UI + background worker; pack into a tab or standalone window."""
 
-    def on_close() -> None:
-        panel.shutdown()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
-
-
-class ScheduleApp:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, parent: tk.Misc, root: tk.Tk, *, embedded: bool = False) -> None:
+        super().__init__(parent, padding=10)
         self.root = root
+        self._embedded = embedded
         self.config_path = default_config_path()
         self.cfg = load_config(self.config_path)
-
-        self.root.title("Organize on a schedule")
-        self.root.minsize(640, 560)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._cfg_lock = threading.Lock()
+        self._interval_next_run_deadline: Optional[float] = None
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
         self.schedule_mode_var = tk.StringVar(
@@ -59,10 +67,7 @@ class ScheduleApp:
         self.max_parallel_var = tk.IntVar(value=self.cfg.max_parallel)
 
         pad = {"padx": 8, "pady": 4}
-        frm = ttk.Frame(root, padding=10)
-        frm.grid(row=0, column=0, sticky="nsew")
-        root.columnconfigure(0, weight=1)
-        root.rowconfigure(0, weight=1)
+        frm = self
         frm.columnconfigure(0, weight=1)
         frm.rowconfigure(2, weight=1)
 
@@ -119,17 +124,27 @@ class ScheduleApp:
 
         ttk.Checkbutton(
             top,
-            text="Enable automatic runs (in this window)",
+            text="Enable automatic runs",
             variable=self.scheduler_var,
             command=self._on_scheduler_toggle,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-        hint = (
-            "Background: run scripts/schedule_daemon.py --foreground under systemd "
-            "(daily mode sleeps until the next local run time), or schedule_daemon.py --once "
-            "via cron at midnight (0 0 * * *). Same config file as shown below."
+        self.next_run_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.next_run_var, wraplength=620, justify="left").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
-        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        if embedded:
+            hint = (
+                "Runs while this app is open. Pick folders below, choose daily midnight or an interval, "
+                "then enable automatic runs. Config is saved automatically."
+            )
+        else:
+            hint = (
+                "Runs while this window is open. For scheduling when the app is closed, use "
+                "schedule_daemon.py under systemd/cron (see install/)."
+            )
+        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self._on_schedule_mode_change()
 
@@ -233,7 +248,8 @@ class ScheduleApp:
         self._tree_item_to_index: Dict[str, int] = {}
         self._refresh_tree()
         self._poll_log_queue()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._update_next_run_label()
+        self._schedule_status_tick()
 
         helper = organizer_script_path()
         if not helper.is_file():
@@ -258,15 +274,18 @@ class ScheduleApp:
 
     def _sync_schedule_timing_to_cfg(self) -> None:
         self._sync_interval_to_cfg(quiet=True)
-        self._sync_daily_time_to_cfg(quiet=True)
+        editing_daily = self.root.focus_get() == self.daily_time_entry
+        if not editing_daily:
+            self._sync_daily_time_to_cfg(quiet=True)
         mode = normalize_schedule_mode(self.schedule_mode_var.get())
         prev_mode = normalize_schedule_mode(self.cfg.schedule_mode)
         prev_time = normalize_daily_time(self.cfg.daily_time)
         time_val = normalize_daily_time(self.daily_time_var.get())
         self.cfg.schedule_mode = mode
-        self.cfg.daily_time = time_val
-        self.daily_time_var.set(time_val)
-        if mode != prev_mode or time_val != prev_time:
+        if not editing_daily:
+            self.cfg.daily_time = time_val
+            self.daily_time_var.set(time_val)
+        if mode != prev_mode or (not editing_daily and time_val != prev_time):
             self._wake_event.set()
 
     def _sync_interval_to_cfg(self, *, quiet: bool = False) -> None:
@@ -304,9 +323,11 @@ class ScheduleApp:
         self._wake_event.set()
         if self.cfg.scheduler_enabled:
             self._ensure_worker()
-            self._append_log("Automatic runs enabled in this window (parallel batches).\n")
+            self._append_log("Automatic runs enabled (scheduler active while app is open).\n")
         else:
-            self._append_log("Automatic runs in this window disabled.\n")
+            self._append_log("Automatic runs disabled.\n")
+            self._interval_next_run_deadline = None
+        self._update_next_run_label()
         self._save_quiet()
 
     def _ensure_worker(self) -> None:
@@ -365,6 +386,11 @@ class ScheduleApp:
             while self.cfg.scheduler_enabled and not self._stop_event.is_set():
                 with self._cfg_lock:
                     wait_sec = wait_seconds_after_run(self.cfg)
+                    mode = normalize_schedule_mode(self.cfg.schedule_mode)
+                if mode == SCHEDULE_MODE_INTERVAL:
+                    self._interval_next_run_deadline = time.monotonic() + wait_sec
+                else:
+                    self._interval_next_run_deadline = None
                 why = self._wait_interval(wait_sec)
                 if why == "stop":
                     return
@@ -377,6 +403,7 @@ class ScheduleApp:
                     break
 
     def _execute_folder_batch(self, label: str) -> None:
+        self._interval_next_run_deadline = None
         try:
             mp = int(self.max_parallel_var.get())
         except (tk.TclError, ValueError):
@@ -390,7 +417,13 @@ class ScheduleApp:
 
         run_enabled_folders(cfg, path, max_parallel=mp, log=log, label=label)
         with self._cfg_lock:
+            prev_mode = self.cfg.schedule_mode
+            prev_interval = self.cfg.interval_minutes
+            prev_daily = self.cfg.daily_time
             self.cfg = load_config(self.config_path)
+            self.cfg.schedule_mode = prev_mode
+            self.cfg.interval_minutes = prev_interval
+            self.cfg.daily_time = prev_daily
         self._queue_ui(self._refresh_tree)
 
     def _queue_ui(self, fn: Any) -> None:
@@ -480,34 +513,6 @@ class ScheduleApp:
         job.include_hidden = bool(self.hidden_var.get())
         job.collect_empty_dirs = bool(self.collect_empty_var.get())
         self._refresh_tree_row(idx)
-
-    def _add_folder(self) -> None:
-        d = filedialog.askdirectory(title="Add folder to schedule")
-        if not d:
-            return
-        path = str(Path(d).expanduser())
-        for existing in self.cfg.folders:
-            if Path(existing.path).expanduser().resolve() == Path(path).expanduser().resolve():
-                messagebox.showinfo("Folder", "That folder is already in the list.")
-                return
-        job = FolderJob(path=path)
-        ok, preview = run_dry_run_preview(job)
-        if not ok:
-            if not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd anyway?"):
-                return
-            job.dry_run_verified = True
-        else:
-            job.dry_run_verified = True
-        with self._cfg_lock:
-            self.cfg.folders.append(job)
-        self._append_log(f"Added {path} (dry-run preview: {ok})\n")
-        self._refresh_tree()
-        children = self.tree.get_children()
-        if children:
-            self.tree.selection_set(children[-1])
-            self.tree.see(children[-1])
-        self._on_tree_select()
-        self._save_quiet()
 
     def _remove_selected(self) -> None:
         sel = self.tree.selection()
@@ -622,6 +627,122 @@ class ScheduleApp:
             return
         self._append_log(f"Saved: {self.config_path}\n")
 
+    def shutdown(self) -> None:
+        """Stop the worker and persist config (call before destroying the root window)."""
+        self._stop_event.set()
+        self._sync_schedule_timing_to_cfg()
+        self._sync_parallel_to_cfg()
+        self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
+        try:
+            save_config(self.config_path, self.cfg)
+        except OSError:
+            pass
+        self._interval_next_run_deadline = None
 
-if __name__ == "__main__":
-    main()
+    def _schedule_status_tick(self) -> None:
+        try:
+            if self.winfo_exists():
+                self._update_next_run_label()
+                self.root.after(1000, self._schedule_status_tick)
+        except tk.TclError:
+            pass
+
+    def _update_next_run_label(self) -> None:
+        if not bool(self.scheduler_var.get()):
+            self.next_run_var.set("Next run: — (automatic runs off)")
+            return
+        self._sync_schedule_timing_to_cfg()
+        mode = normalize_schedule_mode(self.cfg.schedule_mode)
+        if mode == SCHEDULE_MODE_DAILY:
+            sec = seconds_until_next_daily_run(self.cfg.daily_time)
+            label = f"Next run: in {_format_duration(sec)} (daily at {normalize_daily_time(self.cfg.daily_time)} local)"
+        else:
+            deadline = self._interval_next_run_deadline
+            if deadline is not None:
+                sec = max(0.0, deadline - time.monotonic())
+            else:
+                sec = float(max(1, self.cfg.interval_minutes) * 60)
+            label = f"Next run: in {_format_duration(sec)} (every {self.cfg.interval_minutes} min)"
+        self.next_run_var.set(label)
+
+    def add_folder_path(
+        self,
+        path: str,
+        *,
+        recursive: bool = True,
+        strategy: str = "flatten-root",
+        normalize: Optional[str] = None,
+        include_hidden: bool = True,
+        collect_empty_dirs: bool = True,
+        profile: str = "standard",
+        exclude_defaults: bool = True,
+        select: bool = True,
+    ) -> bool:
+        """Add a folder to the schedule list (or select it if already present)."""
+        raw = str(Path(path).expanduser())
+        if not Path(raw).is_dir():
+            messagebox.showerror("Folder", f"Not a directory:\n{raw}")
+            return False
+        try:
+            resolved = Path(raw).expanduser().resolve()
+        except OSError:
+            messagebox.showerror("Folder", f"Could not resolve path:\n{raw}")
+            return False
+        for idx, existing in enumerate(self.cfg.folders):
+            try:
+                if Path(existing.path).expanduser().resolve() == resolved:
+                    if select:
+                        self._select_tree_index(idx)
+                    return True
+            except OSError:
+                continue
+        job = FolderJob(
+            path=raw,
+            recursive=recursive,
+            strategy=strategy,
+            normalize=normalize,
+            include_hidden=include_hidden,
+            collect_empty_dirs=collect_empty_dirs,
+            profile=profile,
+            exclude_defaults=exclude_defaults,
+        )
+        ok, preview = run_dry_run_preview(job)
+        if not ok:
+            if not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd to schedule anyway?"):
+                return False
+        job.dry_run_verified = True
+        with self._cfg_lock:
+            self.cfg.folders.append(job)
+        self._append_log(f"Added {raw} to schedule (dry-run preview: {ok})\n")
+        self._refresh_tree()
+        if select:
+            self._select_tree_index(len(self.cfg.folders) - 1)
+        self._save_quiet()
+        return True
+
+    def _select_tree_index(self, idx: int) -> None:
+        if not (0 <= idx < len(self.cfg.folders)):
+            return
+        for iid, i in self._tree_item_to_index.items():
+            if i == idx:
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+                self._on_tree_select()
+                return
+
+    def _add_folder(self) -> None:
+        d = filedialog.askdirectory(title="Add folder to schedule")
+        if not d:
+            return
+        self.add_folder_path(d)
+
+
+def _format_duration(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
