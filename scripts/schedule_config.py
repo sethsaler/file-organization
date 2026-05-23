@@ -296,7 +296,8 @@ def run_enabled_folders(
                     log(f"(exit {rc})\n")
             if file_log_path:
                 status = "ok" if not last_err else f"error: {last_err}"
-                append_log_line(file_log_path, f"{cfg.folders[idx].path}: {status}")
+                path_log = cfg.folders[idx].path if 0 <= idx < len(cfg.folders) else "?"
+                append_log_line(file_log_path, f"{path_log}: {status}")
 
     try:
         save_config(config_path, cfg)

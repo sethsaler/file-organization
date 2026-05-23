@@ -27,7 +27,11 @@ from org_manifest import (
 from org_mime import sniff_bucket_from_file
 
 EMPTY_DIR_SAMPLE_LIMIT = 20
-PLACEHOLDER_GIF_EXTS = {"GIF"}
+
+# MIME sniff can classify extensionless files into buckets that only exist on the extended profile;
+# allow these when using the standard profile so sniffing is not a silent no-op.
+_MIME_SNIFF_STANDARD_EXTRA_BUCKETS = frozenset({"Documents", "Archives", "Audio"})
+
 
 @dataclass
 class MoveStats:
@@ -83,6 +87,8 @@ class Organizer:
         self.create_backup = create_backup
         self.profile_label = profile_label
         self.profile_buckets = profile_buckets or []
+        if profile_label.startswith("custom:") and not self.profile_buckets:
+            raise ValueError("Custom profile requires at least one bucket definition")
         self.exclude_patterns = list(exclude_patterns or [])
         self.follow_symlinks = follow_symlinks
         self.use_mime_sniff = use_mime_sniff
@@ -220,8 +226,14 @@ class Organizer:
             bucket = bucket_for_extension(ext, prof)
         if bucket == "Other" and not ext and self.use_mime_sniff and src is not None:
             sniffed = sniff_bucket_from_file(src)
-            if sniffed and sniffed in self._allowed_bucket_names():
-                return sniffed
+            if sniffed:
+                allowed = self._allowed_bucket_names()
+                if sniffed in allowed or (
+                    not self.profile_buckets
+                    and self.profile_label == "standard"
+                    and sniffed in _MIME_SNIFF_STANDARD_EXTRA_BUCKETS
+                ):
+                    return sniffed
         return bucket
 
     def _move_one_file(self, src: Path, dest_dir: Path) -> None:
@@ -308,8 +320,22 @@ class Organizer:
         if self.normalize != "standard":
             return
 
-        for root, _, _ in os.walk(self.base, topdown=False):
-            parent = Path(root)
+        # Bottom-up pass with the same directory pruning as organize (excludes, hidden, reserved dirs).
+        roots: List[Path] = []
+        for root, dirs, _ in os.walk(self.base, topdown=True, followlinks=False):
+            root_path = Path(root)
+            if not self.include_hidden:
+                dirs[:] = [d for d in dirs if self._visible_name(d)]
+            if self._is_for_deletion_name(root_path.name):
+                dirs[:] = []
+                continue
+            if self._is_organizer_dir(root_path.name):
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
+            roots.append(root_path)
+
+        for parent in reversed(roots):
             if self._is_for_deletion_name(parent.name):
                 continue
             if self._is_organizer_dir(parent.name):
@@ -340,15 +366,19 @@ class Organizer:
                 if same_casefold or same_inode:
                     self.normalize_stats.folders_case_renamed += 1
                     if not self.dry_run:
+                        rel_from = str(child.relative_to(self.base))
                         tmp = parent / f"__tmp_norm_{uuid.uuid4().hex[:8]}__"
                         child.rename(tmp)
                         tmp.rename(dst)
+                        self.file_moves.append(ManifestEntry(from_path=rel_from, to_path=str(dst.relative_to(self.base))))
                     continue
 
                 if not dst.exists():
                     self.normalize_stats.folders_case_renamed += 1
                     if not self.dry_run:
+                        rel_from = str(child.relative_to(self.base))
                         child.rename(dst)
+                        self.file_moves.append(ManifestEntry(from_path=rel_from, to_path=str(dst.relative_to(self.base))))
                     continue
 
                 self.normalize_stats.folders_merged += 1
@@ -375,7 +405,14 @@ class Organizer:
                     reserved.add(target_name)
                     self.normalize_stats.items_moved_in_merges += 1
                     if not self.dry_run:
-                        shutil.move(str(item), str(dst / target_name))
+                        dest_item = dst / target_name
+                        shutil.move(str(item), str(dest_item))
+                        self.file_moves.append(
+                            ManifestEntry(
+                                from_path=str(item.relative_to(self.base)),
+                                to_path=str(dest_item.relative_to(self.base)),
+                            )
+                        )
 
                 if not self.dry_run:
                     try:
@@ -723,9 +760,7 @@ class Organizer:
         if self.profile_buckets:
             summary_buckets: List[str] = [name for name, _ in self.profile_buckets] + ["Other"]
         else:
-            prof = self.profile_label if self.profile_label in ("standard", "extended") else (
-                "extended" if len(self.profile_buckets) > 3 else "standard"
-            )
+            prof = self.profile_label if self.profile_label in ("standard", "extended") else "standard"
             summary_buckets = bucket_names_for_profile(prof)
 
         summary = {

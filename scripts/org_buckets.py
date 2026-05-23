@@ -105,6 +105,8 @@ def load_profile_from_file(path: Path) -> List[Tuple[str, Set[str]]]:
             raise ValueError(f"Bucket {name!r} must be a list of extensions")
         exts = {str(x).lstrip(".").upper() for x in raw if str(x).strip()}
         ordered.append((str(name), exts))
+    if not ordered:
+        raise ValueError("Profile file must define at least one bucket (Other is implicit)")
     return ordered
 
 
