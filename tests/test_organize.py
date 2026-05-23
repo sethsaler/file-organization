@@ -178,3 +178,27 @@ def test_resolve_profile_custom(tmp_path: Path):
     prof.write_text(json.dumps({"Screenshots": ["png"]}), encoding="utf-8")
     label, buckets = resolve_profile(str(prof))
     assert label.startswith("custom:")
+
+
+def test_typescript_goes_to_code_not_videos():
+    assert bucket_for_filename("app.ts", "extended") == "Code"
+
+
+def test_schedule_dry_run_verified_defaults_false_v4():
+    from schedule_config import ScheduleConfig
+
+    cfg = ScheduleConfig.from_json_dict({
+        "version": 4,
+        "folders": [{"path": "/tmp/x", "enabled": True}],
+    })
+    assert cfg.folders[0].dry_run_verified is False
+
+
+def test_schedule_dry_run_verified_legacy_v3():
+    from schedule_config import ScheduleConfig
+
+    cfg = ScheduleConfig.from_json_dict({
+        "version": 3,
+        "folders": [{"path": "/tmp/x"}],
+    })
+    assert cfg.folders[0].dry_run_verified is True
