@@ -51,10 +51,26 @@ for launcher in "$INSTALL_DIR/launchers/"*.command; do
 done
 shopt -u nullglob
 
+BIN_DIR="${FILE_ORG_BIN_DIR:-$HOME/.local/bin}"
+mkdir -p "$BIN_DIR"
+WRAPPER="$BIN_DIR/organize-by-filetype"
+cat > "$WRAPPER" << WRAP
+#!/usr/bin/env sh
+exec python3 "$INSTALL_DIR/scripts/organize_by_filetype.py" "\$@"
+WRAP
+chmod +x "$WRAPPER"
+RESTORE_WRAPPER="$BIN_DIR/restore-file-organization"
+cat > "$RESTORE_WRAPPER" << WRAP
+#!/usr/bin/env sh
+exec python3 "$INSTALL_DIR/scripts/restore_from_backup.py" "\$@"
+WRAP
+chmod +x "$RESTORE_WRAPPER"
+
 echo "Done."
 echo
-echo "CLI helper:"
-echo "  python3 \"$INSTALL_DIR/scripts/organize_by_filetype.py\" --path /path/to/folder"
+echo "CLI on PATH (if ~/.local/bin is in PATH):"
+echo "  organize-by-filetype --path /path/to/folder"
+echo "  restore-file-organization MANIFEST.json"
 echo "Scheduled folders GUI (config file + optional in-window timer):"
 echo "  python3 \"$INSTALL_DIR/scripts/schedule_gui.py\""
 echo "Background scheduler (systemd / cron / launchd; see $INSTALL_DIR/install/):"

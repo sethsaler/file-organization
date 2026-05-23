@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
 description: Organize files into Images, Videos, GIFs, and Other via one Python helper — non-recursive/recursive, optional normalization, dry-run, collision-safe moves, automatic empty-folder collection into For Deletion.
-version: 1.7.1
+version: 1.8.0
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]

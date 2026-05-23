@@ -28,6 +28,7 @@ from schedule_config import (
     default_config_path,
     load_config,
     organizer_script_path,
+    run_dry_run_preview,
     run_enabled_folders,
     save_config,
 )
@@ -417,8 +418,16 @@ class ScheduleApp:
             if Path(existing.path).expanduser().resolve() == Path(path).expanduser().resolve():
                 messagebox.showinfo("Folder", "That folder is already in the list.")
                 return
+        job = FolderJob(path=path)
+        ok, preview = run_dry_run_preview(job)
+        if not ok:
+            if not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd anyway?"):
+                return
+        else:
+            job.dry_run_verified = True
         with self._cfg_lock:
-            self.cfg.folders.append(FolderJob(path=path))
+            self.cfg.folders.append(job)
+        self._append_log(f"Added {path} (dry-run preview: {ok})\n")
         self._refresh_tree()
         children = self.tree.get_children()
         if children:
