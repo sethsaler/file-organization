@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from org_buckets import bucket_for_extension, bucket_names_for_profile, canonical_dir_map
-from org_exclude import should_skip_traverse_dir
+from org_exclude import path_excluded, should_skip_traverse_dir
 from org_manifest import (
     FOR_DELETION_DIR_NAME,
     Manifest,
@@ -468,6 +468,8 @@ class Organizer:
             return None
 
     def _inspect_empty_dir_tree(self, directory: Path) -> tuple[bool, List[Path]]:
+        if path_excluded(directory, self.base, self.exclude_patterns):
+            return False, []
         if directory.is_symlink():
             return False, []
 

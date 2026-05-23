@@ -99,7 +99,7 @@ class ScheduleConfig:
             if file_ver < 4:
                 dry_run_verified = True
             else:
-                dry_run_verified = bool(item["dry_run_verified"]) if "dry_run_verified" in item else True
+                dry_run_verified = bool(item.get("dry_run_verified", False))
             folders.append(
                 FolderJob(
                     path=p,

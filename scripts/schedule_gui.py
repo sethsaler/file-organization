@@ -428,6 +428,7 @@ class ScheduleApp:
         if not ok:
             if not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd anyway?"):
                 return
+            job.dry_run_verified = True
         else:
             job.dry_run_verified = True
         with self._cfg_lock:

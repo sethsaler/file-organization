@@ -11,7 +11,7 @@ GIF_EXTS: Set[str] = {"GIF"}
 
 VIDEO_EXTS: Set[str] = {
     "MP4", "M4V", "MOV", "AVI", "MKV", "WEBM", "WMV", "FLV", "MPEG", "MPG",
-    "M2TS", "MTS", "TS", "3GP", "3G2", "OGV", "ASF", "F4V", "VOB", "DIVX",
+    "M2TS", "MTS", "3GP", "3G2", "OGV", "ASF", "F4V", "VOB", "DIVX",
 }
 
 IMAGE_EXTS: Set[str] = {

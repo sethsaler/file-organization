@@ -35,7 +35,6 @@ class TinkerApp:
         self.recursive_var = tk.BooleanVar(value=True)
         self.strategy_var = tk.StringVar(value="flatten-root")
         self.normalize_var = tk.StringVar(value="standard")
-        self.recursive_var.trace_add("write", self._on_recursive_changed)
         self.profile_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
@@ -113,10 +112,6 @@ class TinkerApp:
         if not _helper_script().is_file():
             self._append_text(f"Missing helper:\n{_helper_script()}\n")
 
-    def _on_recursive_changed(self, *_args: object) -> None:
-        r = self.recursive_var.get()
-        self.normalize_var.set("standard" if r else "none")
-
     def _browse(self) -> None:
         d = filedialog.askdirectory(title="Choose folder to organize")
         if d:
@@ -128,6 +123,9 @@ class TinkerApp:
 
     def _build_cmd(self, dry_run: bool) -> list[str]:
         base = Path(self.path_var.get().strip()).expanduser()
+        recursive = self.recursive_var.get()
+        norm_ui = self.normalize_var.get()
+        eff_norm = "standard" if recursive else "none"
         cmd = [
             sys.executable,
             str(_helper_script()),
@@ -135,12 +133,12 @@ class TinkerApp:
             str(base),
             "--strategy",
             self.strategy_var.get(),
-            "--normalize",
-            self.normalize_var.get(),
             "--profile",
             self.profile_var.get(),
         ]
-        if self.recursive_var.get():
+        if norm_ui != eff_norm:
+            cmd.extend(["--normalize", norm_ui])
+        if recursive:
             cmd.append("--recursive")
         else:
             cmd.append("--no-recursive")
