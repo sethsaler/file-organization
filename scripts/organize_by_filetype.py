@@ -1,891 +1,27 @@
 #!/usr/bin/env python3
+"""CLI entry point for folder organization by file type."""
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import tempfile
-import uuid
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime
+import sys
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-
-# Extensions (uppercase, no dot). GIF is checked first so it never lands in Images.
-GIF_EXTS: Set[str] = {"GIF"}
-
-VIDEO_EXTS: Set[str] = {
-    "MP4",
-    "M4V",
-    "MOV",
-    "AVI",
-    "MKV",
-    "WEBM",
-    "WMV",
-    "FLV",
-    "MPEG",
-    "MPG",
-    "M2TS",
-    "MTS",
-    "TS",
-    "3GP",
-    "3G2",
-    "OGV",
-    "ASF",
-    "F4V",
-    "VOB",
-    "DIVX",
-}
-
-IMAGE_EXTS: Set[str] = {
-    "JPG",
-    "JPEG",
-    "JPE",
-    "PNG",
-    "WEBP",
-    "BMP",
-    "TIFF",
-    "TIF",
-    "HEIC",
-    "HEIF",
-    "AVIF",
-    "JXL",
-    "SVG",
-    "ICO",
-    "RAW",
-    "CR2",
-    "NEF",
-    "ARW",
-    "DNG",
-    "ORF",
-    "RW2",
-    "PSD",
-    "TGA",
-    "PCX",
-    "HDR",
-    "EXR",
-    "JP2",
-    "J2K",
-}
-
-_CATEGORY_DIR_CANONICAL: Dict[str, str] = {
-    "images": "Images",
-    "videos": "Videos",
-    "gifs": "GIFs",
-    "other": "Other",
-}
-
-FOR_DELETION_DIR_NAME = "For Deletion"
-ORGANIZER_DIR_NAME = ".organizer"
-EMPTY_DIR_SAMPLE_LIMIT = 20
-
-
-@dataclass
-class MoveStats:
-    files_moved: int = 0
-    name_collisions_resolved: int = 0
-    folders_touched: int = 0
-
-
-@dataclass
-class NormalizeStats:
-    folders_case_renamed: int = 0
-    folders_merged: int = 0
-    items_moved_in_merges: int = 0
-    merge_collisions_resolved: int = 0
-    source_folders_removed: int = 0
-
-
-@dataclass
-class EmptyDirStats:
-    folders_moved: int = 0
-    name_collisions_resolved: int = 0
-    sample_moves: List[Dict[str, str]] = field(default_factory=list)
-
-
-@dataclass
-class ManifestEntry:
-    from_path: str
-    to_path: str
-
-
-@dataclass
-class Manifest:
-    version: int = 1
-    created_at: str = ""
-    base_path: str = ""
-    mode: str = ""
-    strategy: str = ""
-    normalize: str = ""
-    file_moves: List[ManifestEntry] = field(default_factory=list)
-    empty_dir_moves: List[ManifestEntry] = field(default_factory=list)
-    empty_dirs_removed: List[str] = field(default_factory=list)
-
-
-class Organizer:
-    def __init__(
-        self,
-        base: Path,
-        recursive: bool,
-        strategy: str,
-        include_hidden: bool,
-        normalize: str,
-        collect_empty_dirs: bool,
-        dry_run: bool,
-        create_backup: bool = True,
-    ) -> None:
-        self.base = base
-        self.recursive = recursive
-        self.strategy = strategy
-        self.include_hidden = include_hidden
-        self.normalize = normalize
-        self.collect_empty_dirs = collect_empty_dirs
-        self.dry_run = dry_run
-        self.create_backup = create_backup
-
-        self.ext_counts = Counter()
-        self.move_stats = MoveStats()
-        self.normalize_stats = NormalizeStats()
-        self.empty_dir_stats = EmptyDirStats()
-        self.empty_dirs_removed = 0
-        self.file_moves: List[ManifestEntry] = []
-        self.empty_dir_moves: List[ManifestEntry] = []
-        self.removed_dirs: List[str] = []
-
-        self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
-
-    def _visible_name(self, name: str) -> bool:
-        return self.include_hidden or not name.startswith(".")
-
-    def _is_for_deletion_name(self, name: str) -> bool:
-        return name.casefold() == FOR_DELETION_DIR_NAME.casefold()
-
-    def _is_organizer_dir(self, name: str) -> bool:
-        return name.casefold() == ORGANIZER_DIR_NAME.casefold()
-
-    def _at_organize_root(self, parent_path: Path) -> bool:
-        try:
-            return parent_path.resolve() == self.base
-        except OSError:
-            return False
-
-    def _should_skip_traversal_dir(self, parent_path: Path, dir_name: str) -> bool:
-        """Do not descend into review/backup dirs. Legacy bucket folders (JPG, Images, …) are always entered."""
-        _ = parent_path
-        if self._is_for_deletion_name(dir_name):
-            return True
-        if self._is_organizer_dir(dir_name):
-            return True
-        return False
-
-    def _walk_topdown_organize(self) -> Iterator[Tuple[Path, List[str], List[str]]]:
-        """Walk the tree for file moves: follow symlinks into directories, break symlink cycles via inode."""
-        visited: Set[Tuple[int, int]] = set()
-        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=True):
-            root_path = Path(root)
-            try:
-                st = os.stat(root_path, follow_symlinks=False)
-                key = (st.st_dev, st.st_ino)
-                if key in visited:
-                    dirs[:] = []
-                    continue
-                visited.add(key)
-            except OSError:
-                pass
-            yield root_path, dirs, files
-
-    def _purge_hidden_files_for_cleanup(self, directory: Path) -> None:
-        if self.include_hidden:
-            return
-        try:
-            for entry in list(directory.iterdir()):
-                if entry.is_file() and not self._visible_name(entry.name):
-                    if not self.dry_run:
-                        try:
-                            entry.unlink()
-                        except OSError:
-                            pass
-        except OSError:
-            pass
-
-    def _note_collision(self, collision_counter: str) -> None:
-        if collision_counter == "files":
-            self.move_stats.name_collisions_resolved += 1
-        else:
-            self.empty_dir_stats.name_collisions_resolved += 1
-
-    def _canonical_folder_name(self, name: str) -> Optional[str]:
-        canon = _CATEGORY_DIR_CANONICAL.get(name.casefold())
-        if canon is not None and canon != name:
-            return canon
-        return None
-
-    def _init_reserved_dir(self, directory: Path) -> None:
-        if directory not in self.reserved_names:
-            existing = set()
-            if directory.exists():
-                try:
-                    existing = {p.name for p in directory.iterdir()}
-                except Exception:
-                    existing = set()
-            self.reserved_names[directory] = existing
-
-    def _collision_safe_target(self, dest_dir: Path, original_name: str, collision_counter: str = "files") -> Path:
-        self._init_reserved_dir(dest_dir)
-        reserved = self.reserved_names[dest_dir]
-
-        if original_name not in reserved:
-            reserved.add(original_name)
-            return dest_dir / original_name
-
-        self._note_collision(collision_counter)
-        p = Path(original_name)
-        stem, suffix = p.stem, p.suffix
-
-        i = 1
-        while True:
-            candidate = f"{stem}_{i}{suffix}" if suffix else f"{original_name}_{i}"
-            if candidate not in reserved:
-                reserved.add(candidate)
-                return dest_dir / candidate
-            i += 1
-
-    def _bucket_for_file(self, file_name: str) -> str:
-        suffix = Path(file_name).suffix
-        ext = suffix[1:].upper() if suffix else ""
-        if ext in GIF_EXTS:
-            return "GIFs"
-        if ext in VIDEO_EXTS:
-            return "Videos"
-        if ext in IMAGE_EXTS:
-            return "Images"
-        return "Other"
-
-    def _move_one_file(self, src: Path, dest_dir: Path) -> None:
-        try:
-            if src.resolve().parent.resolve() == dest_dir.resolve():
-                return
-        except OSError:
-            pass
-
-        dest_dir_name = dest_dir.name
-        self.ext_counts[dest_dir_name] += 1
-
-        if not self.dry_run and not dest_dir.exists():
-            dest_dir.mkdir(parents=True, exist_ok=True)
-        elif self.dry_run:
-            self._init_reserved_dir(dest_dir)
-
-        target = self._collision_safe_target(dest_dir, src.name)
-
-        if not self.dry_run:
-            shutil.move(str(src), str(target))
-            rel_src = str(src.relative_to(self.base))
-            rel_dst = str(target.relative_to(self.base))
-            self.file_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
-
-        self.move_stats.files_moved += 1
-
-    def _run_non_recursive(self) -> None:
-        touched = False
-        for p in list(self.base.iterdir()):
-            if not p.is_file() or not self._visible_name(p.name):
-                continue
-            bucket = self._bucket_for_file(p.name)
-            self._move_one_file(p, self.base / bucket)
-            touched = True
-        if touched:
-            self.move_stats.folders_touched += 1
-
-    def _run_recursive_in_place(self) -> None:
-        touched_dirs: Set[Path] = set()
-
-        for root_path, dirs, files in self._walk_topdown_organize():
-            if not self.include_hidden:
-                dirs[:] = [d for d in dirs if self._visible_name(d)]
-                files = [f for f in files if self._visible_name(f)]
-
-            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
-
-            if not files:
-                continue
-
-            for fn in files:
-                src = root_path / fn
-                bucket = self._bucket_for_file(fn)
-                self._move_one_file(src, root_path / bucket)
-                touched_dirs.add(root_path)
-
-        self.move_stats.folders_touched = len(touched_dirs)
-
-    def _run_recursive_flatten_root(self) -> None:
-        touched_dirs: Set[Path] = set()
-
-        for root_path, dirs, files in self._walk_topdown_organize():
-            if not self.include_hidden:
-                dirs[:] = [d for d in dirs if self._visible_name(d)]
-                files = [f for f in files if self._visible_name(f)]
-
-            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
-
-            if not files:
-                continue
-
-            for fn in files:
-                src = root_path / fn
-                bucket = self._bucket_for_file(fn)
-                self._move_one_file(src, self.base / bucket)
-                touched_dirs.add(root_path)
-
-        self.move_stats.folders_touched = len(touched_dirs)
-
-    def _maybe_normalize(self) -> None:
-        if self.normalize != "standard":
-            return
-
-        for root, _, _ in os.walk(self.base, topdown=False):
-            parent = Path(root)
-            if self._is_for_deletion_name(parent.name):
-                continue
-            if self._is_organizer_dir(parent.name):
-                continue
-
-            for child in [p for p in parent.iterdir() if p.is_dir()]:
-                if self._is_for_deletion_name(child.name):
-                    continue
-                if self._is_organizer_dir(child.name):
-                    continue
-                if not self._visible_name(child.name):
-                    continue
-
-                canonical = self._canonical_folder_name(child.name)
-                if canonical is None or canonical == child.name:
-                    continue
-
-                dst = parent / canonical
-
-                same_casefold = child.name.lower() == canonical.lower()
-                same_inode = False
-                if dst.exists():
-                    try:
-                        same_inode = os.path.samefile(child, dst)
-                    except Exception:
-                        same_inode = False
-
-                if same_casefold or same_inode:
-                    self.normalize_stats.folders_case_renamed += 1
-                    if not self.dry_run:
-                        tmp = parent / f"__tmp_norm_{uuid.uuid4().hex[:8]}__"
-                        child.rename(tmp)
-                        tmp.rename(dst)
-                    continue
-
-                if not dst.exists():
-                    self.normalize_stats.folders_case_renamed += 1
-                    if not self.dry_run:
-                        child.rename(dst)
-                    continue
-
-                self.normalize_stats.folders_merged += 1
-                self._init_reserved_dir(dst)
-                reserved = self.reserved_names[dst]
-
-                for item in list(child.iterdir()):
-                    if not self._visible_name(item.name):
-                        continue
-
-                    target_name = item.name
-                    if target_name in reserved:
-                        self.normalize_stats.merge_collisions_resolved += 1
-                        p = Path(target_name)
-                        stem, suffix = p.stem, p.suffix
-                        i = 1
-                        while True:
-                            candidate = f"{stem}_{i}{suffix}" if suffix else f"{target_name}_{i}"
-                            if candidate not in reserved:
-                                target_name = candidate
-                                break
-                            i += 1
-
-                    reserved.add(target_name)
-                    self.normalize_stats.items_moved_in_merges += 1
-                    if not self.dry_run:
-                        shutil.move(str(item), str(dst / target_name))
-
-                if not self.dry_run:
-                    try:
-                        if not any(child.iterdir()):
-                            child.rmdir()
-                            self.normalize_stats.source_folders_removed += 1
-                    except Exception:
-                        pass
-
-    def _copy_placeholder_tree(self, src: Path, dst: Path) -> None:
-        dst.mkdir(parents=True, exist_ok=True)
-        for entry in src.iterdir():
-            target = dst / entry.name
-            if entry.is_symlink():
-                try:
-                    os.symlink(os.readlink(entry), target)
-                except Exception:
-                    target.touch()
-                continue
-
-            if entry.is_dir():
-                self._copy_placeholder_tree(entry, target)
-                continue
-
-            target.touch()
-
-    def _simulate_empty_dir_collection(self) -> Optional[EmptyDirStats]:
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                sim_base = Path(tmpdir) / "sim"
-                self._copy_placeholder_tree(self.base, sim_base)
-                sim_org = Organizer(
-                    base=sim_base,
-                    recursive=self.recursive,
-                    strategy=self.strategy,
-                    include_hidden=self.include_hidden,
-                    normalize=self.normalize,
-                    collect_empty_dirs=True,
-                    dry_run=False,
-                )
-                sim_org.run()
-                return EmptyDirStats(
-                    folders_moved=sim_org.empty_dir_stats.folders_moved,
-                    name_collisions_resolved=sim_org.empty_dir_stats.name_collisions_resolved,
-                    sample_moves=list(sim_org.empty_dir_stats.sample_moves),
-                )
-        except Exception:
-            return None
-
-    def _inspect_empty_dir_tree(self, directory: Path) -> tuple[bool, List[Path]]:
-        if directory.is_symlink():
-            return False, []
-
-        try:
-            entries = list(directory.iterdir())
-        except Exception:
-            return False, []
-
-        if not entries:
-            return True, []
-
-        collectable = True
-        topmost_children: List[Path] = []
-
-        for entry in entries:
-            if self._is_for_deletion_name(entry.name):
-                collectable = False
-                continue
-            if self._is_organizer_dir(entry.name):
-                collectable = False
-                continue
-
-            if not self.include_hidden and not self._visible_name(entry.name):
-                collectable = False
-                continue
-
-            if entry.is_symlink():
-                collectable = False
-                continue
-
-            if entry.is_dir():
-                child_collectable, child_topmost = self._inspect_empty_dir_tree(entry)
-                if child_collectable:
-                    topmost_children.append(entry)
-                else:
-                    collectable = False
-                    topmost_children.extend(child_topmost)
-                continue
-
-            collectable = False
-
-        if collectable:
-            return True, []
-        return False, topmost_children
-
-    def _find_empty_dir_candidates(self) -> List[Path]:
-        candidates: List[Path] = []
-        seen: Set[Path] = set()
-
-        for child in sorted(self.base.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir() or child.is_symlink():
-                continue
-            if not self._visible_name(child.name):
-                continue
-            if self._is_for_deletion_name(child.name):
-                continue
-            if self._is_organizer_dir(child.name):
-                continue
-
-            child_collectable, child_topmost = self._inspect_empty_dir_tree(child)
-            if child_collectable:
-                paths_to_add = [child]
-            elif self.recursive:
-                paths_to_add = child_topmost
-            else:
-                paths_to_add = []
-
-            for path in paths_to_add:
-                if path in seen:
-                    continue
-                seen.add(path)
-                candidates.append(path)
-
-        return candidates
-
-    def _collect_empty_dirs_batch(self, candidates: List[Path]) -> None:
-        """Move one batch of empty-folder candidates into root-level For Deletion."""
-        dest_root = self.base / FOR_DELETION_DIR_NAME
-        if not self.dry_run:
-            dest_root.mkdir(parents=True, exist_ok=True)
-        else:
-            self._init_reserved_dir(dest_root)
-
-        for src_dir in candidates:
-            target = self._collision_safe_target(dest_root, src_dir.name, collision_counter="empty_dirs")
-            if len(self.empty_dir_stats.sample_moves) < EMPTY_DIR_SAMPLE_LIMIT:
-                self.empty_dir_stats.sample_moves.append(
-                    {
-                        "from": str(src_dir.relative_to(self.base)),
-                        "to": str(target.relative_to(self.base)),
-                    }
-                )
-
-            if not self.dry_run:
-                shutil.move(str(src_dir), str(target))
-                rel_src = str(src_dir.relative_to(self.base))
-                rel_dst = str(target.relative_to(self.base))
-                self.empty_dir_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
-
-            self.empty_dir_stats.folders_moved += 1
-
-    def _maybe_collect_empty_dirs(self) -> None:
-        if not self.collect_empty_dirs:
-            return
-
-        if self.dry_run:
-            simulated = self._simulate_empty_dir_collection()
-            if simulated is not None:
-                self.empty_dir_stats = simulated
-                return
-
-        max_rounds = 500
-        for _ in range(max_rounds):
-            candidates = self._find_empty_dir_candidates()
-            if not candidates:
-                break
-            self._collect_empty_dirs_batch(candidates)
-
-    def _remove_empty_subdirs(self) -> None:
-        candidates: List[Path] = []
-        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
-            root_path = Path(root)
-            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
-            if self._is_for_deletion_name(root_path.name):
-                dirs[:] = []
-                continue
-            if self._is_organizer_dir(root_path.name):
-                dirs[:] = []
-                continue
-            if self._at_organize_root(root_path):
-                continue
-            candidates.append(root_path)
-
-        for root_path in sorted(candidates, key=lambda p: len(p.parts), reverse=True):
-            if self._is_for_deletion_name(root_path.name):
-                continue
-            try:
-                entries = list(root_path.iterdir())
-            except OSError:
-                continue
-
-            can_remove = False
-            if not entries:
-                can_remove = True
-            elif not self.include_hidden:
-                can_remove = all(e.is_file() and not self._visible_name(e.name) for e in entries)
-
-            if not can_remove:
-                continue
-
-            if not self.dry_run:
-                self._purge_hidden_files_for_cleanup(root_path)
-                try:
-                    if any(root_path.iterdir()):
-                        continue
-                    self.removed_dirs.append(str(root_path.relative_to(self.base)))
-                    root_path.rmdir()
-                except OSError:
-                    continue
-            self.empty_dirs_removed += 1
-
-    def _verify(self) -> Dict[str, object]:
-        root_visible = 0
-        root_all = 0
-        for p in self.base.iterdir():
-            if p.is_file():
-                root_all += 1
-                if self._visible_name(p.name):
-                    root_visible += 1
-
-        noncanonical_dirs = []
-        for root_path, dirs, _ in self._walk_topdown_organize():
-            if not self.include_hidden:
-                dirs[:] = [d for d in dirs if self._visible_name(d)]
-            dirs[:] = [d for d in dirs if not self._is_for_deletion_name(d)]
-            dirs[:] = [d for d in dirs if not self._is_organizer_dir(d)]
-            parent = root_path
-            for d in dirs:
-                c = self._canonical_folder_name(d)
-                if c is not None and c != d:
-                    noncanonical_dirs.append(str(parent / d))
-
-        remaining_unorganized_visible_files = None
-        checked_non_bucket_directories = None
-
-        if self.recursive and self.strategy == "in-place":
-            remaining_unorganized_visible_files = 0
-            checked_non_bucket_directories = 0
-
-            for root_path, dirs, files in self._walk_topdown_organize():
-                if not self.include_hidden:
-                    dirs[:] = [d for d in dirs if self._visible_name(d)]
-                    files = [f for f in files if self._visible_name(f)]
-
-                checked_non_bucket_directories += 1
-                remaining_unorganized_visible_files += len(files)
-
-                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
-
-        return {
-            "root_files_remaining_visible": root_visible,
-            "root_files_remaining_all": root_all,
-            "noncanonical_bucket_dirs_count": len(noncanonical_dirs),
-            "noncanonical_bucket_dirs_sample": noncanonical_dirs[:10],
-            "remaining_unorganized_visible_files_in_checked_dirs": remaining_unorganized_visible_files,
-            "checked_non_bucket_directories": checked_non_bucket_directories,
-        }
-
-    def save_manifest(self) -> Optional[Dict[str, str]]:
-        if self.dry_run or not self.create_backup:
-            return None
-
-        manifest = Manifest(
-            created_at=datetime.now().isoformat(),
-            base_path=str(self.base),
-            mode="recursive" if self.recursive else "non-recursive",
-            strategy=self.strategy if self.recursive else "root-only",
-            normalize=self.normalize,
-            file_moves=self.file_moves,
-            empty_dir_moves=self.empty_dir_moves,
-            empty_dirs_removed=self.removed_dirs,
-        )
-
-        backup_dir = self.base / ORGANIZER_DIR_NAME
-        backup_dir.mkdir(parents=True, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        manifest_path = backup_dir / f"backup_{timestamp}.json"
-
-        data = {
-            "version": manifest.version,
-            "created_at": manifest.created_at,
-            "base_path": manifest.base_path,
-            "mode": manifest.mode,
-            "strategy": manifest.strategy,
-            "normalize": manifest.normalize,
-            "file_moves": [{"from": m.from_path, "to": m.to_path} for m in manifest.file_moves],
-            "empty_dir_moves": [{"from": m.from_path, "to": m.to_path} for m in manifest.empty_dir_moves],
-            "empty_dirs_removed": manifest.empty_dirs_removed,
-        }
-
-        manifest_path.write_text(json.dumps(data, indent=2))
-
-        restore_script = backup_dir / f"Restore from {timestamp}.command"
-        restore_script_content = f"""#!/bin/bash
-set -euo pipefail
-
-HELPER="{Path(__file__).resolve()}"
-MANIFEST="{manifest_path.resolve()}"
-
-clear
-echo "=============================================="
-echo " Restore File Organization"
-echo "=============================================="
-echo
-echo "Manifest: $MANIFEST"
-echo
-
-if [[ ! -f "$MANIFEST" ]]; then
-  echo "Error: manifest not found."
-  echo
-  read -r -p "Press Enter to close..." _
-  exit 1
-fi
-
-echo "----- Restoring -----"
-python3 "$HELPER" --restore "$MANIFEST"
-
-echo
-echo "Done. Files restored to original locations."
-echo
-
-read -r -p "Press Enter to close..." _
-"""
-        restore_script.write_text(restore_script_content)
-        restore_script.chmod(0o755)
-
-        root_restore = self.base / "Restore File Organization.command"
-        root_restore.write_text(restore_script_content)
-        root_restore.chmod(0o755)
-
-        return {
-            "manifest": str(manifest_path),
-            "restore_script": str(restore_script),
-            "root_restore": str(root_restore),
-        }
-
-    def run(self) -> Dict[str, object]:
-        try:
-            self.base = self.base.resolve()
-        except OSError:
-            pass
-
-        if self.recursive:
-            if self.strategy == "in-place":
-                self._run_recursive_in_place()
-            else:
-                self._run_recursive_flatten_root()
-                if not self.collect_empty_dirs:
-                    self._remove_empty_subdirs()
-        else:
-            self._run_non_recursive()
-
-        self._maybe_normalize()
-        self._maybe_collect_empty_dirs()
-        self._remove_empty_subdirs()
-
-        manifest_info = self.save_manifest()
-
-        summary = {
-            "target": str(self.base),
-            "mode": "recursive" if self.recursive else "non-recursive",
-            "strategy": self.strategy if self.recursive else "root-only",
-            "buckets": ["Images", "Videos", "GIFs", "Other"],
-            "include_hidden": self.include_hidden,
-            "normalization_mode": self.normalize,
-            "dry_run": self.dry_run,
-            "files_moved": self.move_stats.files_moved,
-            "moved_by_category": dict(sorted(self.ext_counts.items())),
-            "name_collisions_resolved": self.move_stats.name_collisions_resolved,
-            "folders_touched": self.move_stats.folders_touched,
-            "empty_dirs_removed": self.empty_dirs_removed,
-            "normalization": {
-                "folders_case_renamed": self.normalize_stats.folders_case_renamed,
-                "folders_merged": self.normalize_stats.folders_merged,
-                "items_moved_in_merges": self.normalize_stats.items_moved_in_merges,
-                "merge_collisions_resolved": self.normalize_stats.merge_collisions_resolved,
-                "source_folders_removed": self.normalize_stats.source_folders_removed,
-            },
-            "empty_folder_collection": {
-                "enabled": self.collect_empty_dirs,
-                "destination": str(self.base / FOR_DELETION_DIR_NAME) if self.collect_empty_dirs else None,
-                "folders_moved": self.empty_dir_stats.folders_moved,
-                "name_collisions_resolved": self.empty_dir_stats.name_collisions_resolved,
-                "sample_moves": self.empty_dir_stats.sample_moves,
-            },
-            "verification": self._verify(),
-            "backup_manifest": manifest_info["manifest"] if manifest_info else None,
-            "restore_script": manifest_info["restore_script"] if manifest_info else None,
-            "root_restore": manifest_info["root_restore"] if manifest_info else None,
-        }
-        return summary
-
-
-def restore_from_manifest(manifest_path: str) -> None:
-    manifest_file = Path(manifest_path)
-    if not manifest_file.exists():
-        print(json.dumps({"error": f"Manifest not found: {manifest_path}"}, indent=2))
-        return
-
-    try:
-        data = json.loads(manifest_file.read_text())
-    except json.JSONDecodeError as e:
-        print(json.dumps({"error": f"Invalid manifest file: {e}"}, indent=2))
-        return
-
-    base = Path(data["base_path"])
-    if not base.exists():
-        print(json.dumps({"error": f"Base path not found: {base}"}, indent=2))
-        return
-
-    all_moves = data.get("file_moves", [])
-    empty_moves = data.get("empty_dir_moves", [])
-    removed_dirs = data.get("empty_dirs_removed", [])
-
-    restored_files = 0
-    restored_dirs = 0
-    collisions = 0
-
-    for entry in reversed(empty_moves):
-        src = base / entry["to"]
-        dst = base / entry["from"]
-        if not src.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists():
-            collisions += 1
-            stem, suffix = dst.stem, dst.suffix
-            dst = dst.parent / f"{stem}_restored{suffix}"
-        shutil.move(str(src), str(dst))
-        restored_dirs += 1
-
-    for entry in reversed(all_moves):
-        src = base / entry["to"]
-        dst = base / entry["from"]
-        if not src.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists():
-            collisions += 1
-            stem, suffix = dst.stem, dst.suffix
-            dst = dst.parent / f"{stem}_restored{suffix}"
-        shutil.move(str(src), str(dst))
-        restored_files += 1
-
-    for rel_dir in reversed(removed_dirs):
-        dir_path = base / rel_dir
-        if not dir_path.exists():
-            try:
-                dir_path.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
-    result = {
-        "restore_from": str(manifest_file),
-        "base_path": str(base),
-        "files_restored": restored_files,
-        "directories_restored": restored_dirs,
-        "collisions_renamed": collisions,
-        "manifest_info": {
-            "created_at": data.get("created_at", "unknown"),
-            "mode": data.get("mode", "unknown"),
-            "strategy": data.get("strategy", "unknown"),
-        },
-    }
-    print(json.dumps(result, indent=2))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from org_buckets import PROFILE_EXTENDED, PROFILE_STANDARD, resolve_profile
+from org_exclude import merge_exclude_patterns
+from org_manifest import restore_from_manifest
+from org_organizer import Organizer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Organize files into Images, Videos, GIFs, and Other at the target root "
+            "Organize files into type buckets at the target root "
             "(recursive modes, optional normalization, empty-folder staging)."
         )
     )
@@ -900,76 +36,73 @@ def parse_args() -> argparse.Namespace:
     )
     hidden_group = parser.add_mutually_exclusive_group()
     parser.set_defaults(include_hidden=True)
-    hidden_group.add_argument(
-        "--include-hidden",
-        dest="include_hidden",
-        action="store_true",
-        help="Include hidden files and folders (default)",
-    )
-    hidden_group.add_argument(
-        "--no-include-hidden",
-        dest="include_hidden",
-        action="store_false",
-        help="Exclude dotfiles and dot-directories from organizing and empty-folder cleanup",
-    )
+    hidden_group.add_argument("--include-hidden", dest="include_hidden", action="store_true", help="Include hidden files (default)")
+    hidden_group.add_argument("--no-include-hidden", dest="include_hidden", action="store_false", help="Exclude dotfiles")
     parser.add_argument(
         "--normalize",
         choices=["none", "standard"],
-        default="none",
-        help="Normalization mode (standard fixes Images/Videos/GIFs/Other folder casing)",
+        default=None,
+        help="Normalization mode (default: standard when recursive, none otherwise)",
     )
     empty_dir_group = parser.add_mutually_exclusive_group()
     parser.set_defaults(collect_empty_dirs=True)
-    empty_dir_group.add_argument(
-        "--collect-empty-dirs",
-        dest="collect_empty_dirs",
-        action="store_true",
-        help="Move collectable empty folders into a root-level 'For Deletion' folder (default)",
-    )
-    empty_dir_group.add_argument(
-        "--no-collect-empty-dirs",
-        dest="collect_empty_dirs",
-        action="store_false",
-        help="Disable automatic empty-folder collection into 'For Deletion'",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Simulate operations without writing changes")
+    empty_dir_group.add_argument("--collect-empty-dirs", dest="collect_empty_dirs", action="store_true", help="Stage empty folders to For Deletion (default)")
+    empty_dir_group.add_argument("--no-collect-empty-dirs", dest="collect_empty_dirs", action="store_false", help="Skip empty-folder staging")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate without writing")
     backup_group = parser.add_mutually_exclusive_group()
     parser.set_defaults(create_backup=True)
-    backup_group.add_argument(
-        "--backup",
-        dest="create_backup",
-        action="store_true",
-        help="Create a backup manifest for rollback (default)",
-    )
-    backup_group.add_argument(
-        "--no-backup",
-        dest="create_backup",
-        action="store_false",
-        help="Skip creating a backup manifest",
-    )
+    backup_group.add_argument("--backup", dest="create_backup", action="store_true", help="Create backup manifest (default)")
+    backup_group.add_argument("--no-backup", dest="create_backup", action="store_false", help="Skip backup manifest")
+    parser.add_argument("--restore", metavar="MANIFEST", help="Restore from a backup manifest")
     parser.add_argument(
-        "--restore",
-        metavar="MANIFEST",
-        help="Restore files from a backup manifest instead of organizing",
+        "--profile",
+        default=PROFILE_STANDARD,
+        metavar="NAME|FILE",
+        help=f"Bucket profile: {PROFILE_STANDARD}, {PROFILE_EXTENDED}, or path to JSON",
     )
+    parser.add_argument("--exclude", action="append", default=[], metavar="PATTERN", help="Exclude dir name or glob (repeatable)")
+    parser.add_argument("--exclude-defaults", action="store_true", help="Also exclude .git, node_modules, venv, etc.")
+    parser.add_argument("--no-follow-symlinks", action="store_true", help="Do not follow directory symlinks when walking")
+    parser.add_argument("--mime-sniff", action="store_true", help="Sniff extensionless files by content")
+    parser.add_argument("--verbose", action="store_true", help="Progress messages on stderr")
+    parser.add_argument("--ocr-index", action="store_true", help="After run, OCR PNG/JPEG in Images/ to .organizer/ocr_index.csv")
+    parser.add_argument("--json-out", metavar="FILE", help="Write JSON summary to file instead of stdout only")
     return parser.parse_args()
+
+
+def _progress(msg: str) -> None:
+    sys.stderr.write(msg)
+    sys.stderr.flush()
 
 
 def main() -> None:
     args = parse_args()
 
     if args.restore:
-        restore_from_manifest(args.restore)
+        if not restore_from_manifest(args.restore):
+            sys.exit(1)
         return
+
+    if not args.path:
+        print(json.dumps({"error": "--path is required unless using --restore"}, indent=2))
+        sys.exit(2)
 
     base = Path(args.path).expanduser().resolve()
     if not base.exists() or not base.is_dir():
         print(json.dumps({"error": f"Path not found or not a directory: {base}"}, indent=2))
-        return
+        sys.exit(1)
 
     normalize = args.normalize
-    if args.recursive and normalize == "none":
-        pass
+    if normalize is None:
+        normalize = "standard" if args.recursive else "none"
+
+    try:
+        profile_label, profile_buckets = resolve_profile(args.profile)
+    except ValueError as e:
+        print(json.dumps({"error": str(e)}, indent=2))
+        sys.exit(2)
+
+    excludes = merge_exclude_patterns(args.exclude or [], use_defaults=args.exclude_defaults)
 
     org = Organizer(
         base=base,
@@ -980,9 +113,20 @@ def main() -> None:
         collect_empty_dirs=args.collect_empty_dirs,
         dry_run=args.dry_run,
         create_backup=args.create_backup,
+        profile_label=profile_label,
+        profile_buckets=profile_buckets,
+        exclude_patterns=excludes,
+        follow_symlinks=not args.no_follow_symlinks,
+        use_mime_sniff=args.mime_sniff,
+        verbose=args.verbose,
+        ocr_index=args.ocr_index,
+        progress_callback=_progress if args.verbose else None,
     )
     result = org.run()
-    print(json.dumps(result, indent=2))
+    out = json.dumps(result, indent=2)
+    print(out)
+    if args.json_out:
+        Path(args.json_out).write_text(out, encoding="utf-8")
 
 
 if __name__ == "__main__":

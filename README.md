@@ -117,14 +117,30 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--strategy {flatten-root,in-place}` — recursive strategy (default: flatten-root)
 - `--include-hidden` — include hidden files and folders (default behavior)
 - `--no-include-hidden` — exclude dotfiles and dot-directories
-- `--normalize {none,standard}` — normalization mode (standard fixes bucket folder casing)
-- `--collect-empty-dirs` — stage collectable empty folder trees into root-level `For Deletion` (default)
-- `--no-collect-empty-dirs` — skip staging; only remove empty directories in place after organizing
+- `--normalize {none,standard}` — normalization (default: **standard** when recursive, **none** when not)
+- `--profile {standard,extended,FILE.json}` — bucket set (`extended` adds Documents, Audio, Archives, Code)
+- `--exclude PATTERN` — skip matching directory names or globs (repeatable)
+- `--exclude-defaults` — also skip `.git`, `node_modules`, `venv`, `__pycache__`, etc.
+- `--no-follow-symlinks` — do not follow directory symlinks when walking
+- `--mime-sniff` — classify extensionless files from file headers
+- `--verbose` — progress on stderr during large runs
+- `--ocr-index` — after organizing, OCR PNG/JPEG under `Images/` into `.organizer/ocr_index.csv` (needs OCR deps)
+- `--collect-empty-dirs` / `--no-collect-empty-dirs` — empty-folder staging (default: on)
 - `--dry-run` — preview changes without writing
+- `--restore MANIFEST` — undo a run from `.organizer/backup_*.json`
+- `--json-out FILE` — write JSON summary to a file
+
+Restore without the main CLI:
+
+```bash
+python3 scripts/restore_from_backup.py /path/to/folder/.organizer/backup_20260101_120000.json
+python3 scripts/restore_from_backup.py --list /path/to/folder
+```
 
 ## Behavior and safety
 
-- **Buckets:** `Images`, `Videos`, `GIFs`, `Other` (see the script for extension lists)
+- **Buckets:** `Images`, `Videos`, `GIFs`, `Other` by default; use `--profile extended` for more types
+- **Dotfiles:** included by default (e.g. `.DS_Store` moves with other files unless `--no-include-hidden`)
 - Hidden files and folders are organized like visible ones unless `--no-include-hidden` is set
 - Existing files are never overwritten
 - Name collisions are resolved by suffixing `_1`, `_2`, and so on

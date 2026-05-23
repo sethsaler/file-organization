@@ -4,11 +4,24 @@ All notable changes to this project will be documented in this file.
 
 This project tracks changes using the Hermes skill version as its public version number.
 
-## [Unreleased]
+## [1.8.0] - 2026-05-23
 
-- Ongoing improvements, cleanup, and repository polish.
-- Added `scripts/schedule_config.py`, `scripts/schedule_daemon.py`, and parallel `schedule.json` runs; `install/systemd/` and `install/launchd/` examples for long-running background scheduling.
-- Added `scripts/extract_image_text.py` to extract text from PNG/JPEG images via Tesseract and write CSV or Excel (`file_name`, `extracted_text`), plus `requirements-ocr.txt` and README documentation.
+### Added
+
+- Modular helpers: `org_buckets.py`, `org_exclude.py`, `org_mime.py`, `org_manifest.py`, `org_organizer.py`, `org_logging.py`.
+- `pytest` suite and GitHub Actions CI (`.github/workflows/test.yml`).
+- CLI: `--profile standard|extended|file.json`, `--exclude`, `--exclude-defaults`, `--no-follow-symlinks`, `--mime-sniff`, `--verbose`, `--ocr-index`, `--json-out`.
+- `scripts/restore_from_backup.py` and `restore_*.sh` for cross-platform rollback.
+- Install adds `organize-by-filetype` and `restore-file-organization` to `~/.local/bin`.
+- Scheduler: file logging (`~/.local/state/file-organization/scheduler.log`), path overlap warnings, auto-disable after repeated failures, dry-run preview when adding folders in `schedule_gui.py`.
+- Tinker GUI: profile, exclude defaults, verbose/MIME options, restore from latest manifest.
+
+### Changed
+
+- Recursive runs default to `--normalize standard` when not specified.
+- `schedule.json` schema version 3 (`profile`, `exclude`, failure counters).
+
+## [Unreleased]
 
 ### Changed
 

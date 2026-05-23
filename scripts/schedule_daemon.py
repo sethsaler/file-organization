@@ -25,6 +25,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+from org_logging import default_log_path
 from schedule_config import default_config_path, load_config, run_enabled_folders
 
 
@@ -92,6 +93,7 @@ def main() -> None:
             max_parallel=args.max_parallel,
             log=lambda s: print(s, end=""),
             label="once",
+            file_log_path=default_log_path(),
         )
         print(json.dumps({"ok": True, "config": str(config_path)}, indent=2))
         return
@@ -130,6 +132,7 @@ def main() -> None:
                 max_parallel=args.max_parallel,
                 log=lambda s: print(s, end=""),
                 label="scheduled",
+                file_log_path=default_log_path(),
             )
 
         first = False
