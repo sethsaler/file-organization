@@ -24,14 +24,19 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from schedule_config import (
     FolderJob,
+    SCHEDULE_MODE_DAILY,
+    SCHEDULE_MODE_INTERVAL,
     build_organize_cmd,
     effective_normalize,
     default_config_path,
     load_config,
+    normalize_daily_time,
+    normalize_schedule_mode,
     organizer_script_path,
     run_dry_run_preview,
     run_enabled_folders,
     save_config,
+    wait_seconds_after_run,
 )
 
 
@@ -51,6 +56,10 @@ class ScheduleApp:
         self._cfg_lock = threading.Lock()
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
+        self.schedule_mode_var = tk.StringVar(
+            value=normalize_schedule_mode(self.cfg.schedule_mode)
+        )
+        self.daily_time_var = tk.StringVar(value=normalize_daily_time(self.cfg.daily_time))
         self.scheduler_var = tk.BooleanVar(value=self.cfg.scheduler_enabled)
         self.max_parallel_var = tk.IntVar(value=self.cfg.max_parallel)
 
@@ -67,18 +76,42 @@ class ScheduleApp:
         top.grid(row=row, column=0, sticky="ew", **pad)
         top.columnconfigure(2, weight=1)
 
-        ttk.Label(top, text="Run every").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        tk.Spinbox(
-            top,
+        mode_row = ttk.Frame(top)
+        mode_row.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(
+            mode_row,
+            text="Run every",
+            variable=self.schedule_mode_var,
+            value=SCHEDULE_MODE_INTERVAL,
+            command=self._on_schedule_mode_change,
+        ).pack(side="left")
+        self.interval_spin = tk.Spinbox(
+            mode_row,
             from_=1,
             to=10080,
             width=8,
             textvariable=self.interval_var,
             command=self._sync_interval_to_cfg,
-        ).grid(row=0, column=1, sticky="w")
-        ttk.Label(top, text="minutes").grid(row=0, column=2, sticky="w", padx=(6, 0))
+        )
+        self.interval_spin.pack(side="left", padx=(6, 0))
+        ttk.Label(mode_row, text="minutes").pack(side="left", padx=(6, 0))
 
-        ttk.Label(top, text="Max parallel").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        daily_row = ttk.Frame(top)
+        daily_row.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Radiobutton(
+            daily_row,
+            text="Once daily at",
+            variable=self.schedule_mode_var,
+            value=SCHEDULE_MODE_DAILY,
+            command=self._on_schedule_mode_change,
+        ).pack(side="left")
+        self.daily_time_entry = ttk.Entry(daily_row, width=7, textvariable=self.daily_time_var)
+        self.daily_time_entry.pack(side="left", padx=(6, 0))
+        self.daily_time_entry.bind("<FocusOut>", lambda _e: self._sync_daily_time_to_cfg())
+        self.daily_time_entry.bind("<Return>", lambda _e: self._sync_daily_time_to_cfg())
+        ttk.Label(daily_row, text="(local time, 24h — default midnight)").pack(side="left", padx=(6, 0))
+
+        ttk.Label(top, text="Max parallel").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
         tk.Spinbox(
             top,
             from_=0,
@@ -86,21 +119,24 @@ class ScheduleApp:
             width=8,
             textvariable=self.max_parallel_var,
             command=self._sync_parallel_to_cfg,
-        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=1, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
+        ).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=2, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
 
         ttk.Checkbutton(
             top,
             text="Enable automatic runs (in this window)",
             variable=self.scheduler_var,
             command=self._on_scheduler_toggle,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         hint = (
-            "Background: run scripts/schedule_daemon.py --foreground under systemd, "
-            "or schedule_daemon.py --once via cron. Same config file as shown below."
+            "Background: run scripts/schedule_daemon.py --foreground under systemd "
+            "(daily mode sleeps until the next local run time), or schedule_daemon.py --once "
+            "via cron at midnight (0 0 * * *). Same config file as shown below."
         )
-        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        self._on_schedule_mode_change()
 
         row += 1
         path_row = ttk.Frame(frm)
@@ -211,7 +247,34 @@ class ScheduleApp:
         if self.cfg.scheduler_enabled:
             self._ensure_worker()
 
-    def _sync_interval_to_cfg(self) -> None:
+    def _on_schedule_mode_change(self) -> None:
+        daily = normalize_schedule_mode(self.schedule_mode_var.get()) == SCHEDULE_MODE_DAILY
+        spin_state = "disabled" if daily else "normal"
+        try:
+            self.interval_spin.configure(state=spin_state)
+        except tk.TclError:
+            pass
+        entry_state = "normal" if daily else "disabled"
+        try:
+            self.daily_time_entry.configure(state=entry_state)
+        except tk.TclError:
+            pass
+        self._sync_schedule_timing_to_cfg()
+
+    def _sync_schedule_timing_to_cfg(self) -> None:
+        self._sync_interval_to_cfg(quiet=True)
+        self._sync_daily_time_to_cfg(quiet=True)
+        mode = normalize_schedule_mode(self.schedule_mode_var.get())
+        prev_mode = normalize_schedule_mode(self.cfg.schedule_mode)
+        prev_time = normalize_daily_time(self.cfg.daily_time)
+        time_val = normalize_daily_time(self.daily_time_var.get())
+        self.cfg.schedule_mode = mode
+        self.cfg.daily_time = time_val
+        self.daily_time_var.set(time_val)
+        if mode != prev_mode or time_val != prev_time:
+            self._wake_event.set()
+
+    def _sync_interval_to_cfg(self, *, quiet: bool = False) -> None:
         try:
             v = int(self.interval_var.get())
         except (tk.TclError, ValueError):
@@ -220,7 +283,16 @@ class ScheduleApp:
         self.interval_var.set(v)
         prev = self.cfg.interval_minutes
         self.cfg.interval_minutes = v
-        if v != prev:
+        if not quiet and v != prev:
+            self._wake_event.set()
+
+    def _sync_daily_time_to_cfg(self, *, quiet: bool = False) -> None:
+        normalized = normalize_daily_time(self.daily_time_var.get())
+        self.daily_time_var.set(normalized)
+        prev = normalize_daily_time(self.cfg.daily_time)
+        self.cfg.daily_time = normalized
+        self.cfg.schedule_mode = normalize_schedule_mode(self.schedule_mode_var.get())
+        if not quiet and normalized != prev:
             self._wake_event.set()
 
     def _sync_parallel_to_cfg(self) -> None:
@@ -296,8 +368,9 @@ class ScheduleApp:
             if self._stop_event.is_set():
                 break
             while self.cfg.scheduler_enabled and not self._stop_event.is_set():
-                minutes = max(1, min(10080, int(self.cfg.interval_minutes)))
-                wait_sec = minutes * 60
+                with self._cfg_lock:
+                    cfg = load_config(self.config_path)
+                wait_sec = wait_seconds_after_run(cfg)
                 why = self._wait_interval(wait_sec)
                 if why == "stop":
                     return
@@ -333,7 +406,7 @@ class ScheduleApp:
             pass
 
     def _save_quiet(self) -> None:
-        self._sync_interval_to_cfg()
+        self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
@@ -545,7 +618,7 @@ class ScheduleApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _save(self) -> None:
-        self._sync_interval_to_cfg()
+        self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
@@ -557,7 +630,7 @@ class ScheduleApp:
 
     def _on_close(self) -> None:
         self._stop_event.set()
-        self._sync_interval_to_cfg()
+        self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:

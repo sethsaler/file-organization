@@ -52,16 +52,38 @@ Edit folders and options in the schedule GUI (writes `~/.config/file-organizatio
 python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_gui.py
 ```
 
-Run a **true background** loop (reloads the config each cycle; enable `scheduler_enabled` in the JSON, or use `--force`):
+1. Click **Add folder…** and pick the folder to auto-organize.
+2. Choose **Once daily at** `00:00` for midnight (local time), or **Run every** *N* **minutes** for interval mode.
+3. Enable **automatic runs** in the GUI, or run the background daemon below with `scheduler_enabled` set to true in the JSON.
+
+Run a **true background** loop (reloads the config each cycle; in daily mode sleeps until the next local run time; enable `scheduler_enabled` in the JSON, or use `--force`):
 
 ```bash
 python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_daemon.py --foreground
 ```
 
-For **cron**, run one parallel batch per invocation (honors `scheduler_enabled` unless you pass `--force`):
+For **cron** at midnight, run one parallel batch per invocation (honors `scheduler_enabled` unless you pass `--force`):
 
-```bash
-python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_daemon.py --once
+```cron
+0 0 * * * /usr/bin/python3 /FULL/PATH/TO/scripts/schedule_daemon.py --once >>"$HOME/.cache/file-org-scheduler.log" 2>&1
+```
+
+Example `schedule.json` for a single folder every night at midnight:
+
+```json
+{
+  "version": 5,
+  "schedule_mode": "daily",
+  "daily_time": "00:00",
+  "scheduler_enabled": true,
+  "folders": [
+    {
+      "path": "/path/to/your/folder",
+      "enabled": true,
+      "dry_run_verified": true
+    }
+  ]
+}
 ```
 
 Set `max_parallel` in the JSON: **0** means all enabled folders at once (capped at 32); a positive number limits concurrent runs. Example unit files: `install/systemd/`, `install/launchd/`.

@@ -23,6 +23,10 @@ This project tracks changes using the Hermes skill version as its public version
 
 ## [Unreleased]
 
+### Added
+
+- **Daily schedule:** `schedule.json` can use `"schedule_mode": "daily"` and `"daily_time": "00:00"` (local 24h time) so enabled folders run once per day at midnight (or another time). The schedule GUI adds “Once daily at”, and `schedule_daemon.py --foreground` sleeps until the next run time.
+
 ### Changed
 
 - **Removed per-extension mode:** `--by-extension` is gone. Output JSON uses `moved_by_category`, `buckets`, and `noncanonical_bucket_dirs_*`; `alias_map` dropped from normalization stats.
