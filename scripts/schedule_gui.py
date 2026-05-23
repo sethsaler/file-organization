@@ -25,6 +25,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from schedule_config import (
     FolderJob,
     build_organize_cmd,
+    effective_normalize,
     default_config_path,
     load_config,
     organizer_script_path,
@@ -389,7 +390,9 @@ class ScheduleApp:
         self.enabled_var.set(job.enabled)
         self.recursive_var.set(job.recursive)
         self.strategy_var.set(job.strategy)
-        self.normalize_var.set(job.normalize)
+        self.normalize_var.set(
+            job.normalize if job.normalize not in (None, "") else effective_normalize(job)
+        )
         self.hidden_var.set(job.include_hidden)
         self.collect_empty_var.set(job.collect_empty_dirs)
 
@@ -404,7 +407,9 @@ class ScheduleApp:
         job.enabled = bool(self.enabled_var.get())
         job.recursive = bool(self.recursive_var.get())
         job.strategy = self.strategy_var.get()
-        job.normalize = self.normalize_var.get()
+        r = job.recursive
+        ui = self.normalize_var.get()
+        job.normalize = None if ui == ("standard" if r else "none") else ui
         job.include_hidden = bool(self.hidden_var.get())
         job.collect_empty_dirs = bool(self.collect_empty_var.get())
         self._refresh_tree_row(idx)

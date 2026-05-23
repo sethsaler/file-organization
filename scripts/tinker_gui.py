@@ -35,6 +35,7 @@ class TinkerApp:
         self.recursive_var = tk.BooleanVar(value=True)
         self.strategy_var = tk.StringVar(value="flatten-root")
         self.normalize_var = tk.StringVar(value="standard")
+        self.recursive_var.trace_add("write", self._on_recursive_changed)
         self.profile_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
@@ -111,6 +112,10 @@ class TinkerApp:
 
         if not _helper_script().is_file():
             self._append_text(f"Missing helper:\n{_helper_script()}\n")
+
+    def _on_recursive_changed(self, *_args: object) -> None:
+        r = self.recursive_var.get()
+        self.normalize_var.set("standard" if r else "none")
 
     def _browse(self) -> None:
         d = filedialog.askdirectory(title="Choose folder to organize")

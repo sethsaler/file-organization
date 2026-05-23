@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 ORGANIZER_DIR_NAME = ".organizer"
 FOR_DELETION_DIR_NAME = "For Deletion"
@@ -102,6 +102,21 @@ read -r -p "Press Enter..." _
     }
 
 
+def _validate_move_list(name: str, items: Any) -> Optional[str]:
+    if not isinstance(items, list):
+        return f"{name} must be a JSON array"
+    for i, entry in enumerate(items):
+        if not isinstance(entry, dict):
+            return f"{name}[{i}] must be a JSON object"
+        for key in ("from", "to"):
+            if key not in entry:
+                return f"{name}[{i}] missing {key!r} key"
+            v = entry[key]
+            if not isinstance(v, str):
+                return f"{name}[{i}] {key!r} must be a string"
+    return None
+
+
 def restore_from_manifest(manifest_path: str) -> bool:
     manifest_file = Path(manifest_path)
     if not manifest_file.exists():
@@ -121,6 +136,12 @@ def restore_from_manifest(manifest_path: str) -> bool:
     if not base.exists():
         print(json.dumps({"error": f"Base path not found: {base}"}, indent=2))
         return False
+
+    for key in ("empty_dir_moves", "file_moves"):
+        err = _validate_move_list(key, data.get(key, []))
+        if err:
+            print(json.dumps({"error": err}, indent=2))
+            return False
 
     restored_files = restored_dirs = collisions = 0
     for entry in reversed(data.get("empty_dir_moves", [])):

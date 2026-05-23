@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 
 def _helper_script() -> Path:
@@ -40,7 +40,7 @@ class FolderJob:
     enabled: bool = True
     recursive: bool = True
     strategy: str = "flatten-root"
-    normalize: str = "standard"
+    normalize: Optional[str] = None
     include_hidden: bool = True
     collect_empty_dirs: bool = True
     profile: str = "standard"
@@ -77,6 +77,7 @@ class ScheduleConfig:
     @classmethod
     def from_json_dict(cls, data: Dict[str, Any]) -> ScheduleConfig:
         folders_raw = data.get("folders") or []
+        file_ver = max(int(data.get("version", 1)), 1)
         folders: List[FolderJob] = []
         for item in folders_raw:
             if not isinstance(item, dict):
@@ -87,20 +88,32 @@ class ScheduleConfig:
             ex = item.get("exclude") or []
             if not isinstance(ex, list):
                 ex = []
+            recursive_val = bool(item.get("recursive", True))
+            raw_norm = item.get("normalize")
+            if raw_norm is None or (isinstance(raw_norm, str) and not raw_norm.strip()):
+                normalize_val: Optional[str] = None
+            else:
+                normalize_val = str(raw_norm).strip()
+            if not recursive_val and normalize_val == "standard":
+                normalize_val = None
+            if file_ver < 4:
+                dry_run_verified = True
+            else:
+                dry_run_verified = bool(item["dry_run_verified"]) if "dry_run_verified" in item else True
             folders.append(
                 FolderJob(
                     path=p,
                     enabled=bool(item.get("enabled", True)),
-                    recursive=bool(item.get("recursive", True)),
+                    recursive=recursive_val,
                     strategy=str(item.get("strategy", "flatten-root")),
-                    normalize=str(item.get("normalize", "standard")),
+                    normalize=normalize_val,
                     include_hidden=bool(item.get("include_hidden", True)),
                     collect_empty_dirs=bool(item.get("collect_empty_dirs", True)),
                     profile=str(item.get("profile", "standard")),
                     exclude_defaults=bool(item.get("exclude_defaults", True)),
                     exclude=[str(x) for x in ex],
                     consecutive_failures=int(item.get("consecutive_failures", 0)),
-                    dry_run_verified=bool(item.get("dry_run_verified", False)),
+                    dry_run_verified=dry_run_verified,
                     last_run=item.get("last_run"),
                     last_error=item.get("last_error"),
                 )
@@ -130,6 +143,13 @@ def load_config(path: Path) -> ScheduleConfig:
         return ScheduleConfig()
 
 
+def effective_normalize(job: FolderJob) -> str:
+    """Match organize_by_filetype: standard when recursive, none otherwise, unless explicitly set."""
+    if job.normalize:
+        return job.normalize
+    return "standard" if job.recursive else "none"
+
+
 def save_config(path: Path, cfg: ScheduleConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -148,7 +168,7 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
         "--strategy",
         job.strategy,
         "--normalize",
-        job.normalize,
+        effective_normalize(job),
         "--profile",
         job.profile,
     ]
@@ -254,6 +274,15 @@ def run_enabled_folders(
     tasks: List[Tuple[int, FolderJob, List[str]]] = []
     for idx, job in enumerate(cfg.folders):
         if not job.enabled:
+            continue
+        if not job.dry_run_verified:
+            if log:
+                log(
+                    f"\n[skip {job.path}]: dry-run not verified; "
+                    "add the folder after a successful preview, or edit schedule.json if you accept the risk.\n"
+                )
+            if file_log_path:
+                append_log_line(file_log_path, f"{job.path}: skipped (dry-run not verified)")
             continue
         cmd = build_organize_cmd(job)
         tasks.append((idx, job, cmd))
