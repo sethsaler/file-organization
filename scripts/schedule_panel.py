@@ -11,6 +11,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,7 @@ class SchedulePanel(ttk.Frame):
         self._wake_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._cfg_lock = threading.Lock()
+        self._interval_next_run_deadline: Optional[float] = None
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
         self.schedule_mode_var = tk.StringVar(
@@ -321,6 +323,7 @@ class SchedulePanel(ttk.Frame):
             self._append_log("Automatic runs enabled (scheduler active while app is open).\n")
         else:
             self._append_log("Automatic runs disabled.\n")
+            self._interval_next_run_deadline = None
         self._update_next_run_label()
         self._save_quiet()
 
@@ -379,8 +382,12 @@ class SchedulePanel(ttk.Frame):
                 break
             while self.cfg.scheduler_enabled and not self._stop_event.is_set():
                 with self._cfg_lock:
-                    cfg = load_config(self.config_path)
-                wait_sec = wait_seconds_after_run(cfg)
+                    wait_sec = wait_seconds_after_run(self.cfg)
+                    mode = normalize_schedule_mode(self.cfg.schedule_mode)
+                if mode == SCHEDULE_MODE_INTERVAL:
+                    self._interval_next_run_deadline = time.monotonic() + wait_sec
+                else:
+                    self._interval_next_run_deadline = None
                 why = self._wait_interval(wait_sec)
                 if why == "stop":
                     return
@@ -393,6 +400,7 @@ class SchedulePanel(ttk.Frame):
                     break
 
     def _execute_folder_batch(self, label: str) -> None:
+        self._interval_next_run_deadline = None
         try:
             mp = int(self.max_parallel_var.get())
         except (tk.TclError, ValueError):
@@ -406,7 +414,13 @@ class SchedulePanel(ttk.Frame):
 
         run_enabled_folders(cfg, path, max_parallel=mp, log=log, label=label)
         with self._cfg_lock:
+            prev_mode = self.cfg.schedule_mode
+            prev_interval = self.cfg.interval_minutes
+            prev_daily = self.cfg.daily_time
             self.cfg = load_config(self.config_path)
+            self.cfg.schedule_mode = prev_mode
+            self.cfg.interval_minutes = prev_interval
+            self.cfg.daily_time = prev_daily
         self._queue_ui(self._refresh_tree)
 
     def _queue_ui(self, fn: Any) -> None:
@@ -620,6 +634,7 @@ class SchedulePanel(ttk.Frame):
             save_config(self.config_path, self.cfg)
         except OSError:
             pass
+        self._interval_next_run_deadline = None
 
     def _schedule_status_tick(self) -> None:
         try:
@@ -639,7 +654,11 @@ class SchedulePanel(ttk.Frame):
             sec = seconds_until_next_daily_run(self.cfg.daily_time)
             label = f"Next run: in {_format_duration(sec)} (daily at {normalize_daily_time(self.cfg.daily_time)} local)"
         else:
-            sec = float(max(1, self.cfg.interval_minutes) * 60)
+            deadline = self._interval_next_run_deadline
+            if deadline is not None:
+                sec = max(0.0, deadline - time.monotonic())
+            else:
+                sec = float(max(1, self.cfg.interval_minutes) * 60)
             label = f"Next run: in {_format_duration(sec)} (every {self.cfg.interval_minutes} min)"
         self.next_run_var.set(label)
 
