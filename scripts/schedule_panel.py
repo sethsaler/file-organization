@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Reusable Tk panel: folder list, timing, and in-process scheduler worker.
+"""Reusable Tk panel: folder list, timing, and background scheduler control.
 
 Embedded in `tinker_gui.py` (Schedule tab) or used standalone via `schedule_gui.py`.
 Persists to ~/.config/file-organization/schedule.json (same schema as `schedule_daemon.py`).
+When automatic runs are enabled, a LaunchAgent (macOS) or systemd user unit (Linux) keeps
+`schedule_daemon.py` running in the background so schedules continue after the app closes.
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ import queue
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from schedule_config import (
     build_organize_cmd,
     effective_normalize,
     default_config_path,
+    estimate_seconds_until_next_run,
     load_config,
     normalize_daily_time,
     normalize_schedule_mode,
@@ -36,9 +38,8 @@ from schedule_config import (
     run_dry_run_preview,
     run_enabled_folders,
     save_config,
-    seconds_until_next_daily_run,
-    wait_seconds_after_run,
 )
+from schedule_service import is_service_running, service_log_path, service_status_line, sync_service_enabled
 
 
 class SchedulePanel(ttk.Frame):
@@ -52,11 +53,8 @@ class SchedulePanel(ttk.Frame):
         self.cfg = load_config(self.config_path)
 
         self._log_queue: queue.Queue[str] = queue.Queue()
-        self._stop_event = threading.Event()
-        self._wake_event = threading.Event()
-        self._worker: Optional[threading.Thread] = None
         self._cfg_lock = threading.Lock()
-        self._interval_next_run_deadline: Optional[float] = None
+        self._last_seen_runs: Dict[str, Optional[str]] = {}
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
         self.schedule_mode_var = tk.StringVar(
@@ -134,16 +132,10 @@ class SchedulePanel(ttk.Frame):
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
 
-        if embedded:
-            hint = (
-                "Runs while this app is open. Pick folders below, choose daily midnight or an interval, "
-                "then enable automatic runs. Config is saved automatically."
-            )
-        else:
-            hint = (
-                "Runs while this window is open. For scheduling when the app is closed, use "
-                "schedule_daemon.py under systemd/cron (see install/)."
-            )
+        hint = (
+            "Automatic runs continue in the background after you close this app. "
+            "Pick folders below, choose daily or interval timing, then enable automatic runs."
+        )
         ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self._on_schedule_mode_change()
@@ -246,6 +238,7 @@ class SchedulePanel(ttk.Frame):
         frm.rowconfigure(row, weight=1)
 
         self._tree_item_to_index: Dict[str, int] = {}
+        self._last_seen_runs = {j.path: j.last_run for j in self.cfg.folders}
         self._refresh_tree()
         self._poll_log_queue()
         self._update_next_run_label()
@@ -256,7 +249,7 @@ class SchedulePanel(ttk.Frame):
             self._append_log(f"Missing helper script:\n{helper}\n")
 
         if self.cfg.scheduler_enabled:
-            self._ensure_worker()
+            self._sync_background_service()
 
     def _on_schedule_mode_change(self) -> None:
         daily = normalize_schedule_mode(self.schedule_mode_var.get()) == SCHEDULE_MODE_DAILY
@@ -286,7 +279,7 @@ class SchedulePanel(ttk.Frame):
             self.cfg.daily_time = time_val
             self.daily_time_var.set(time_val)
         if mode != prev_mode or (not editing_daily and time_val != prev_time):
-            self._wake_event.set()
+            pass
 
     def _sync_interval_to_cfg(self, *, quiet: bool = False) -> None:
         try:
@@ -298,7 +291,7 @@ class SchedulePanel(ttk.Frame):
         prev = self.cfg.interval_minutes
         self.cfg.interval_minutes = v
         if not quiet and v != prev:
-            self._wake_event.set()
+            pass
 
     def _sync_daily_time_to_cfg(self, *, quiet: bool = False) -> None:
         normalized = normalize_daily_time(self.daily_time_var.get())
@@ -307,7 +300,7 @@ class SchedulePanel(ttk.Frame):
         self.cfg.daily_time = normalized
         self.cfg.schedule_mode = normalize_schedule_mode(self.schedule_mode_var.get())
         if not quiet and normalized != prev:
-            self._wake_event.set()
+            pass
 
     def _sync_parallel_to_cfg(self) -> None:
         try:
@@ -320,111 +313,38 @@ class SchedulePanel(ttk.Frame):
 
     def _on_scheduler_toggle(self) -> None:
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
-        self._wake_event.set()
         if self.cfg.scheduler_enabled:
-            self._ensure_worker()
-            self._append_log("Automatic runs enabled (scheduler active while app is open).\n")
+            self._append_log("Enabling automatic runs in the background…\n")
         else:
-            self._append_log("Automatic runs disabled.\n")
-            self._interval_next_run_deadline = None
+            self._append_log("Disabling automatic runs…\n")
+        self._sync_background_service()
         self._update_next_run_label()
         self._save_quiet()
 
-    def _ensure_worker(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            return
-        self._stop_event.clear()
-        self._wake_event.clear()
-        self._worker = threading.Thread(target=self._worker_loop, name="schedule-worker", daemon=True)
-        self._worker.start()
+    def _sync_background_service(self) -> None:
+        enabled = bool(self.scheduler_var.get())
 
-    def _interruptible_wait(self, seconds: float) -> bool:
-        """Wait up to `seconds`. Return True if shutdown requested."""
-        remaining = float(seconds)
-        while remaining > 0:
-            if self._stop_event.is_set():
-                return True
-            if self._wake_event.is_set():
-                self._wake_event.clear()
-                return False
-            chunk = min(remaining, 1.0)
-            if self._stop_event.wait(timeout=chunk):
-                return True
-            if self._wake_event.is_set():
-                self._wake_event.clear()
-                return False
-            remaining -= chunk
-        return False
+        def worker() -> None:
+            ok, msg = sync_service_enabled(enabled)
+            self._log_queue.put(f"{msg}\n")
 
-    def _wait_interval(self, seconds: float) -> str:
-        """Wait up to `seconds`. Return 'stop', 'wake' (early interrupt), or 'done' (full elapsed)."""
-        remaining = float(seconds)
-        while remaining > 0:
-            if self._stop_event.is_set():
-                return "stop"
-            if self._wake_event.is_set():
-                self._wake_event.clear()
-                return "wake"
-            chunk = min(remaining, 1.0)
-            if self._stop_event.wait(timeout=chunk):
-                return "stop"
-            if self._wake_event.is_set():
-                self._wake_event.clear()
-                return "wake"
-            remaining -= chunk
-        return "done"
+            def finish() -> None:
+                if not ok:
+                    if enabled:
+                        self.scheduler_var.set(False)
+                        self.cfg.scheduler_enabled = False
+                        try:
+                            save_config(self.config_path, self.cfg)
+                        except OSError:
+                            pass
+                        messagebox.showerror("Background scheduler", msg)
+                    else:
+                        messagebox.showwarning("Background scheduler", msg)
+                self._update_next_run_label()
 
-    def _worker_loop(self) -> None:
-        while not self._stop_event.is_set():
-            if not self.cfg.scheduler_enabled:
-                if self._interruptible_wait(1.0):
-                    break
-                continue
-            self._execute_folder_batch(label="scheduled")
-            if self._stop_event.is_set():
-                break
-            while self.cfg.scheduler_enabled and not self._stop_event.is_set():
-                with self._cfg_lock:
-                    wait_sec = wait_seconds_after_run(self.cfg)
-                    mode = normalize_schedule_mode(self.cfg.schedule_mode)
-                if mode == SCHEDULE_MODE_INTERVAL:
-                    self._interval_next_run_deadline = time.monotonic() + wait_sec
-                else:
-                    self._interval_next_run_deadline = None
-                why = self._wait_interval(wait_sec)
-                if why == "stop":
-                    return
-                if not self.cfg.scheduler_enabled:
-                    break
-                if why == "wake":
-                    continue
-                self._execute_folder_batch(label="scheduled")
-                if self._stop_event.is_set():
-                    break
+            self._queue_ui(finish)
 
-    def _execute_folder_batch(self, label: str) -> None:
-        self._interval_next_run_deadline = None
-        try:
-            mp = int(self.max_parallel_var.get())
-        except (tk.TclError, ValueError):
-            mp = None
-        with self._cfg_lock:
-            path = self.config_path
-        cfg = load_config(path)
-
-        def log(msg: str) -> None:
-            self._log_queue.put(msg)
-
-        run_enabled_folders(cfg, path, max_parallel=mp, log=log, label=label)
-        with self._cfg_lock:
-            prev_mode = self.cfg.schedule_mode
-            prev_interval = self.cfg.interval_minutes
-            prev_daily = self.cfg.daily_time
-            self.cfg = load_config(self.config_path)
-            self.cfg.schedule_mode = prev_mode
-            self.cfg.interval_minutes = prev_interval
-            self.cfg.daily_time = prev_daily
-        self._queue_ui(self._refresh_tree)
+        threading.Thread(target=worker, daemon=True, name="schedule-service-sync").start()
 
     def _queue_ui(self, fn: Any) -> None:
         try:
@@ -628,8 +548,7 @@ class SchedulePanel(ttk.Frame):
         self._append_log(f"Saved: {self.config_path}\n")
 
     def shutdown(self) -> None:
-        """Stop the worker and persist config (call before destroying the root window)."""
-        self._stop_event.set()
+        """Persist config before destroying the root window (background scheduler keeps running)."""
         self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
@@ -637,7 +556,6 @@ class SchedulePanel(ttk.Frame):
             save_config(self.config_path, self.cfg)
         except OSError:
             pass
-        self._interval_next_run_deadline = None
 
     def _schedule_status_tick(self) -> None:
         try:
@@ -647,22 +565,44 @@ class SchedulePanel(ttk.Frame):
         except tk.TclError:
             pass
 
+    def _reload_config_if_changed(self) -> None:
+        disk = load_config(self.config_path)
+        changed = False
+        for disk_job in disk.folders:
+            for local in self.cfg.folders:
+                if local.path != disk_job.path:
+                    continue
+                if (
+                    local.last_run != disk_job.last_run
+                    or local.last_error != disk_job.last_error
+                    or local.enabled != disk_job.enabled
+                ):
+                    local.last_run = disk_job.last_run
+                    local.last_error = disk_job.last_error
+                    local.consecutive_failures = disk_job.consecutive_failures
+                    local.enabled = disk_job.enabled
+                    changed = True
+                self._last_seen_runs[disk_job.path] = disk_job.last_run
+        if changed:
+            self._refresh_tree()
+
     def _update_next_run_label(self) -> None:
         if not bool(self.scheduler_var.get()):
-            self.next_run_var.set("Next run: — (automatic runs off)")
+            self.next_run_var.set(f"Next run: — (automatic runs off) · {service_status_line()}")
             return
         self._sync_schedule_timing_to_cfg()
+        self._reload_config_if_changed()
         mode = normalize_schedule_mode(self.cfg.schedule_mode)
+        sec = estimate_seconds_until_next_run(self.cfg)
         if mode == SCHEDULE_MODE_DAILY:
-            sec = seconds_until_next_daily_run(self.cfg.daily_time)
-            label = f"Next run: in {_format_duration(sec)} (daily at {normalize_daily_time(self.cfg.daily_time)} local)"
+            timing = f"daily at {normalize_daily_time(self.cfg.daily_time)} local"
         else:
-            deadline = self._interval_next_run_deadline
-            if deadline is not None:
-                sec = max(0.0, deadline - time.monotonic())
-            else:
-                sec = float(max(1, self.cfg.interval_minutes) * 60)
-            label = f"Next run: in {_format_duration(sec)} (every {self.cfg.interval_minutes} min)"
+            timing = f"every {self.cfg.interval_minutes} min"
+        status = service_status_line()
+        label = f"Next run: in {_format_duration(sec)} ({timing}) · {status}"
+        if is_service_running():
+            log_path = service_log_path()
+            label += f" · log: {log_path}"
         self.next_run_var.set(label)
 
     def add_folder_path(

@@ -1,12 +1,13 @@
-# Background scheduling (optional)
+# Background scheduling
 
-- **Linux (systemd):** see [systemd/README.md](systemd/README.md) for a user service or cron.
-- **macOS (LaunchAgent):** copy and edit [launchd/org.fileorganization.schedule-daemon.plist.example](launchd/org.fileorganization.schedule-daemon.plist.example) — replace `INSTALL_DIR` with your install path, then:
+The Schedule tab **enables a background daemon automatically** when you turn on automatic runs:
 
-```bash
-mkdir -p ~/Library/LaunchAgents INSTALL_DIR/logs
-cp org.fileorganization.schedule-daemon.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/org.fileorganization.schedule-daemon.plist
-```
+- **macOS:** installs a LaunchAgent at `~/Library/LaunchAgents/org.fileorganization.schedule-daemon.plist`
+- **Linux:** installs a systemd user unit at `~/.config/systemd/user/file-org-scheduler.service`
 
-The daemon runs `schedule_daemon.py --foreground`; schedule folders with `schedule_gui.py` and set `scheduler_enabled` to true in `schedule.json` (or pass `--force` on the daemon).
+Logs: `~/.local/state/file-organization/` (or `$XDG_STATE_HOME/file-organization/`).
+
+Manual setup (optional) — same behavior as the GUI:
+
+- **Linux (systemd):** see [systemd/README.md](systemd/README.md)
+- **macOS (LaunchAgent):** copy and edit [launchd/org.fileorganization.schedule-daemon.plist.example](launchd/org.fileorganization.schedule-daemon.plist.example)

@@ -107,6 +107,31 @@ def wait_seconds_after_run(cfg: ScheduleConfig) -> float:
     return float(minutes * 60)
 
 
+def estimate_seconds_until_next_run(cfg: ScheduleConfig) -> float:
+    """Best-effort countdown until the next scheduled batch (for UI display)."""
+    if normalize_schedule_mode(cfg.schedule_mode) == SCHEDULE_MODE_DAILY:
+        return seconds_until_next_daily_run(cfg.daily_time)
+
+    interval_sec = float(max(1, min(10080, int(cfg.interval_minutes))) * 60)
+    latest: Optional[datetime] = None
+    for job in cfg.folders:
+        if not job.enabled or not job.last_run:
+            continue
+        try:
+            raw = job.last_run.replace("Z", "+00:00")
+            ts = datetime.fromisoformat(raw)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    if latest is None:
+        return interval_sec
+    elapsed = (datetime.now(timezone.utc) - latest.astimezone(timezone.utc)).total_seconds()
+    return max(0.0, interval_sec - elapsed)
+
+
 @dataclass
 class ScheduleConfig:
     version: int = CONFIG_VERSION
