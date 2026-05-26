@@ -48,15 +48,15 @@ Use the **Schedule** tab in the same app (or the standalone `schedule_gui.py`) t
 
 1. On **Organize**, pick a folder and click **Add to schedule…**, or on **Schedule** click **Add folder…**
 2. Choose **Once daily at** `00:00` for midnight (local time), or **Run every** *N* **minutes**
-3. Enable **automatic runs** — the built-in scheduler runs while the app is open
+3. Enable **automatic runs** — a background scheduler keeps running after you close the app (LaunchAgent on macOS, systemd user unit on Linux)
 
-Optional: run a **headless background** loop when the GUI is closed (reloads config each cycle; enable `scheduler_enabled` in the JSON, or use `--force`):
+The GUI installs and controls the background daemon automatically. Advanced setups can still run `schedule_daemon.py` manually:
 
 ```bash
 python3 ~/.local/share/organize-folder-by-filetype/scripts/schedule_daemon.py --foreground
 ```
 
-For **cron** at midnight, run one parallel batch per invocation (honors `scheduler_enabled` unless you pass `--force`):
+For **cron** at midnight (one batch per invocation; honors `scheduler_enabled` unless you pass `--force`):
 
 ```cron
 0 0 * * * /usr/bin/python3 /FULL/PATH/TO/scripts/schedule_daemon.py --once >>"$HOME/.cache/file-org-scheduler.log" 2>&1

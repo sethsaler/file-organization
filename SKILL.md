@@ -73,7 +73,7 @@ Performance characteristics:
 - `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
 - `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
-- `install/systemd/`, `install/launchd/` — example service files for long-running background scheduling
+- **Background scheduling:** enabling automatic runs in the Schedule tab installs a LaunchAgent (macOS) or systemd user unit (Linux) so `schedule_daemon.py` keeps running after the app closes. See `scripts/schedule_service.py`.
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI
 - `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive flatten-root, standard normalization, `For Deletion` staging by default)
 - `launchers/Organize Files by Type.command` — prompts for a folder, then flatten-root + standard normalization + `For Deletion` staging (dry-run preview, then confirm)

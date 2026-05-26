@@ -249,3 +249,27 @@ def test_daily_schedule_mode_roundtrip(tmp_path: Path):
 
     cfg_interval = ScheduleConfig(interval_minutes=30)
     assert wait_seconds_after_run(cfg_interval) == 30 * 60
+
+
+def test_estimate_seconds_until_next_run_interval():
+    from datetime import datetime, timezone
+
+    from schedule_config import FolderJob, estimate_seconds_until_next_run
+
+    recent = datetime.now(timezone.utc).isoformat()
+    cfg = ScheduleConfig(
+        interval_minutes=60,
+        folders=[FolderJob(path="/tmp/a", enabled=True, last_run=recent, dry_run_verified=True)],
+    )
+    sec = estimate_seconds_until_next_run(cfg)
+    assert 0 <= sec <= 3600
+
+
+def test_schedule_service_launchd_plist():
+    from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
+
+    plist = build_launchd_plist()
+    assert plist["Label"] == SERVICE_LABEL
+    assert plist["ProgramArguments"][-1] == "--foreground"
+    assert str(daemon_script()) in plist["ProgramArguments"][1]
+    assert plist["KeepAlive"] is True

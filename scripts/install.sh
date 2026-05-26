@@ -71,7 +71,7 @@ echo
 echo "CLI on PATH (if ~/.local/bin is in PATH):"
 echo "  organize-by-filetype --path /path/to/folder"
 echo "  restore-file-organization MANIFEST.json"
-echo "GUI (Organize + Schedule tabs; built-in scheduler while app is open):"
+echo "GUI (Organize + Schedule tabs; background scheduler when enabled):"
 echo "  python3 \"$INSTALL_DIR/scripts/tinker_gui.py\""
 echo "Schedule-only window (same Schedule tab):"
 echo "  python3 \"$INSTALL_DIR/scripts/schedule_gui.py\""
