@@ -13,6 +13,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from org_paths import normalize_folder_input
+
 
 CONFIG_VERSION = 5
 
@@ -246,7 +252,7 @@ def save_config(path: Path, cfg: ScheduleConfig) -> None:
 
 def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, *, dry_run: bool = False) -> List[str]:
     py = python_executable or sys.executable
-    base = Path(job.path).expanduser()
+    base = normalize_folder_input(job.path)
     cmd = [
         py,
         str(_helper_script()),
@@ -281,7 +287,7 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
 
 def find_path_conflicts(cfg: ScheduleConfig) -> List[str]:
     """Return human-readable warnings when enabled folder paths nest or overlap."""
-    enabled = [Path(j.path).expanduser().resolve() for j in cfg.folders if j.enabled]
+    enabled = [normalize_folder_input(j.path).resolve() for j in cfg.folders if j.enabled]
     warnings: List[str] = []
     for i, a in enumerate(enabled):
         for b in enabled[i + 1 :]:
@@ -320,7 +326,7 @@ def _effective_max_workers(n_jobs: int, max_parallel: int) -> int:
 
 def _run_single_job(args: Tuple[int, FolderJob, List[str]]) -> Tuple[int, str, Optional[str], str, str, int]:
     idx, job, cmd = args
-    base = Path(job.path).expanduser()
+    base = normalize_folder_input(job.path)
     if not base.is_dir():
         ts = datetime.now(timezone.utc).isoformat()
         return idx, ts, "path missing or not a directory", "", "", 1

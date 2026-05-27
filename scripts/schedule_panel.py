@@ -39,6 +39,7 @@ from schedule_config import (
     run_enabled_folders,
     save_config,
 )
+from org_paths import normalize_folder_input
 from schedule_service import is_service_running, service_log_path, service_status_line, sync_service_enabled
 
 
@@ -619,7 +620,7 @@ class SchedulePanel(ttk.Frame):
         select: bool = True,
     ) -> bool:
         """Add a folder to the schedule list (or select it if already present)."""
-        raw = str(Path(path).expanduser())
+        raw = str(normalize_folder_input(path))
         if not Path(raw).is_dir():
             messagebox.showerror("Folder", f"Not a directory:\n{raw}")
             return False

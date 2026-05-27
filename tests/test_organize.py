@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 from org_buckets import bucket_for_filename, resolve_profile
 from org_exclude import dir_name_excluded, merge_exclude_patterns
 from org_organizer import Organizer
+from org_paths import normalize_folder_input
 from schedule_config import ScheduleConfig, find_path_conflicts
 
 
@@ -273,3 +274,41 @@ def test_schedule_service_launchd_plist():
     assert plist["ProgramArguments"][-1] == "--foreground"
     assert str(daemon_script()) in plist["ProgramArguments"][1]
     assert plist["KeepAlive"] is True
+
+
+def test_normalize_folder_input(tmp_path: Path):
+    base = tmp_path / "icloud folder"
+    base.mkdir()
+    posix = str(base)
+
+    assert normalize_folder_input(posix) == base
+    assert normalize_folder_input(f'"{posix}"') == base
+    assert normalize_folder_input(f"file://{posix.replace(' ', '%20')}") == base
+    assert normalize_folder_input(posix + "/") == base
+    assert normalize_folder_input(posix + "\n") == base
+
+
+def test_normalize_folder_input_shell_escapes(tmp_path: Path):
+    base = tmp_path / "Mobile Documents" / "com~apple~CloudDocs" / "My Folder"
+    base.mkdir(parents=True)
+    escaped = str(base).replace(" ", "\\ ").replace("~", "\\~")
+    assert normalize_folder_input(escaped).resolve() == base.resolve()
+
+
+def test_normalize_folder_input_trailing_space_on_last_component(tmp_path: Path):
+    parent = tmp_path / "Manual Library"
+    parent.mkdir()
+    actual = parent / "Magui "
+    actual.mkdir()
+    pasted = str(parent / "Magui")
+    assert normalize_folder_input(pasted) == actual
+
+
+def test_normalize_folder_input_icloud_mobile_documents():
+    icloud = Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+    if not icloud.is_dir():
+        pytest.skip("iCloud Drive not available")
+    raw = str(icloud)
+    assert normalize_folder_input(raw).is_dir()
+    assert normalize_folder_input(f'"{raw}"').is_dir()
+    assert normalize_folder_input(f"file://{raw.replace(' ', '%20')}").is_dir()
