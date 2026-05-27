@@ -5,7 +5,10 @@ from __future__ import annotations
 import csv
 import json
 import os
+import random
+import re
 import shutil
+import string
 import sys
 import tempfile
 import uuid
@@ -27,6 +30,9 @@ from org_manifest import (
 from org_mime import sniff_bucket_from_file
 
 EMPTY_DIR_SAMPLE_LIMIT = 20
+
+# Pattern to detect randomly renamed files: 16 alphanumeric characters before extension
+RANDOM_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]{16}\.[^.]+$')
 
 # MIME sniff can classify extensionless files into buckets that only exist on the extended profile;
 # allow these when using the standard profile so sniffing is not a silent no-op.
@@ -76,6 +82,9 @@ class Organizer:
         verbose: bool = False,
         ocr_index: bool = False,
         progress_callback: Optional[Callable[[str], None]] = None,
+        random_names: bool = False,
+        random_names_after_organize: bool = False,
+        skip_randomly_renamed: bool = False,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -94,6 +103,9 @@ class Organizer:
         self.use_mime_sniff = use_mime_sniff
         self.verbose = verbose
         self.ocr_index = ocr_index
+        self.random_names = random_names
+        self.random_names_after_organize = random_names_after_organize
+        self.skip_randomly_renamed = skip_randomly_renamed
         self._progress = progress_callback or (lambda _m: None)
         prof_key = profile_label if profile_label in ("standard", "extended") else "standard"
         if profile_buckets and len(profile_buckets) > 3:
@@ -113,6 +125,7 @@ class Organizer:
         self.removed_dirs: List[str] = []
 
         self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
+        self.used_random_names: Set[str] = set()
 
     def _visible_name(self, name: str) -> bool:
         return self.include_hidden or not name.startswith(".")
@@ -190,9 +203,31 @@ class Organizer:
                     existing = set()
             self.reserved_names[directory] = existing
 
+    def _is_randomly_renamed(self, filename: str) -> bool:
+        """Check if a filename appears to be already randomly renamed."""
+        return bool(RANDOM_NAME_PATTERN.match(filename))
+
+    def _generate_random_name(self, extension: str = "") -> str:
+        """Generate a unique random filename with the given extension."""
+        while True:
+            # Generate 16-character random string (letters and digits)
+            chars = string.ascii_letters + string.digits
+            random_str = ''.join(random.choices(chars, k=16))
+            name = random_str + extension
+            if name not in self.used_random_names:
+                self.used_random_names.add(name)
+                return name
+
     def _collision_safe_target(self, dest_dir: Path, original_name: str, collision_counter: str = "files") -> Path:
         self._init_reserved_dir(dest_dir)
         reserved = self.reserved_names[dest_dir]
+
+        # If random_names is enabled, generate a random name with the original extension
+        if self.random_names:
+            extension = Path(original_name).suffix
+            random_name = self._generate_random_name(extension)
+            reserved.add(random_name)
+            return dest_dir / random_name
 
         if original_name not in reserved:
             reserved.add(original_name)
@@ -736,6 +771,61 @@ class Organizer:
             w.writerows(rows)
         return str(out_path)
 
+    def _rename_all_files_after_organize(self) -> Dict[str, object]:
+        """Rename all files with random names after organization is complete."""
+        rename_stats = {"files_renamed": 0, "files_skipped": 0, "errors": []}
+        
+        # Collect all files from the organized structure
+        all_files = []
+        for root, dirs, files in os.walk(self.base, topdown=False):
+            root_path = Path(root)
+            
+            # Skip organizer and deletion directories
+            if self._is_organizer_dir(root_path.name) or self._is_for_deletion_name(root_path.name):
+                dirs[:] = []
+                continue
+                
+            if not self.include_hidden:
+                dirs[:] = [d for d in dirs if self._visible_name(d)]
+                files = [f for f in files if self._visible_name(f)]
+                
+            for filename in files:
+                src = root_path / filename
+                if src.is_file() and not src.is_symlink():
+                    all_files.append(src)
+        
+        # Rename each file
+        for src in all_files:
+            try:
+                # Skip files that appear to be already randomly renamed if flag is enabled
+                if self.skip_randomly_renamed and self._is_randomly_renamed(src.name):
+                    rename_stats["files_skipped"] += 1
+                    continue
+                
+                new_name = self._generate_random_name(src.suffix)
+                dest = src.parent / new_name
+                
+                if dest.exists():
+                    rename_stats["errors"].append(f"Destination already exists: {dest}")
+                    continue
+                
+                if not self.dry_run:
+                    src.rename(dest)
+                    # Update the file_moves manifest with the new name
+                    rel_src = str(src.relative_to(self.base))
+                    rel_dst = str(dest.relative_to(self.base))
+                    self.file_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
+                
+                rename_stats["files_renamed"] += 1
+                
+                if self.verbose and rename_stats["files_renamed"] % 100 == 0:
+                    self._progress(f"Renamed {rename_stats['files_renamed']} files after organization…\n")
+                    
+            except Exception as e:
+                rename_stats["errors"].append(f"Error renaming {src}: {e}")
+        
+        return rename_stats
+
     def run(self) -> Dict[str, object]:
         try:
             self.base = self.base.resolve()
@@ -755,6 +845,11 @@ class Organizer:
         self._maybe_normalize()
         self._maybe_collect_empty_dirs()
         self._remove_empty_subdirs()
+
+        # Rename all files after organization if requested
+        rename_stats = {}
+        if self.random_names_after_organize:
+            rename_stats = self._rename_all_files_after_organize()
 
         manifest_info = self.save_manifest()
         ocr_path = self._maybe_write_ocr_index()
@@ -792,6 +887,12 @@ class Organizer:
                 "folders_moved": self.empty_dir_stats.folders_moved,
                 "name_collisions_resolved": self.empty_dir_stats.name_collisions_resolved,
                 "sample_moves": self.empty_dir_stats.sample_moves,
+            },
+            "rename_after_organize": {
+                "enabled": self.random_names_after_organize,
+                "files_renamed": rename_stats.get("files_renamed", 0),
+                "files_skipped": rename_stats.get("files_skipped", 0),
+                "errors": rename_stats.get("errors", []),
             },
             "verification": self._verify(),
             "backup_manifest": manifest_info.get("manifest") if manifest_info else None,

@@ -16,6 +16,7 @@ from org_buckets import PROFILE_EXTENDED, PROFILE_STANDARD, resolve_profile
 from org_exclude import merge_exclude_patterns
 from org_manifest import restore_from_manifest
 from org_organizer import Organizer
+from org_paths import normalize_folder_input
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +68,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Progress messages on stderr")
     parser.add_argument("--ocr-index", action="store_true", help="After run, OCR PNG/JPEG in Images/ to .organizer/ocr_index.csv")
     parser.add_argument("--json-out", metavar="FILE", help="Write JSON summary to file instead of stdout only")
+    parser.add_argument("--random-names", action="store_true", help="Rename files with random unique sequences (preserves extensions)")
+    parser.add_argument("--random-names-after-organize", action="store_true", help="After organizing, rename all files with random unique sequences")
+    parser.add_argument("--skip-randomly-renamed", action="store_true", help="Skip files that appear to be already randomly renamed (16-char alphanumeric filenames)")
     return parser.parse_args()
 
 
@@ -87,7 +91,7 @@ def main() -> None:
         print(json.dumps({"error": "--path is required unless using --restore"}, indent=2))
         sys.exit(2)
 
-    base = Path(args.path).expanduser().resolve()
+    base = normalize_folder_input(args.path).resolve()
     if not base.exists() or not base.is_dir():
         print(json.dumps({"error": f"Path not found or not a directory: {base}"}, indent=2))
         sys.exit(1)
@@ -121,6 +125,9 @@ def main() -> None:
         verbose=args.verbose,
         ocr_index=args.ocr_index,
         progress_callback=_progress if args.verbose else None,
+        random_names=args.random_names,
+        random_names_after_organize=args.random_names_after_organize,
+        skip_randomly_renamed=args.skip_randomly_renamed,
     )
     result = org.run()
     out = json.dumps(result, indent=2)
