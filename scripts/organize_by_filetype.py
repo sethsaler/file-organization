@@ -68,9 +68,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Progress messages on stderr")
     parser.add_argument("--ocr-index", action="store_true", help="After run, OCR PNG/JPEG in Images/ to .organizer/ocr_index.csv")
     parser.add_argument("--json-out", metavar="FILE", help="Write JSON summary to file instead of stdout only")
-    parser.add_argument("--random-names", action="store_true", help="Rename files with random unique sequences (preserves extensions)")
+    random_names_group = parser.add_mutually_exclusive_group()
+    parser.set_defaults(random_names=True)
+    random_names_group.add_argument("--random-names", dest="random_names", action="store_true", help="Rename files with random unique sequences (preserves extensions) (default)")
+    random_names_group.add_argument("--no-random-names", dest="random_names", action="store_false", help="Do not rename files with random unique sequences")
     parser.add_argument("--random-names-after-organize", action="store_true", help="After organizing, rename all files with random unique sequences")
-    parser.add_argument("--skip-randomly-renamed", action="store_true", help="Skip files that appear to be already randomly renamed (16-char alphanumeric filenames)")
+    skip_random_group = parser.add_mutually_exclusive_group()
+    parser.set_defaults(skip_randomly_renamed=True)
+    skip_random_group.add_argument("--skip-randomly-renamed", dest="skip_randomly_renamed", action="store_true", help="Skip files that appear to be already randomly renamed (16-char alphanumeric filenames) (default)")
+    skip_random_group.add_argument("--no-skip-randomly-renamed", dest="skip_randomly_renamed", action="store_false", help="Do not skip files that appear to be already randomly renamed")
     return parser.parse_args()
 
 

@@ -49,15 +49,15 @@ class TinkerApp:
         self.exclude_defaults_var = tk.BooleanVar(value=True)
         self.verbose_var = tk.BooleanVar(value=False)
         self.mime_var = tk.BooleanVar(value=False)
-        self.rename_after_organize_var = tk.BooleanVar(value=False)
-        self.skip_randomly_renamed_var = tk.BooleanVar(value=False)
+        self.rename_after_organize_var = tk.BooleanVar(value=True)
+        self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
 
         # Random rename tab variables
         self.rename_path_var = tk.StringVar()
         self.rename_recursive_var = tk.BooleanVar(value=True)
         self.rename_hidden_var = tk.BooleanVar(value=True)
         self.rename_verbose_var = tk.BooleanVar(value=False)
-        self.rename_skip_randomly_renamed_var = tk.BooleanVar(value=False)
+        self.rename_skip_randomly_renamed_var = tk.BooleanVar(value=True)
 
         notebook = ttk.Notebook(root)
         notebook.grid(row=0, column=0, sticky="nsew")
