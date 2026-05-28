@@ -120,7 +120,7 @@ def main() -> None:
     while not stop:
         cfg = load_config(config_path)
         if args.interval_override is not None:
-            wait_sec = max(60.0, float(max(1, min(10080, int(args.interval_override))) * 60)
+            wait_sec = max(60.0, float(max(1, min(10080, int(args.interval_override))) * 60))
         else:
             wait_sec = wait_seconds_after_run(cfg)
 
@@ -148,7 +148,7 @@ def main() -> None:
         first = False
         cfg = load_config(config_path)
         if args.interval_override is not None:
-            wait_sec = max(60.0, float(max(1, min(10080, int(args.interval_override))) * 60)
+            wait_sec = max(60.0, float(max(1, min(10080, int(args.interval_override))) * 60))
         else:
             wait_sec = wait_seconds_after_run(cfg)
         remaining = wait_sec
