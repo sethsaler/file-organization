@@ -12,6 +12,7 @@ It supports recursive modes, dry-run previews, normalization, automatic empty-fo
   - `flatten-root` (default): move all files from **any depth** into folders directly under the target path (`Images`, `Videos`, `GIFs`, `Other` by default). Traversal skips only `For Deletion` and `.organizer`, so **legacy extension folders at the root** (for example a prior `JPG/` or `PNG/` sort) are still fully scanned.
   - `in-place`: each directory organizes its own direct files
 - Supports non-recursive organization (root files only with `--no-recursive`)
+- In scheduled mode, supports `expand_subfolders` to organize each immediate subdirectory independently instead of treating the parent as a single recursive target
 - Optionally normalizes bucket names (`--normalize standard`): canonical casing for `Images`, `Videos`, `GIFs`, `Other`
 - In flatten-root mode (default), collectable empty folder trees are staged into `For Deletion` first (multi-round), then any remaining empty directories (including empty bucket folders) are removed
 - In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default; a final pass removes leftover empties
@@ -48,7 +49,8 @@ Use the **Schedule** tab in the same app (or the standalone `schedule_gui.py`) t
 
 1. On **Organize**, pick a folder and click **Add to schedule…**, or on **Schedule** click **Add folder…**
 2. Choose **Once daily at** `00:00` for midnight (local time), or **Run every** *N* **minutes**
-3. Enable **automatic runs** — a background scheduler keeps running after you close the app (LaunchAgent on macOS, systemd user unit on Linux)
+3. Optionally enable **Expand to organize each subfolder separately** to organize each immediate subdirectory independently instead of treating the parent as a single recursive target
+4. Enable **automatic runs** — a background scheduler keeps running after you close the app (LaunchAgent on macOS, systemd user unit on Linux)
 
 The GUI installs and controls the background daemon automatically. Advanced setups can still run `schedule_daemon.py` manually:
 
@@ -74,6 +76,26 @@ Example `schedule.json` for a single folder every night at midnight:
     {
       "path": "/path/to/your/folder",
       "enabled": true,
+      "dry_run_verified": true
+    }
+  ]
+}
+```
+
+To organize each subfolder of a parent directory independently, set `"expand_subfolders": true`:
+
+```json
+{
+  "version": 5,
+  "schedule_mode": "daily",
+  "daily_time": "00:00",
+  "scheduler_enabled": true,
+  "folders": [
+    {
+      "path": "/path/to/parent/folder",
+      "enabled": true,
+      "recursive": true,
+      "expand_subfolders": true,
       "dry_run_verified": true
     }
   ]

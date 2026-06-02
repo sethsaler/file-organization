@@ -197,6 +197,7 @@ class SchedulePanel(ttk.Frame):
         self.normalize_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
+        self.expand_subfolders_var = tk.BooleanVar(value=False)
 
         dr = 0
         ttk.Checkbutton(detail, text="Include in scheduled runs", variable=self.enabled_var, command=self._push_detail_to_job).grid(
@@ -227,6 +228,13 @@ class SchedulePanel(ttk.Frame):
             detail,
             text="Collect empty folders into “For Deletion”",
             variable=self.collect_empty_var,
+            command=self._push_detail_to_job,
+        ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
+        dr += 1
+        ttk.Checkbutton(
+            detail,
+            text="Expand to organize each subfolder separately",
+            variable=self.expand_subfolders_var,
             command=self._push_detail_to_job,
         ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
 
@@ -416,6 +424,7 @@ class SchedulePanel(ttk.Frame):
         )
         self.hidden_var.set(job.include_hidden)
         self.collect_empty_var.set(job.collect_empty_dirs)
+        self.expand_subfolders_var.set(job.expand_subfolders)
 
     def _push_detail_to_job(self) -> None:
         sel = self.tree.selection()
@@ -433,6 +442,7 @@ class SchedulePanel(ttk.Frame):
         job.normalize = None if ui == ("standard" if r else "none") else ui
         job.include_hidden = bool(self.hidden_var.get())
         job.collect_empty_dirs = bool(self.collect_empty_var.get())
+        job.expand_subfolders = bool(self.expand_subfolders_var.get())
         self._refresh_tree_row(idx)
 
     def _remove_selected(self) -> None:

@@ -60,6 +60,7 @@ class FolderJob:
     dry_run_verified: bool = False
     last_run: Optional[str] = None
     last_error: Optional[str] = None
+    expand_subfolders: bool = False
 
 
 def parse_daily_time(value: str) -> Tuple[int, int]:
@@ -207,6 +208,7 @@ class ScheduleConfig:
                     dry_run_verified=dry_run_verified,
                     last_run=item.get("last_run"),
                     last_error=item.get("last_error"),
+                    expand_subfolders=bool(item.get("expand_subfolders", False)),
                 )
             )
         max_parallel = max(0, min(128, int(data.get("max_parallel", 0))))
@@ -304,6 +306,40 @@ def find_path_conflicts(cfg: ScheduleConfig) -> List[str]:
     return warnings
 
 
+def expand_subfolders(job: FolderJob) -> List[FolderJob]:
+    """Expand a job with expand_subfolders=True into one job per subfolder."""
+    if not job.expand_subfolders:
+        return [job]
+
+    base = normalize_folder_input(job.path).resolve()
+    if not base.is_dir():
+        return [job]
+
+    subfolders: List[FolderJob] = []
+    for item in base.iterdir():
+        if item.is_dir():
+            sub_job = FolderJob(
+                path=str(item),
+                enabled=job.enabled,
+                recursive=job.recursive,
+                strategy=job.strategy,
+                normalize=job.normalize,
+                include_hidden=job.include_hidden,
+                collect_empty_dirs=job.collect_empty_dirs,
+                profile=job.profile,
+                exclude_defaults=job.exclude_defaults,
+                exclude=job.exclude.copy(),
+                consecutive_failures=job.consecutive_failures,
+                dry_run_verified=job.dry_run_verified,
+                last_run=job.last_run,
+                last_error=job.last_error,
+                expand_subfolders=False,
+            )
+            subfolders.append(sub_job)
+
+    return subfolders if subfolders else [job]
+
+
 def run_dry_run_preview(job: FolderJob) -> Tuple[bool, str]:
     cmd = build_organize_cmd(job, dry_run=True)
     try:
@@ -365,9 +401,16 @@ def run_enabled_folders(
 
     mp = max_parallel if max_parallel is not None else cfg.max_parallel
     tasks: List[Tuple[int, FolderJob, List[str]]] = []
+    expanded_jobs: List[Tuple[int, FolderJob]] = []
+    
     for idx, job in enumerate(cfg.folders):
         if not job.enabled:
             continue
+        expanded = expand_subfolders(job)
+        for sub_job in expanded:
+            expanded_jobs.append((idx, sub_job))
+    
+    for idx, job in expanded_jobs:
         if not job.dry_run_verified:
             if log:
                 log(
