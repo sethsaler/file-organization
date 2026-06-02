@@ -51,6 +51,7 @@ class TinkerApp:
         self.mime_var = tk.BooleanVar(value=False)
         self.rename_after_organize_var = tk.BooleanVar(value=True)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
+        self.expand_subfolders_var = tk.BooleanVar(value=False)
 
         # Random rename tab variables
         self.rename_path_var = tk.StringVar()
@@ -125,17 +126,28 @@ class TinkerApp:
         ttk.Radiobutton(norm, text="None", variable=self.normalize_var, value="none").pack(anchor="w")
         row += 1
 
-        for var, label in [
-            (self.hidden_var, "Include hidden files and folders"),
-            (self.collect_empty_var, "Collect empty folders into “For Deletion”"),
-            (self.exclude_defaults_var, "Exclude .git, node_modules, venv, …"),
-            (self.verbose_var, "Verbose progress (stderr)"),
-            (self.mime_var, "MIME-sniff extensionless files"),
-            (self.rename_after_organize_var, "Rename all files with random names after organizing"),
-            (self.skip_randomly_renamed_var, "Skip already-randomly-renamed files (16-char names)"),
-        ]:
-            ttk.Checkbutton(frm, text=label, variable=var).grid(row=row, column=0, columnspan=3, sticky="w", **pad)
-            row += 1
+        # File handling options
+        file_opts = ttk.LabelFrame(frm, text="File handling", padding=6)
+        file_opts.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Checkbutton(file_opts, text="Include hidden files and folders", variable=self.hidden_var).pack(anchor="w")
+        ttk.Checkbutton(file_opts, text="Collect empty folders into “For Deletion”", variable=self.collect_empty_var).pack(anchor="w")
+        ttk.Checkbutton(file_opts, text="Exclude .git, node_modules, venv, …", variable=self.exclude_defaults_var).pack(anchor="w")
+        row += 1
+
+        # Random rename options
+        rename_opts = ttk.LabelFrame(frm, text="Random rename (default: on)", padding=6)
+        rename_opts.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Checkbutton(rename_opts, text="Rename all files with random names after organizing", variable=self.rename_after_organize_var).pack(anchor="w")
+        ttk.Checkbutton(rename_opts, text="Skip already-randomly-renamed files (16-char names)", variable=self.skip_randomly_renamed_var).pack(anchor="w")
+        row += 1
+
+        # Advanced options
+        adv_opts = ttk.LabelFrame(frm, text="Advanced", padding=6)
+        adv_opts.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Checkbutton(adv_opts, text="Verbose progress (stderr)", variable=self.verbose_var).pack(anchor="w")
+        ttk.Checkbutton(adv_opts, text="MIME-sniff extensionless files", variable=self.mime_var).pack(anchor="w")
+        ttk.Checkbutton(adv_opts, text="Expand to organize each subfolder separately", variable=self.expand_subfolders_var).pack(anchor="w")
+        row += 1
 
         btn_row = ttk.Frame(frm)
         btn_row.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
@@ -283,6 +295,9 @@ class TinkerApp:
             collect_empty_dirs=self.collect_empty_var.get(),
             profile=self.profile_var.get(),
             exclude_defaults=self.exclude_defaults_var.get(),
+            expand_subfolders=self.expand_subfolders_var.get(),
+            random_names_after_organize=self.rename_after_organize_var.get(),
+            skip_randomly_renamed=self.skip_randomly_renamed_var.get(),
         )
         self.notebook.select(1)
 
@@ -336,6 +351,38 @@ class TinkerApp:
             messagebox.showerror("Folder", f"Not a directory:\n{path}")
             return
         self._show_resolved_path(path)
+
+        # Handle expand_subfolders
+        if self.expand_subfolders_var.get():
+            subfolders = [item for item in path.iterdir() if item.is_dir()]
+            if not subfolders:
+                self._append_text("No subfolders found to organize.\n")
+                return
+            self._append_text(f"Organizing {len(subfolders)} subfolder(s) separately:\n")
+            for subfolder in subfolders:
+                self._append_text(f"\n--- {subfolder.name} ---\n")
+                cmd = self._build_cmd(dry_run, base=subfolder)
+                self._append_text("$ " + " ".join(cmd) + "\n\n")
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                except subprocess.TimeoutExpired:
+                    self._append_text("Timed out after 1 hour.\n")
+                    continue
+                except OSError as e:
+                    self._append_text(f"Could not run: {e}\n")
+                    continue
+                if proc.stderr:
+                    self._append_text(proc.stderr + "\n")
+                if proc.stdout:
+                    try:
+                        self._append_text(json.dumps(json.loads(proc.stdout), indent=2) + "\n")
+                    except json.JSONDecodeError:
+                        self._append_text(proc.stdout + "\n")
+                if proc.returncode != 0:
+                    self._append_text(f"(exit {proc.returncode})\n")
+            return
+
+        # Normal single-folder run
         cmd = self._build_cmd(dry_run, base=path)
         self._append_text("\n---\n$ " + " ".join(cmd) + "\n\n")
         try:

@@ -198,6 +198,8 @@ class SchedulePanel(ttk.Frame):
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
         self.expand_subfolders_var = tk.BooleanVar(value=False)
+        self.random_names_after_organize_var = tk.BooleanVar(value=True)
+        self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
 
         dr = 0
         ttk.Checkbutton(detail, text="Include in scheduled runs", variable=self.enabled_var, command=self._push_detail_to_job).grid(
@@ -231,6 +233,24 @@ class SchedulePanel(ttk.Frame):
             command=self._push_detail_to_job,
         ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
         dr += 1
+
+        # Random rename section
+        rename_frame = ttk.LabelFrame(detail, text="Random rename (default: on)", padding=6)
+        rename_frame.grid(row=dr, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Checkbutton(
+            rename_frame,
+            text="Rename all files with random names after organizing",
+            variable=self.random_names_after_organize_var,
+            command=self._push_detail_to_job,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            rename_frame,
+            text="Skip already-randomly-renamed files (16-char names)",
+            variable=self.skip_randomly_renamed_var,
+            command=self._push_detail_to_job,
+        ).pack(anchor="w")
+        dr += 1
+
         ttk.Checkbutton(
             detail,
             text="Expand to organize each subfolder separately",
@@ -425,6 +445,8 @@ class SchedulePanel(ttk.Frame):
         self.hidden_var.set(job.include_hidden)
         self.collect_empty_var.set(job.collect_empty_dirs)
         self.expand_subfolders_var.set(job.expand_subfolders)
+        self.random_names_after_organize_var.set(job.random_names_after_organize)
+        self.skip_randomly_renamed_var.set(job.skip_randomly_renamed)
 
     def _push_detail_to_job(self) -> None:
         sel = self.tree.selection()
@@ -443,6 +465,8 @@ class SchedulePanel(ttk.Frame):
         job.include_hidden = bool(self.hidden_var.get())
         job.collect_empty_dirs = bool(self.collect_empty_var.get())
         job.expand_subfolders = bool(self.expand_subfolders_var.get())
+        job.random_names_after_organize = bool(self.random_names_after_organize_var.get())
+        job.skip_randomly_renamed = bool(self.skip_randomly_renamed_var.get())
         self._refresh_tree_row(idx)
 
     def _remove_selected(self) -> None:
@@ -627,6 +651,9 @@ class SchedulePanel(ttk.Frame):
         collect_empty_dirs: bool = True,
         profile: str = "standard",
         exclude_defaults: bool = True,
+        expand_subfolders: bool = False,
+        random_names_after_organize: bool = True,
+        skip_randomly_renamed: bool = True,
         select: bool = True,
     ) -> bool:
         """Add a folder to the schedule list (or select it if already present)."""
@@ -656,6 +683,9 @@ class SchedulePanel(ttk.Frame):
             collect_empty_dirs=collect_empty_dirs,
             profile=profile,
             exclude_defaults=exclude_defaults,
+            expand_subfolders=expand_subfolders,
+            random_names_after_organize=random_names_after_organize,
+            skip_randomly_renamed=skip_randomly_renamed,
         )
         ok, preview = run_dry_run_preview(job)
         if not ok:

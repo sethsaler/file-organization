@@ -61,6 +61,8 @@ class FolderJob:
     last_run: Optional[str] = None
     last_error: Optional[str] = None
     expand_subfolders: bool = False
+    random_names_after_organize: bool = True
+    skip_randomly_renamed: bool = True
 
 
 def parse_daily_time(value: str) -> Tuple[int, int]:
@@ -209,6 +211,8 @@ class ScheduleConfig:
                     last_run=item.get("last_run"),
                     last_error=item.get("last_error"),
                     expand_subfolders=bool(item.get("expand_subfolders", False)),
+                    random_names_after_organize=bool(item.get("random_names_after_organize", True)),
+                    skip_randomly_renamed=bool(item.get("skip_randomly_renamed", True)),
                 )
             )
         max_parallel = max(0, min(128, int(data.get("max_parallel", 0))))
@@ -282,6 +286,10 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
     for pat in job.exclude:
         if pat.strip():
             cmd.extend(["--exclude", pat.strip()])
+    if job.random_names_after_organize:
+        cmd.append("--random-names-after-organize")
+    if job.skip_randomly_renamed:
+        cmd.append("--skip-randomly-renamed")
     if dry_run:
         cmd.append("--dry-run")
     return cmd
@@ -334,6 +342,8 @@ def expand_subfolders(job: FolderJob) -> List[FolderJob]:
                 last_run=job.last_run,
                 last_error=job.last_error,
                 expand_subfolders=False,
+                random_names_after_organize=job.random_names_after_organize,
+                skip_randomly_renamed=job.skip_randomly_renamed,
             )
             subfolders.append(sub_job)
 
