@@ -290,6 +290,7 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
         cmd.append("--random-names-after-organize")
     if job.skip_randomly_renamed:
         cmd.append("--skip-randomly-renamed")
+    cmd.append("--backup")
     if dry_run:
         cmd.append("--dry-run")
     return cmd

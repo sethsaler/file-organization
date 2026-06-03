@@ -42,6 +42,42 @@ def list_manifests(base: Path, limit: int = 20) -> List[Path]:
     return sorted(backup_dir.glob("backup_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
 
 
+def cleanup_old_manifests(base: Path, days_to_keep: int = 7) -> int:
+    """Remove manifest files older than days_to_keep days. Returns count of files removed."""
+    import time
+    backup_dir = base / ORGANIZER_DIR_NAME
+    if not backup_dir.is_dir():
+        return 0
+    
+    cutoff_time = time.time() - (days_to_keep * 24 * 60 * 60)
+    removed_count = 0
+    
+    for manifest_file in backup_dir.glob("backup_*.json"):
+        try:
+            if manifest_file.stat().st_mtime < cutoff_time:
+                manifest_file.unlink()
+                removed_count += 1
+        except OSError:
+            pass
+    
+    # Also clean up associated restore scripts
+    for restore_script in backup_dir.glob("restore_*.sh"):
+        try:
+            if restore_script.stat().st_mtime < cutoff_time:
+                restore_script.unlink()
+        except OSError:
+            pass
+    
+    for restore_command in backup_dir.glob("Restore from *.command"):
+        try:
+            if restore_command.stat().st_mtime < cutoff_time:
+                restore_command.unlink()
+        except OSError:
+            pass
+    
+    return removed_count
+
+
 def write_manifest_files(
     base: Path,
     manifest: Manifest,

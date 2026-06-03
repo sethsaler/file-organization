@@ -25,6 +25,7 @@ from org_manifest import (
     Manifest,
     ManifestEntry,
     ORGANIZER_DIR_NAME,
+    cleanup_old_manifests,
     write_manifest_files,
 )
 from org_mime import sniff_bucket_from_file
@@ -671,6 +672,27 @@ class Organizer:
                     continue
             self.empty_dirs_removed += 1
 
+    def _cleanup_empty_other_bucket(self) -> None:
+        """Remove the Other directory if no files were moved to it."""
+        # Check if any files were moved to "Other" (case-insensitive check)
+        other_bucket_has_files = any(
+            key.casefold() == "other" and count > 0
+            for key, count in self.ext_counts.items()
+        )
+        
+        if other_bucket_has_files:
+            return
+        
+        # No files in Other bucket, remove the directory if it exists
+        for child in self.base.iterdir():
+            if child.is_dir() and child.name.casefold() == "other":
+                if not self.dry_run:
+                    try:
+                        shutil.rmtree(child)
+                    except OSError:
+                        pass
+                break
+
     def _verify(self) -> Dict[str, object]:
         root_visible = 0
         root_all = 0
@@ -845,6 +867,7 @@ class Organizer:
         self._maybe_normalize()
         self._maybe_collect_empty_dirs()
         self._remove_empty_subdirs()
+        self._cleanup_empty_other_bucket()
 
         # Rename all files after organization if requested
         rename_stats = {}
@@ -852,6 +875,8 @@ class Organizer:
             rename_stats = self._rename_all_files_after_organize()
 
         manifest_info = self.save_manifest()
+        if manifest_info and not self.dry_run:
+            cleanup_old_manifests(self.base, days_to_keep=7)
         ocr_path = self._maybe_write_ocr_index()
 
         if self.profile_buckets:
