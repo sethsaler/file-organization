@@ -150,6 +150,11 @@ class Organizer:
             return True
         if should_skip_traverse_dir(parent_path, dir_name, self.base, self.exclude_patterns):
             return True
+        # Skip bucket directories when using in-place strategy to prevent re-organizing
+        # files that were just moved into bucket folders
+        if self.recursive and self.strategy == "in-place" and not self._at_organize_root(parent_path):
+            if dir_name.casefold() in self._category_canonical:
+                return True
         return False
 
     def _walk_topdown_organize(self) -> Iterator[Tuple[Path, List[str], List[str]]]:
