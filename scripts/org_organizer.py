@@ -677,6 +677,44 @@ class Organizer:
                     continue
             self.empty_dirs_removed += 1
 
+    def _cleanup_dsstore_files(self) -> None:
+        """Remove .DS_Store files (both named and randomly renamed)."""
+        dsstore_files_removed = 0
+        
+        for file_path in self.base.rglob("*"):
+            if not file_path.is_file():
+                continue
+                
+            # Check if it's a .DS_Store file
+            is_dsstore = False
+            
+            # Check by name
+            if file_path.name == '.DS_Store' or file_path.suffix == '.DS_Store':
+                is_dsstore = True
+            # Check by content for randomly named .DS_Store files
+            elif not file_path.suffix:
+                try:
+                    with open(file_path, 'rb') as f:
+                        header = f.read(8)
+                    if len(header) >= 8 and header == b'\x00\x00\x00\x01Bud1':
+                        is_dsstore = True
+                except Exception:
+                    pass
+            
+            if is_dsstore:
+                if not self.dry_run:
+                    try:
+                        file_path.unlink()
+                        dsstore_files_removed += 1
+                    except OSError:
+                        pass
+                else:
+                    dsstore_files_removed += 1
+        
+        if dsstore_files_removed > 0:
+            action = "Would remove" if self.dry_run else "Removed"
+            print(f"{action} {dsstore_files_removed} .DS_Store file(s)")
+
     def _cleanup_empty_other_bucket(self) -> None:
         """Remove the Other directory if no files were moved to it."""
         # Check if any files were moved to "Other" (case-insensitive check)
@@ -688,15 +726,33 @@ class Organizer:
         if other_bucket_has_files:
             return
         
-        # No files in Other bucket, remove the directory if it exists
-        for child in self.base.iterdir():
-            if child.is_dir() and child.name.casefold() == "other":
-                if not self.dry_run:
+        # No files in Other bucket, remove empty Other directories
+        # For in-place strategy, check subdirectories; for flatten-root, only check base
+        if self.recursive and self.strategy == "in-place":
+            # Check all subdirectories for empty Other folders
+            for other_dir in self.base.rglob("Other"):
+                if other_dir.is_dir():
                     try:
-                        shutil.rmtree(child)
+                        # Check if directory is empty (excluding hidden files if not including them)
+                        entries = list(other_dir.iterdir())
+                        if not self.include_hidden:
+                            entries = [e for e in entries if self._visible_name(e.name)]
+                        
+                        if not entries:
+                            if not self.dry_run:
+                                shutil.rmtree(other_dir)
                     except OSError:
                         pass
-                break
+        else:
+            # Only check root level for flatten-root strategy
+            for child in self.base.iterdir():
+                if child.is_dir() and child.name.casefold() == "other":
+                    if not self.dry_run:
+                        try:
+                            shutil.rmtree(child)
+                        except OSError:
+                            pass
+                    break
 
     def _verify(self) -> Dict[str, object]:
         root_visible = 0
@@ -872,6 +928,7 @@ class Organizer:
         self._maybe_normalize()
         self._maybe_collect_empty_dirs()
         self._remove_empty_subdirs()
+        self._cleanup_dsstore_files()
         self._cleanup_empty_other_bucket()
 
         # Rename all files after organization if requested
