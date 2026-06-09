@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -59,6 +61,15 @@ class TinkerApp:
         self.rename_hidden_var = tk.BooleanVar(value=True)
         self.rename_verbose_var = tk.BooleanVar(value=False)
         self.rename_skip_randomly_renamed_var = tk.BooleanVar(value=True)
+
+        # Background command execution state
+        self._out_queue: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._active_proc: subprocess.Popen | None = None
+        self._cancel_requested = False
+        self._run_buttons: list[ttk.Button] = []
+        self._cancel_buttons: list[ttk.Button] = []
+        self.status_var = tk.StringVar(value="")
 
         notebook = ttk.Notebook(root)
         notebook.grid(row=0, column=0, sticky="nsew")
@@ -151,13 +162,24 @@ class TinkerApp:
 
         btn_row = ttk.Frame(frm)
         btn_row.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Button(btn_row, text="Dry run", command=lambda: self._run(dry_run=True)).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Run", command=lambda: self._run(dry_run=False)).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Restore…", command=self._restore).pack(side="left", padx=(0, 6))
+        dry_btn = ttk.Button(btn_row, text="Dry run", command=lambda: self._run(dry_run=True))
+        dry_btn.pack(side="left", padx=(0, 6))
+        run_btn = ttk.Button(btn_row, text="Run", command=lambda: self._run(dry_run=False))
+        run_btn.pack(side="left", padx=(0, 6))
+        restore_btn = ttk.Button(btn_row, text="Restore…", command=self._restore)
+        restore_btn.pack(side="left", padx=(0, 6))
         ttk.Button(btn_row, text="Add to schedule…", command=self._add_to_schedule).pack(side="left")
+        cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel, state="disabled")
+        cancel_btn.pack(side="right")
+        ttk.Button(btn_row, text="Clear", command=lambda: self.out.delete("1.0", "end")).pack(side="right", padx=(0, 6))
+        self._run_buttons.extend([dry_btn, run_btn, restore_btn])
+        self._cancel_buttons.append(cancel_btn)
         row += 1
 
-        ttk.Label(frm, text="Output (JSON or errors):").grid(row=row, column=0, columnspan=3, sticky="w", **pad)
+        out_header = ttk.Frame(frm)
+        out_header.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
+        ttk.Label(out_header, text="Output (JSON or errors):").pack(side="left")
+        ttk.Label(out_header, textvariable=self.status_var, foreground="gray").pack(side="right")
         row += 1
         self.out = scrolledtext.ScrolledText(
             frm,
@@ -203,8 +225,15 @@ class TinkerApp:
 
         btn_row = ttk.Frame(frm)
         btn_row.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Button(btn_row, text="Dry run", command=lambda: self._run_rename(dry_run=True)).pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Run", command=lambda: self._run_rename(dry_run=False)).pack(side="left")
+        dry_btn = ttk.Button(btn_row, text="Dry run", command=lambda: self._run_rename(dry_run=True))
+        dry_btn.pack(side="left", padx=(0, 6))
+        run_btn = ttk.Button(btn_row, text="Run", command=lambda: self._run_rename(dry_run=False))
+        run_btn.pack(side="left")
+        cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel, state="disabled")
+        cancel_btn.pack(side="right")
+        ttk.Button(btn_row, text="Clear", command=lambda: self.rename_out.delete("1.0", "end")).pack(side="right", padx=(0, 6))
+        self._run_buttons.extend([dry_btn, run_btn])
+        self._cancel_buttons.append(cancel_btn)
         row += 1
 
         ttk.Label(frm, text="Output:").grid(row=row, column=0, columnspan=3, sticky="w", **pad)
@@ -219,6 +248,13 @@ class TinkerApp:
         frm.rowconfigure(row, weight=1)
 
     def _on_close(self) -> None:
+        self._cancel_requested = True
+        proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
         self.schedule_panel.shutdown()
         self.root.destroy()
 
@@ -239,7 +275,7 @@ class TinkerApp:
             entry.bind("<Command-V>", self._on_path_paste)
 
     def _on_path_paste(self, event: tk.Event | None = None) -> str:
-        entry = self.path_entry
+        entry = event.widget if event is not None else self.path_entry
         try:
             clip = self.root.clipboard_get()
         except tk.TclError:
@@ -270,6 +306,96 @@ class TinkerApp:
         resolved = str(path)
         if self.path_var.get() != resolved:
             self.path_var.set(resolved)
+
+    # --- Background command execution -------------------------------------
+
+    def _is_running(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        for btn in self._run_buttons:
+            btn.configure(state=state)
+        for btn in self._cancel_buttons:
+            btn.configure(state="normal" if busy else "disabled")
+        self.status_var.set("Running…" if busy else "")
+
+    def _cancel(self) -> None:
+        self._cancel_requested = True
+        proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        self.status_var.set("Cancelling…")
+
+    def _start_jobs(self, jobs: list[tuple[str, list[str]]], target: str) -> None:
+        """Run *jobs* (header, cmd) sequentially in a worker thread.
+
+        *target* is "organize" or "rename" and selects the output pane.
+        """
+        if self._is_running():
+            messagebox.showwarning("Busy", "A command is already running.")
+            return
+        self._cancel_requested = False
+        self._set_busy(True)
+        self._worker = threading.Thread(target=self._worker_main, args=(jobs, target), daemon=True)
+        self._worker.start()
+        self.root.after(100, self._poll_queue)
+
+    def _worker_main(self, jobs: list[tuple[str, list[str]]], target: str) -> None:
+        for header, cmd in jobs:
+            if self._cancel_requested:
+                self._out_queue.put((target, "Cancelled.\n"))
+                break
+            self._out_queue.put((target, header + "$ " + " ".join(cmd) + "\n\n"))
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            except OSError as e:
+                self._out_queue.put((target, f"Could not run: {e}\n"))
+                continue
+            self._active_proc = proc
+            try:
+                stdout, stderr = proc.communicate(timeout=3600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                self._out_queue.put((target, "Timed out after 1 hour.\n"))
+            finally:
+                self._active_proc = None
+            self._out_queue.put((target, self._format_result(stdout, stderr, proc.returncode)))
+        self._out_queue.put(None)
+
+    @staticmethod
+    def _format_result(stdout: str, stderr: str, returncode: int) -> str:
+        parts: list[str] = []
+        if stderr:
+            parts.append(stderr + "\n")
+        if stdout:
+            try:
+                parts.append(json.dumps(json.loads(stdout), indent=2) + "\n")
+            except json.JSONDecodeError:
+                parts.append(stdout + "\n")
+        if returncode != 0:
+            parts.append(f"(exit {returncode})\n")
+        return "".join(parts)
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                item = self._out_queue.get_nowait()
+                if item is None:
+                    self._set_busy(False)
+                    return
+                target, text = item
+                if target == "rename":
+                    self._append_rename_text(text)
+                else:
+                    self._append_text(text)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_queue)
 
     def _effective_normalize(self) -> str | None:
         recursive = self.recursive_var.get()
@@ -359,49 +485,16 @@ class TinkerApp:
                 self._append_text("No subfolders found to organize.\n")
                 return
             self._append_text(f"Organizing {len(subfolders)} subfolder(s) separately:\n")
-            for subfolder in subfolders:
-                self._append_text(f"\n--- {subfolder.name} ---\n")
-                cmd = self._build_cmd(dry_run, base=subfolder)
-                self._append_text("$ " + " ".join(cmd) + "\n\n")
-                try:
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                except subprocess.TimeoutExpired:
-                    self._append_text("Timed out after 1 hour.\n")
-                    continue
-                except OSError as e:
-                    self._append_text(f"Could not run: {e}\n")
-                    continue
-                if proc.stderr:
-                    self._append_text(proc.stderr + "\n")
-                if proc.stdout:
-                    try:
-                        self._append_text(json.dumps(json.loads(proc.stdout), indent=2) + "\n")
-                    except json.JSONDecodeError:
-                        self._append_text(proc.stdout + "\n")
-                if proc.returncode != 0:
-                    self._append_text(f"(exit {proc.returncode})\n")
+            jobs = [
+                (f"\n--- {sub.name} ---\n", self._build_cmd(dry_run, base=sub))
+                for sub in subfolders
+            ]
+            self._start_jobs(jobs, "organize")
             return
 
         # Normal single-folder run
         cmd = self._build_cmd(dry_run, base=path)
-        self._append_text("\n---\n$ " + " ".join(cmd) + "\n\n")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        except subprocess.TimeoutExpired:
-            self._append_text("Timed out after 1 hour.\n")
-            return
-        except OSError as e:
-            self._append_text(f"Could not run: {e}\n")
-            return
-        if proc.stderr:
-            self._append_text(proc.stderr + "\n")
-        if proc.stdout:
-            try:
-                self._append_text(json.dumps(json.loads(proc.stdout), indent=2) + "\n")
-            except json.JSONDecodeError:
-                self._append_text(proc.stdout + "\n")
-        if proc.returncode != 0:
-            self._append_text(f"(exit {proc.returncode})\n")
+        self._start_jobs([("\n---\n", cmd)], "organize")
 
     def _restore(self) -> None:
         base = self._parse_folder_path()
@@ -431,12 +524,7 @@ class TinkerApp:
         if not messagebox.askyesno("Restore", f"Restore files from:\n{manifest}\n\nThis moves files back."):
             return
         cmd = [sys.executable, str(_restore_script()), str(manifest)]
-        self._append_text("\n--- restore ---\n$ " + " ".join(cmd) + "\n\n")
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.stdout:
-            self._append_text(proc.stdout + "\n")
-        if proc.stderr:
-            self._append_text(proc.stderr + "\n")
+        self._start_jobs([("\n--- restore ---\n", cmd)], "organize")
 
     def _run_rename(self, dry_run: bool) -> None:
         """Run the random rename operation."""
@@ -445,8 +533,8 @@ class TinkerApp:
             messagebox.showwarning("Folder", "Choose a folder first.")
             return
 
-        path = Path(path_str).resolve()
-        if not path.exists() or not path.is_dir():
+        path = normalize_folder_input(path_str)
+        if not path.is_dir():
             messagebox.showerror("Folder", f"Not a directory:\n{path}")
             return
 
@@ -476,24 +564,7 @@ class TinkerApp:
         if dry_run:
             cmd.append("--dry-run")
 
-        self._append_rename_text("\n---\n$ " + " ".join(cmd) + "\n\n")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        except subprocess.TimeoutExpired:
-            self._append_rename_text("Timed out after 1 hour.\n")
-            return
-        except OSError as e:
-            self._append_rename_text(f"Could not run: {e}\n")
-            return
-        if proc.stderr:
-            self._append_rename_text(proc.stderr + "\n")
-        if proc.stdout:
-            try:
-                self._append_rename_text(json.dumps(json.loads(proc.stdout), indent=2) + "\n")
-            except json.JSONDecodeError:
-                self._append_rename_text(proc.stdout + "\n")
-        if proc.returncode != 0:
-            self._append_rename_text(f"(exit {proc.returncode})\n")
+        self._start_jobs([("\n---\n", cmd)], "rename")
 
 
 def main() -> None:
