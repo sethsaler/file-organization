@@ -57,6 +57,7 @@ def build_launchd_plist() -> dict:
         "Label": SERVICE_LABEL,
         "ProgramArguments": [
             _python_executable(),
+            "-u",
             str(daemon_script()),
             "--foreground",
         ],
