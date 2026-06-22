@@ -15,6 +15,13 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import default_log_path, default_state_dir
+from schedule_config import (
+    SCHEDULE_MODE_DAILY,
+    default_config_path,
+    load_config,
+    normalize_schedule_mode,
+    parse_daily_time,
+)
 
 SERVICE_LABEL = "org.fileorganization.schedule-daemon"
 SYSTEMD_UNIT = "file-org-scheduler.service"
@@ -51,22 +58,50 @@ def _log_paths() -> Tuple[Path, Path]:
     return state / "schedule-daemon.log", state / "schedule-daemon.err.log"
 
 
+def _current_schedule() -> Tuple[str, str]:
+    """Best-effort (mode, daily_time) from the saved config; safe defaults on error."""
+    try:
+        cfg = load_config(default_config_path())
+        return normalize_schedule_mode(cfg.schedule_mode), cfg.daily_time
+    except Exception:
+        return SCHEDULE_MODE_DAILY, "00:00"
+
+
 def build_launchd_plist() -> dict:
     out_log, err_log = _log_paths()
-    return {
+    plist: dict = {
         "Label": SERVICE_LABEL,
-        "ProgramArguments": [
-            _python_executable(),
-            "-u",
-            str(daemon_script()),
-            "--foreground",
-        ],
         "WorkingDirectory": str(_SCRIPT_DIR),
-        "RunAtLoad": True,
-        "KeepAlive": True,
         "StandardOutPath": str(out_log),
         "StandardErrorPath": str(err_log),
     }
+
+    mode, daily_time = _current_schedule()
+    if mode == SCHEDULE_MODE_DAILY:
+        # Let launchd own the timing: it fires at the calendar time and, if the Mac
+        # was asleep then, runs the missed event once on the next wake (no drift).
+        # KeepAlive/RunAtLoad are intentionally omitted so the one-shot run only
+        # happens on the schedule rather than every time the agent loads.
+        hour, minute = parse_daily_time(daily_time)
+        plist["ProgramArguments"] = [
+            _python_executable(),
+            "-u",
+            str(daemon_script()),
+            "--once",
+        ]
+        plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
+        return plist
+
+    # Interval mode keeps the long-running loop alive in the background.
+    plist["ProgramArguments"] = [
+        _python_executable(),
+        "-u",
+        str(daemon_script()),
+        "--foreground",
+    ]
+    plist["RunAtLoad"] = True
+    plist["KeepAlive"] = True
+    return plist
 
 
 def build_systemd_unit() -> str:
@@ -234,6 +269,18 @@ def sync_service_enabled(enabled: bool) -> Tuple[bool, str]:
     if enabled:
         return start_service()
     return stop_service()
+
+
+def restart_service() -> Tuple[bool, str]:
+    """Rewrite the service file and reload it so config changes (mode/daily_time) apply.
+
+    The launchd daily agent bakes the run time into StartCalendarInterval, so a changed
+    schedule only takes effect after the agent is reinstalled. No-op when not installed.
+    """
+    if not is_service_installed() and not is_service_running():
+        return True, "Background scheduler not installed"
+    stop_service()
+    return start_service()
 
 
 def service_status_line() -> str:
