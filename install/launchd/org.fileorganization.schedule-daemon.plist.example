@@ -1,24 +1,71 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!--
+  Two ways to run the scheduler:
+
+  1. Daily mode (recommended for laptops): let launchd own the timing with
+     StartCalendarInterval and run a single batch with `--once`. launchd fires at
+     the calendar time, and if the Mac was asleep then it runs the missed event
+     once on the next wake (no drift). This matches `schedule_mode: daily` in
+     schedule.json. Adjust Hour/Minute to your daily_time. (Active block below.)
+
+  2. Interval mode: run a long-lived loop with `--foreground` plus RunAtLoad and
+     KeepAlive (see the commented block at the bottom). Use this with
+     `schedule_mode: interval`.
+
+  The GUI ("Enable automatic runs") writes the right variant automatically based
+  on your schedule.json; this file is only for manual installs.
+-->
 <dict>
   <key>Label</key>
   <string>org.fileorganization.schedule-daemon</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
+    <string>-u</string>
     <string>INSTALL_DIR/scripts/schedule_daemon.py</string>
-    <string>--foreground</string>
+    <string>--once</string>
   </array>
   <key>WorkingDirectory</key>
   <string>INSTALL_DIR/scripts</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>INSTALL_DIR/logs/schedule-daemon.log</string>
   <key>StandardErrorPath</key>
   <string>INSTALL_DIR/logs/schedule-daemon.err.log</string>
 </dict>
 </plist>
+
+<!--
+  Interval-mode alternative (replace the <dict> above with this):
+
+  <dict>
+    <key>Label</key>
+    <string>org.fileorganization.schedule-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/bin/python3</string>
+      <string>-u</string>
+      <string>INSTALL_DIR/scripts/schedule_daemon.py</string>
+      <string>--foreground</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>INSTALL_DIR/scripts</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>INSTALL_DIR/logs/schedule-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>INSTALL_DIR/logs/schedule-daemon.err.log</string>
+  </dict>
+-->
+
