@@ -40,7 +40,13 @@ from schedule_config import (
     save_config,
 )
 from org_paths import normalize_folder_input
-from schedule_service import is_service_running, service_log_path, service_status_line, sync_service_enabled
+from schedule_service import (
+    is_service_running,
+    restart_service,
+    service_log_path,
+    service_status_line,
+    sync_service_enabled,
+)
 
 
 class SchedulePanel(ttk.Frame):
@@ -56,6 +62,10 @@ class SchedulePanel(ttk.Frame):
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._cfg_lock = threading.Lock()
         self._last_seen_runs: Dict[str, Optional[str]] = {}
+        self._applied_schedule = (
+            normalize_schedule_mode(self.cfg.schedule_mode),
+            normalize_daily_time(self.cfg.daily_time),
+        )
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
         self.schedule_mode_var = tk.StringVar(
@@ -375,6 +385,26 @@ class SchedulePanel(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True, name="schedule-service-sync").start()
 
+    def _apply_schedule_change(self) -> None:
+        """Reload the background agent when the run mode/time baked into it changed."""
+        current = (
+            normalize_schedule_mode(self.cfg.schedule_mode),
+            normalize_daily_time(self.cfg.daily_time),
+        )
+        if current == self._applied_schedule:
+            return
+        self._applied_schedule = current
+        if not bool(self.scheduler_var.get()):
+            return
+
+        def worker() -> None:
+            ok, msg = restart_service()
+            self._log_queue.put(f"{msg}\n")
+
+        threading.Thread(
+            target=worker, daemon=True, name="schedule-service-reinstall"
+        ).start()
+
     def _queue_ui(self, fn: Any) -> None:
         try:
             self.root.after(0, fn)
@@ -389,6 +419,8 @@ class SchedulePanel(ttk.Frame):
             save_config(self.config_path, self.cfg)
         except OSError as e:
             self._append_log(f"Could not save config: {e}\n")
+            return
+        self._apply_schedule_change()
 
     def _poll_log_queue(self) -> None:
         try:
@@ -581,6 +613,7 @@ class SchedulePanel(ttk.Frame):
             messagebox.showerror("Save", str(e))
             return
         self._append_log(f"Saved: {self.config_path}\n")
+        self._apply_schedule_change()
 
     def shutdown(self) -> None:
         """Persist config before destroying the root window (background scheduler keeps running)."""

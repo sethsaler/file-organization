@@ -266,14 +266,33 @@ def test_estimate_seconds_until_next_run_interval():
     assert 0 <= sec <= 3600
 
 
-def test_schedule_service_launchd_plist():
+def test_schedule_service_launchd_plist_interval(monkeypatch):
+    import schedule_service
     from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
 
+    monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("interval", "02:00"))
     plist = build_launchd_plist()
     assert plist["Label"] == SERVICE_LABEL
     assert plist["ProgramArguments"][-1] == "--foreground"
-    assert str(daemon_script()) in plist["ProgramArguments"][1]
+    assert str(daemon_script()) in plist["ProgramArguments"]
     assert plist["KeepAlive"] is True
+    assert "StartCalendarInterval" not in plist
+
+
+def test_schedule_service_launchd_plist_daily(monkeypatch):
+    import schedule_service
+    from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
+
+    monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("daily", "02:30"))
+    plist = build_launchd_plist()
+    assert plist["Label"] == SERVICE_LABEL
+    # Daily mode runs a single batch on a calendar trigger (no drifting sleep loop).
+    assert plist["ProgramArguments"][-1] == "--once"
+    assert str(daemon_script()) in plist["ProgramArguments"]
+    assert plist["StartCalendarInterval"] == {"Hour": 2, "Minute": 30}
+    # No KeepAlive/RunAtLoad: the one-shot must fire only on schedule.
+    assert "KeepAlive" not in plist
+    assert "RunAtLoad" not in plist
 
 
 def test_normalize_folder_input(tmp_path: Path):
