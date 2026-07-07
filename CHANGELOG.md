@@ -25,24 +25,47 @@ This project tracks changes using the Hermes skill version as its public version
 
 ### Added
 
+- **Duplicate hardlinking (`--duplicates-hardlink`):** with `--detect-duplicates`, duplicates stay in their bucket as hardlinks to the canonical copy instead of being staged into `Duplicates` — the copy costs no disk space and both paths remain valid. Falls back to a plain move if the filesystem cannot hardlink. Toggle in the Tinker GUI and Schedule tab (`duplicates_hardlink` in `schedule.json`).
+- **Date-based bucketing (`--date-buckets`):** files are placed under `Bucket/YYYY/MM` subfolders by modification time, in every strategy. Toggle in the Tinker GUI and Schedule tab (`date_buckets` in `schedule.json`).
+- **iCloud-safe duplicate detection:** cloud-placeholder files with no local content (undownloaded iCloud Drive items, detected via `SF_DATALESS` / zero allocated blocks) are never registered for duplicate hashing, so background sweeps can no longer trigger surprise multi-gigabyte downloads.
+- **Watch-mode LaunchAgent runs only the changed folder:** `schedule_daemon.py --once` in watch mode persists per-folder watch signatures (`~/.local/state/file-organization/watch-signatures.json`) and organizes only folders whose signature changed since the last fire. A fire with no signature changes (the hourly `StartInterval` backstop) still sweeps everything to catch deep changes the signature cannot see.
+- **macOS notifications after background sweeps:** the daemon posts a notification ("Organized N folder(s), M failed") after scheduled/watch runs that actually ran folders. Disable with `"notify_on_run": false` in `schedule.json`.
+- **Run history:** every scheduled/manual batch appends a compact record (path, outcome, files moved, duplicates, empty dirs staged) to `~/.local/state/file-organization/history.jsonl` (auto-trimmed at ~1 MiB). New **History…** button in the Schedule tab shows the recent runs.
+- **Per-folder run timeout:** `timeout_minutes` on a folder job (default 60, 0 = no timeout) replaces the fixed 1-hour cap on scheduled runs.
+- **Background scheduler self-heals across restarts, OS updates, and Homebrew Python upgrades:** service files now bake in a version-stable interpreter symlink (`/opt/homebrew/bin/python3` / `/usr/local/bin/python3`) instead of a versioned path like `python@3.14` that vanishes on `brew upgrade`. `start_service()` detects a stale installed LaunchAgent (missing interpreter, or any drift from the current config) and force-reloads it, and clears a persisted `launchctl disable` / Background Task Management toggle before bootstrapping. Since the GUIs already re-sync the service on launch when automatic runs are enabled, opening either GUI now repairs a silently broken agent.
+- **Duplicate detection (`--detect-duplicates`):** files with identical content are detected during organization (size-first grouping, lazy BLAKE2 hashing — unique-sized files are never read) and the copies are staged into a root-level `Duplicates` folder instead of their bucket. The first copy encountered is canonical; files already inside root bucket folders are seeded as canonical so re-runs keep the organized copy. `Duplicates` is skipped on later runs, moves are recorded in the backup manifest (restorable), and the JSON summary gains a `duplicates` block. Available as a per-folder toggle in the Schedule tab and a checkbox in the Tinker GUI (`detect_duplicates` in `schedule.json`).
+- **Watch schedule mode (near real-time organizing):** `schedule_mode: "watch"` organizes a folder shortly after files change instead of polling on a timer. On macOS the LaunchAgent uses native `WatchPaths` (event-driven, no resident daemon, `ThrottleInterval` 15 s debounce, hourly `StartInterval` backstop). The `--foreground` daemon (systemd/manual) gains a watch loop that polls a cheap mtime signature (folder root + immediate subdirs) every 2 s and fires after a 5 s quiet period, running only the folder(s) that changed. New GUI radio option: "Watch folders and organize when files change".
+- **Threshold-gated scheduling:** each `FolderJob` supports `min_unsorted_threshold` (default 0 = always run). When > 0, the scheduler counts unsorted files before running — if below the threshold, the folder is skipped. The count is strategy-aware: root-only for `flatten-root`, recursive for `in-place` (skipping bucket-named dirs, `For Deletion`, `.organizer`). Early-abort stops the walk once the threshold is met. Configurable via the Schedule tab GUI.
+- **LaunchAgent interval mode with `StartInterval`:** short intervals (≤ 60 min) now use `StartInterval` + `--once` (fire-and-exit every N seconds) instead of a 24/7 `--foreground` daemon. More efficient for frequent polling.
 - **Background scheduler from GUI:** enabling automatic runs installs a LaunchAgent (macOS) or systemd user unit (Linux) via `schedule_service.py`, so scheduled organization continues after the app closes.
 - **Scheduler in main GUI:** `tinker_gui.py` has a **Schedule** tab (`schedule_panel.py`) with folder list, daily/interval timing, next-run status, and background daemon control. **Add to schedule…** on the Organize tab links the current folder. `schedule_gui.py` remains a schedule-only window using the same panel.
+- `scripts/install.sh`: curl-friendly installer that unpacks a GitHub ref into `~/.local/share/organize-folder-by-filetype` (configurable via `FILE_ORG_*` env vars).
+- `scripts/tinker_gui.py`: Tkinter UI to configure options and run dry-run or live organize with JSON output.
+- `launchers/Organize by File Type (Tinker).command`: macOS launcher for the tinker GUI.
+
+### Performance
+
+- **Exclusion checks no longer resolve paths repeatedly:** `path_excluded` derives relative paths with a string prefix strip instead of two `resolve()` chains, and per-directory skip decisions are memoized across the run's 5-7 tree passes (`_at_organize_root` also now uses the existing resolve cache). Previously each directory paid multiple lstat/readlink chains per pass.
+- **Fewer full-tree walks per run:** the normalize pass reuses the walk's directory listings instead of re-listing every directory; empty-`Other` cleanup uses dirs observed during traversal instead of an `rglob("Other")` sweep; the two verification walks are folded into one; empty-dir inspection uses `os.scandir` d_type info instead of 2-3 stats per entry.
+- **Per-file fast paths:** same-volume moves use a single `os.rename` syscall (falling back to `shutil.move` cross-device); collision-name probing resumes from the last suffix per (dir, name) instead of restarting at `_1` (was O(n²) for n same-named files); extension parsing uses `splitext` instead of Path construction; the random-rename pass and duplicate-index seeding use one `lstat` per file instead of 2-3 stats, and the rename pass no longer stats for destination existence; `DuplicateIndex.update_location` is O(1) via a reverse path→digest map; symlink-cycle bookkeeping is skipped entirely when not following symlinks.
+- **Dry-run empty-folder preview is now simulated in memory** instead of cloning the whole tree into a temp directory and running a second organizer over it (~8× faster dry runs on a 5,000-file tree; the gap grows with tree size).
+- **Per-file move overhead cut:** destination checks use a cached per-directory `resolve()` (previously 3 uncached `resolve()` chains per file) and `mkdir` runs once per destination directory. Real runs ~1.5× faster on 5k–20k-file trees.
+- **`.DS_Store` cleanup no longer opens every extensionless file:** only 16-char random-rename candidates are content-sniffed, and the scan uses one `os.walk` instead of `rglob` with per-path `Path` objects.
+- **O(1) extension classification:** bucket lookup uses a precomputed extension→bucket dict instead of scanning every bucket's extension set per file.
+
+### Fixed
+
+- **Folders containing only a `.DS_Store` are now removed/staged:** `.DS_Store` cleanup runs before the empty-dir passes, so such folders count as empty even with hidden files included (previously they were left behind unless `include_hidden` was off).
+- `org_buckets.py` referenced `Optional` without importing it (latent `NameError`).
+- `expand_subfolders` now propagates `min_unsorted_threshold` to the per-subfolder jobs (it was silently dropped).
+- Changing the interval minutes (not just mode/daily time) now reinstalls the background agent, since `StartInterval` is baked into the plist.
 
 ### Changed
 
 - **Removed per-extension mode:** `--by-extension` is gone. Output JSON uses `moved_by_category`, `buckets`, and `noncanonical_bucket_dirs_*`; `alias_map` dropped from normalization stats.
-
 - **Traversal / legacy buckets:** Directory walking no longer skips folders whose names look like extension or category buckets (e.g. root-level `JPG/` or `Images/`). Only `For Deletion` and `.organizer` are skipped, so trees like iCloud `PreSorted/JPG/` are scanned. **Idempotent moves:** files already inside the correct destination folder are not moved again.
-
 - **Flatten-root + empty folders:** With default `--collect-empty-dirs`, flatten-root no longer deletes empty trees before collection; collectable trees are moved to `For Deletion` in multiple rounds, then a final pass removes leftover empty dirs (including empty bucket folders). Repo launchers and Desktop helper now use staging for flatten as well. `--no-collect-empty-dirs` still skips staging.
-
 - **Category-only buckets:** Default organization is **Images**, **Videos**, **GIFs**, and **Other** (GIFs separate from still images). Tinker no longer offers an extension-folder toggle.
-
-### Added
-
-- `scripts/install.sh`: curl-friendly installer that unpacks a GitHub ref into `~/.local/share/organize-folder-by-filetype` (configurable via `FILE_ORG_*` env vars).
-- `scripts/tinker_gui.py`: Tkinter UI to configure options and run dry-run or live organize with JSON output.
-- `launchers/Organize by File Type (Tinker).command`: macOS launcher for the tinker GUI.
 
 ## [1.5.1] - 2026-03-30
 

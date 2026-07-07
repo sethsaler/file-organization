@@ -8,9 +8,9 @@ import os
 import random
 import re
 import shutil
+import stat as stat_module
 import string
 import sys
-import tempfile
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -18,7 +18,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
-from org_buckets import bucket_for_extension, bucket_names_for_profile, canonical_dir_map
+from org_buckets import (
+    bucket_names_for_profile,
+    buckets_for_profile,
+    canonical_dir_map,
+    extension_bucket_map,
+)
+from org_dupes import DuplicateIndex, stat_is_dataless
 from org_exclude import path_excluded, should_skip_traverse_dir
 from org_manifest import (
     FOR_DELETION_DIR_NAME,
@@ -31,13 +37,31 @@ from org_manifest import (
 from org_mime import sniff_bucket_from_file
 
 EMPTY_DIR_SAMPLE_LIMIT = 20
+DUPLICATES_DIR_NAME = "Duplicates"
+DUPLICATE_SAMPLE_LIMIT = 20
 
 # Pattern to detect randomly renamed files: 16 alphanumeric characters before extension
 RANDOM_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]{16}\.[^.]+$')
 
+# Extensionless variant: a randomly renamed file that had no extension to preserve
+RANDOM_NAME_CANDIDATE_PATTERN = re.compile(r'^[A-Za-z0-9]{16}$')
+
 # MIME sniff can classify extensionless files into buckets that only exist on the extended profile;
 # allow these when using the standard profile so sniffing is not a silent no-op.
 _MIME_SNIFF_STANDARD_EXTRA_BUCKETS = frozenset({"Documents", "Archives", "Audio"})
+
+
+class _SimDir:
+    """In-memory directory node used to preview empty-folder collection in dry runs."""
+
+    __slots__ = ("path", "parent", "is_symlink", "subdirs", "files")
+
+    def __init__(self, path: Path, parent: Optional["_SimDir"], is_symlink: bool) -> None:
+        self.path = path
+        self.parent = parent
+        self.is_symlink = is_symlink
+        self.subdirs: Dict[str, "_SimDir"] = {}
+        self.files: Dict[str, bool] = {}
 
 
 @dataclass
@@ -60,6 +84,13 @@ class NormalizeStats:
 class EmptyDirStats:
     folders_moved: int = 0
     name_collisions_resolved: int = 0
+    sample_moves: List[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class DuplicateStats:
+    files_moved: int = 0
+    files_hardlinked: int = 0
     sample_moves: List[Dict[str, str]] = field(default_factory=list)
 
 
@@ -86,6 +117,9 @@ class Organizer:
         random_names: bool = False,
         random_names_after_organize: bool = False,
         skip_randomly_renamed: bool = False,
+        detect_duplicates: bool = False,
+        duplicates_hardlink: bool = False,
+        date_buckets: bool = False,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -107,6 +141,9 @@ class Organizer:
         self.random_names = random_names
         self.random_names_after_organize = random_names_after_organize
         self.skip_randomly_renamed = skip_randomly_renamed
+        self.detect_duplicates = detect_duplicates
+        self.duplicates_hardlink = duplicates_hardlink
+        self.date_buckets = date_buckets
         self._progress = progress_callback or (lambda _m: None)
         prof_key = profile_label if profile_label in ("standard", "extended") else "standard"
         if profile_buckets and len(profile_buckets) > 3:
@@ -116,10 +153,17 @@ class Organizer:
             self._category_canonical = {n.casefold(): n for n, _ in profile_buckets}
             self._category_canonical["other"] = "Other"
 
+        # One ext -> bucket dict so per-file classification is O(1) instead of a
+        # linear scan over every bucket's extension set.
+        prof_for_exts = profile_label if profile_label in ("standard", "extended") else "standard"
+        effective_buckets = self.profile_buckets or buckets_for_profile(prof_for_exts)
+        self._ext_bucket_map = extension_bucket_map(effective_buckets)
+
         self.ext_counts = Counter()
         self.move_stats = MoveStats()
         self.normalize_stats = NormalizeStats()
         self.empty_dir_stats = EmptyDirStats()
+        self.duplicate_stats = DuplicateStats()
         self.empty_dirs_removed = 0
         self.file_moves: List[ManifestEntry] = []
         self.empty_dir_moves: List[ManifestEntry] = []
@@ -127,6 +171,20 @@ class Organizer:
 
         self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
         self.used_random_names: Set[str] = set()
+        self._dup_index: Optional[DuplicateIndex] = DuplicateIndex() if detect_duplicates else None
+        self._resolved_dir_cache: Dict[Path, Path] = {}
+        self._ensured_dirs: Set[Path] = set()
+        # Skip decisions are name/pattern-based and stable within a run, but the
+        # run makes 5-7 passes over the tree; memoizing avoids re-paying the
+        # exclusion checks (and their resolve chains) per pass.
+        self._skip_dir_cache: Dict[Path, bool] = {}
+        # (dest_dir, filename) -> next collision suffix to try, so probing does
+        # not restart at _1 for every file (O(n²) with n same-named files).
+        self._next_collision_suffix: Dict[Tuple[Path, str], int] = {}
+        self._allowed_buckets_cache: Optional[Set[str]] = None
+        # "Other" dirs observed during traversal, so cleanup does not need a
+        # dedicated rglob() walk over the whole tree.
+        self._seen_other_dirs: Set[Path] = set()
 
     def _visible_name(self, name: str) -> bool:
         return self.include_hidden or not name.startswith(".")
@@ -137,16 +195,40 @@ class Organizer:
     def _is_organizer_dir(self, name: str) -> bool:
         return name.casefold() == ORGANIZER_DIR_NAME.casefold()
 
+    def _is_duplicates_dir(self, name: str) -> bool:
+        return self.detect_duplicates and name.casefold() == DUPLICATES_DIR_NAME.casefold()
+
+    def _resolve_dir(self, directory: Path) -> Path:
+        cached = self._resolved_dir_cache.get(directory)
+        if cached is None:
+            try:
+                cached = directory.resolve()
+            except OSError:
+                cached = directory
+            self._resolved_dir_cache[directory] = cached
+        return cached
+
     def _at_organize_root(self, parent_path: Path) -> bool:
-        try:
-            return parent_path.resolve() == self.base
-        except OSError:
-            return False
+        return self._resolve_dir(parent_path) == self.base
 
     def _should_skip_traversal_dir(self, parent_path: Path, dir_name: str) -> bool:
+        key = parent_path / dir_name
+        cached = self._skip_dir_cache.get(key)
+        if cached is not None:
+            return cached
+        skip = self._compute_skip_traversal_dir(parent_path, dir_name)
+        self._skip_dir_cache[key] = skip
+        return skip
+
+    def _compute_skip_traversal_dir(self, parent_path: Path, dir_name: str) -> bool:
+        if dir_name.casefold() == "other":
+            self._seen_other_dirs.add(parent_path / dir_name)
         if self._is_for_deletion_name(dir_name):
             return True
         if self._is_organizer_dir(dir_name):
+            return True
+        # Never re-organize files already staged as duplicates.
+        if self._is_duplicates_dir(dir_name):
             return True
         if should_skip_traverse_dir(parent_path, dir_name, self.base, self.exclude_patterns):
             return True
@@ -159,6 +241,12 @@ class Organizer:
 
     def _walk_topdown_organize(self) -> Iterator[Tuple[Path, List[str], List[str]]]:
         """Walk the tree for file moves: follow symlinks into directories, break symlink cycles via inode."""
+        if not self.follow_symlinks:
+            # os.walk(followlinks=False) cannot cycle; skip the per-directory
+            # stat + visited-set bookkeeping entirely.
+            for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
+                yield Path(root), dirs, files
+            return
         visited: Set[Tuple[int, int]] = set()
         for root, dirs, files in os.walk(self.base, topdown=True, followlinks=self.follow_symlinks):
             root_path = Path(root)
@@ -224,13 +312,28 @@ class Organizer:
                 self.used_random_names.add(name)
                 return name
 
+    def _probe_collision_name(self, reserved: Set[str], dest_dir: Path, original_name: str) -> str:
+        """Find a free `name_N` variant, resuming N from the last probe for this
+        (dir, name) so n same-named files cost O(n) probes instead of O(n²)."""
+        stem, suffix = os.path.splitext(original_name)
+        if suffix == ".":  # trailing-dot names: keep legacy `name_N` shape
+            stem, suffix = original_name, ""
+        key = (dest_dir, original_name)
+        i = self._next_collision_suffix.get(key, 1)
+        while True:
+            candidate = f"{stem}_{i}{suffix}" if suffix else f"{original_name}_{i}"
+            if candidate not in reserved:
+                self._next_collision_suffix[key] = i + 1
+                return candidate
+            i += 1
+
     def _collision_safe_target(self, dest_dir: Path, original_name: str, collision_counter: str = "files") -> Path:
         self._init_reserved_dir(dest_dir)
         reserved = self.reserved_names[dest_dir]
 
         # If random_names is enabled, generate a random name with the original extension
         if self.random_names:
-            extension = Path(original_name).suffix
+            extension = os.path.splitext(original_name)[1]
             random_name = self._generate_random_name(extension)
             reserved.add(random_name)
             return dest_dir / random_name
@@ -240,31 +343,33 @@ class Organizer:
             return dest_dir / original_name
 
         self._note_collision(collision_counter)
-        p = Path(original_name)
-        stem, suffix = p.stem, p.suffix
+        candidate = self._probe_collision_name(reserved, dest_dir, original_name)
+        reserved.add(candidate)
+        return dest_dir / candidate
 
-        i = 1
-        while True:
-            candidate = f"{stem}_{i}{suffix}" if suffix else f"{original_name}_{i}"
-            if candidate not in reserved:
-                reserved.add(candidate)
-                return dest_dir / candidate
-            i += 1
+    def _fast_move(self, src: Path, dst: Path) -> None:
+        """Move via a single rename syscall; fall back to shutil.move for
+        cross-device moves (or anything else rename cannot do)."""
+        try:
+            os.rename(src, dst)
+        except OSError:
+            shutil.move(str(src), str(dst))
 
     def _allowed_bucket_names(self) -> Set[str]:
-        if self.profile_buckets:
-            return {name for name, _ in self.profile_buckets} | {"Other"}
-        prof = self.profile_label if self.profile_label in ("standard", "extended") else "standard"
-        return set(bucket_names_for_profile(prof))
+        cached = self._allowed_buckets_cache
+        if cached is None:
+            if self.profile_buckets:
+                cached = {name for name, _ in self.profile_buckets} | {"Other"}
+            else:
+                prof = self.profile_label if self.profile_label in ("standard", "extended") else "standard"
+                cached = set(bucket_names_for_profile(prof))
+            self._allowed_buckets_cache = cached
+        return cached
 
     def _bucket_for_file(self, file_name: str, src: Optional[Path] = None) -> str:
-        suffix = Path(file_name).suffix
-        ext = suffix[1:].upper() if suffix else ""
-        prof = self.profile_label if self.profile_label in ("standard", "extended") else "standard"
-        if self.profile_buckets:
-            bucket = bucket_for_extension(ext, prof, self.profile_buckets)
-        else:
-            bucket = bucket_for_extension(ext, prof)
+        suffix = os.path.splitext(file_name)[1]
+        ext = suffix[1:].upper() if suffix and suffix != "." else ""
+        bucket = self._ext_bucket_map.get(ext, "Other") if ext else "Other"
         if bucket == "Other" and not ext and self.use_mime_sniff and src is not None:
             sniffed = sniff_bucket_from_file(src)
             if sniffed:
@@ -277,28 +382,138 @@ class Organizer:
                     return sniffed
         return bucket
 
-    def _move_one_file(self, src: Path, dest_dir: Path) -> None:
-        try:
-            if src.resolve().parent.resolve() == dest_dir.resolve():
-                return
-        except OSError:
-            pass
+    def _seed_duplicate_index(self) -> None:
+        """Register files already sitting in root bucket folders as canonical copies.
 
-        dest_dir_name = dest_dir.name
+        Without this, a fresh copy of an already-organized file could be encountered
+        first during the walk and the previously organized file would be the one
+        staged into Duplicates. Skipped for in-place mode (per-directory semantics).
+        """
+        if self._dup_index is None:
+            return
+        if self.recursive and self.strategy == "in-place":
+            return
+        allowed = {b.casefold() for b in self._allowed_bucket_names()}
+        try:
+            children = list(self.base.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if not child.is_dir() or child.is_symlink():
+                continue
+            if child.name.casefold() not in allowed:
+                continue
+            for root, _dirs, files in os.walk(child, followlinks=False):
+                root_path = Path(root)
+                for name in files:
+                    p = root_path / name
+                    try:
+                        st = os.lstat(p)  # one syscall for both the symlink and size checks
+                    except OSError:
+                        continue
+                    if not stat_module.S_ISREG(st.st_mode):
+                        continue
+                    if stat_is_dataless(st):
+                        continue
+                    self._dup_index.register(p, st.st_size)
+
+    def _bucket_dest_dir(self, parent: Path, bucket: str, src: Path) -> Path:
+        """Bucket destination for a file; adds YYYY/MM from mtime in date-buckets mode."""
+        dest = parent / bucket
+        if self.date_buckets:
+            try:
+                mt = datetime.fromtimestamp(src.stat().st_mtime)
+            except (OSError, OverflowError, ValueError):
+                return dest
+            dest = dest / f"{mt.year:04d}" / f"{mt.month:02d}"
+        return dest
+
+    def _move_one_file(
+        self,
+        src: Path,
+        dest_dir: Path,
+        bucket_parent: Optional[Path] = None,
+        bucket_name: Optional[str] = None,
+    ) -> None:
+        duplicate_of: Optional[Path] = None
+        dup_size: Optional[int] = None
+        hardlink_dup = False
+        if self._dup_index is not None:
+            try:
+                st = src.stat()
+            except OSError:
+                st = None
+            # Never register cloud placeholders: hashing one would force a full
+            # download of the file's content.
+            if st is not None and not stat_is_dataless(st):
+                dup_size = st.st_size
+                duplicate_of = self._dup_index.register(src, dup_size)
+            if duplicate_of is not None:
+                if self.duplicates_hardlink:
+                    # Keep the normal bucket destination; the move below becomes
+                    # link-to-canonical + unlink, so the copy costs no space.
+                    hardlink_dup = True
+                else:
+                    dest_dir = (bucket_parent or dest_dir.parent) / DUPLICATES_DIR_NAME
+
+        if src.parent == dest_dir:
+            return
+        if self._resolve_dir(src.parent) == self._resolve_dir(dest_dir):
+            return
+
+        if duplicate_of is not None and not hardlink_dup:
+            dest_dir_name = DUPLICATES_DIR_NAME
+        else:
+            # In date-buckets mode dest_dir ends in YYYY/MM; count by bucket.
+            dest_dir_name = bucket_name or dest_dir.name
         self.ext_counts[dest_dir_name] += 1
 
-        if not self.dry_run and not dest_dir.exists():
-            dest_dir.mkdir(parents=True, exist_ok=True)
-        elif self.dry_run:
+        if not self.dry_run:
+            if dest_dir not in self._ensured_dirs:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                self._ensured_dirs.add(dest_dir)
+        else:
             self._init_reserved_dir(dest_dir)
 
         target = self._collision_safe_target(dest_dir, src.name)
 
+        hardlinked = False
         if not self.dry_run:
-            shutil.move(str(src), str(target))
+            if hardlink_dup:
+                try:
+                    os.link(duplicate_of, target)
+                    os.unlink(src)
+                    hardlinked = True
+                except OSError:
+                    # Cross-volume or FS without hardlinks: keep the plain move,
+                    # leaving the duplicate as a full copy in its bucket.
+                    hardlinked = False
+            if not hardlinked:
+                self._fast_move(src, target)
             rel_src = str(src.relative_to(self.base))
             rel_dst = str(target.relative_to(self.base))
             self.file_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
+            if self._dup_index is not None and dup_size is not None and duplicate_of is None:
+                # The canonical copy just moved; keep the index pointing at it.
+                self._dup_index.update_location(dup_size, src, target)
+        elif hardlink_dup:
+            hardlinked = True  # dry run: count what a real run would hardlink
+
+        if hardlinked:
+            self.duplicate_stats.files_hardlinked += 1
+        if duplicate_of is not None:
+            self.duplicate_stats.files_moved += 1
+            if len(self.duplicate_stats.sample_moves) < DUPLICATE_SAMPLE_LIMIT:
+                try:
+                    self.duplicate_stats.sample_moves.append(
+                        {
+                            "from": str(src.relative_to(self.base)),
+                            "to": str(target.relative_to(self.base)),
+                            "duplicate_of": str(duplicate_of.relative_to(self.base)),
+                        }
+                    )
+                except ValueError:
+                    pass
 
         self.move_stats.files_moved += 1
         if self.verbose and self.move_stats.files_moved % 100 == 0:
@@ -310,7 +525,10 @@ class Organizer:
             if not p.is_file() or not self._visible_name(p.name):
                 continue
             bucket = self._bucket_for_file(p.name, p)
-            self._move_one_file(p, self.base / bucket)
+            self._move_one_file(
+                p, self._bucket_dest_dir(self.base, bucket, p),
+                bucket_parent=self.base, bucket_name=bucket,
+            )
             touched = True
         if touched:
             self.move_stats.folders_touched += 1
@@ -331,7 +549,10 @@ class Organizer:
             for fn in files:
                 src = root_path / fn
                 bucket = self._bucket_for_file(fn, src)
-                self._move_one_file(src, root_path / bucket)
+                self._move_one_file(
+                    src, self._bucket_dest_dir(root_path, bucket, src),
+                    bucket_parent=root_path, bucket_name=bucket,
+                )
                 touched_dirs.add(root_path)
 
         self.move_stats.folders_touched = len(touched_dirs)
@@ -352,7 +573,10 @@ class Organizer:
             for fn in files:
                 src = root_path / fn
                 bucket = self._bucket_for_file(fn, src)
-                self._move_one_file(src, self.base / bucket)
+                self._move_one_file(
+                    src, self._bucket_dest_dir(self.base, bucket, src),
+                    bucket_parent=self.base, bucket_name=bucket,
+                )
                 touched_dirs.add(root_path)
 
         self.move_stats.folders_touched = len(touched_dirs)
@@ -362,7 +586,11 @@ class Organizer:
             return
 
         # Bottom-up pass with the same directory pruning as organize (excludes, hidden, reserved dirs).
-        roots: List[Path] = []
+        # Snapshot each directory's child dirs BEFORE exclusion pruning: pruning
+        # stops descent into bucket dirs, but they are exactly the children this
+        # pass may need to case-rename. The snapshot also avoids re-listing every
+        # directory (iterdir + per-entry is_dir stats) that the walk just listed.
+        roots: List[Tuple[Path, List[str]]] = []
         for root, dirs, _ in os.walk(self.base, topdown=True, followlinks=False):
             root_path = Path(root)
             if not self.include_hidden:
@@ -373,16 +601,17 @@ class Organizer:
             if self._is_organizer_dir(root_path.name):
                 dirs[:] = []
                 continue
+            child_dirs = list(dirs)
             dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
-            roots.append(root_path)
+            roots.append((root_path, child_dirs))
 
-        for parent in reversed(roots):
+        for parent, child_names in reversed(roots):
             if self._is_for_deletion_name(parent.name):
                 continue
             if self._is_organizer_dir(parent.name):
                 continue
 
-            for child in [p for p in parent.iterdir() if p.is_dir()]:
+            for child in (parent / name for name in child_names):
                 if self._is_for_deletion_name(child.name):
                     continue
                 if self._is_organizer_dir(child.name):
@@ -433,21 +662,13 @@ class Organizer:
                     target_name = item.name
                     if target_name in reserved:
                         self.normalize_stats.merge_collisions_resolved += 1
-                        p = Path(target_name)
-                        stem, suffix = p.stem, p.suffix
-                        i = 1
-                        while True:
-                            candidate = f"{stem}_{i}{suffix}" if suffix else f"{target_name}_{i}"
-                            if candidate not in reserved:
-                                target_name = candidate
-                                break
-                            i += 1
+                        target_name = self._probe_collision_name(reserved, dst, target_name)
 
                     reserved.add(target_name)
                     self.normalize_stats.items_moved_in_merges += 1
                     if not self.dry_run:
                         dest_item = dst / target_name
-                        shutil.move(str(item), str(dest_item))
+                        self._fast_move(item, dest_item)
                         self.file_moves.append(
                             ManifestEntry(
                                 from_path=str(item.relative_to(self.base)),
@@ -463,60 +684,222 @@ class Organizer:
                     except Exception:
                         pass
 
-    def _copy_placeholder_tree(self, src: Path, dst: Path) -> None:
-        dst.mkdir(parents=True, exist_ok=True)
-        for entry in src.iterdir():
-            target = dst / entry.name
-            if entry.is_symlink():
-                try:
-                    os.symlink(os.readlink(entry), target)
-                except Exception:
-                    target.touch()
-                continue
-
-            if entry.is_dir():
-                self._copy_placeholder_tree(entry, target)
-                continue
-
-            target.touch()
-
     def _simulate_empty_dir_collection(self) -> Optional[EmptyDirStats]:
+        """Predict For Deletion staging for dry runs without touching the disk.
+
+        Builds an in-memory snapshot of the tree in one scandir walk, replays the
+        organize file moves on it, then runs the same collection logic on the model.
+        (Normalization-only folder merges are not replayed; the extremely rare case
+        of two empty case-variant bucket dirs can preview one extra folder.)
+        """
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                sim_base = Path(tmpdir) / "sim"
-                self._copy_placeholder_tree(self.base, sim_base)
-                sim_org = Organizer(
-                    base=sim_base,
-                    recursive=self.recursive,
-                    strategy=self.strategy,
-                    include_hidden=self.include_hidden,
-                    normalize=self.normalize,
-                    collect_empty_dirs=True,
-                    dry_run=False,
-                    profile_label=self.profile_label,
-                    profile_buckets=list(self.profile_buckets) if self.profile_buckets else None,
-                    exclude_patterns=list(self.exclude_patterns),
-                    follow_symlinks=self.follow_symlinks,
-                    use_mime_sniff=self.use_mime_sniff,
-                )
-                sim_org.run()
-                return EmptyDirStats(
-                    folders_moved=sim_org.empty_dir_stats.folders_moved,
-                    name_collisions_resolved=sim_org.empty_dir_stats.name_collisions_resolved,
-                    sample_moves=list(sim_org.empty_dir_stats.sample_moves),
-                )
+            root = self._build_sim_tree()
+            self._sim_organize(root)
+            return self._sim_collect_empty_dirs(root)
         except Exception:
             return None
+
+    def _build_sim_tree(self) -> "_SimDir":
+        visited: Set[Tuple[int, int]] = set()
+        root = _SimDir(self.base, None, False)
+
+        def build(node: _SimDir) -> None:
+            try:
+                st = os.stat(node.path, follow_symlinks=False)
+                key = (st.st_dev, st.st_ino)
+                if key in visited:
+                    return
+                visited.add(key)
+            except OSError:
+                return
+            try:
+                entries = list(os.scandir(node.path))
+            except OSError:
+                return
+            for entry in entries:
+                try:
+                    is_link = entry.is_symlink()
+                    is_dir = entry.is_dir(follow_symlinks=True)
+                except OSError:
+                    continue
+                if is_dir:
+                    child = _SimDir(node.path / entry.name, node, is_link)
+                    node.subdirs[entry.name] = child
+                    if self.follow_symlinks or not is_link:
+                        build(child)
+                else:
+                    node.files[entry.name] = is_link
+
+        build(root)
+        return root
+
+    def _sim_get_or_create_subdir(self, node: "_SimDir", name: str) -> "_SimDir":
+        for existing_name, child in node.subdirs.items():
+            if existing_name.casefold() == name.casefold():
+                return child
+        child = _SimDir(node.path / name, node, False)
+        node.subdirs[name] = child
+        return child
+
+    def _sim_walk(self, root: "_SimDir") -> Iterator[Tuple["_SimDir", List[str]]]:
+        """Topdown model walk with the same pruning as the organize walk."""
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            dir_names = list(node.subdirs)
+            file_names = list(node.files)
+            if not self.include_hidden:
+                dir_names = [d for d in dir_names if self._visible_name(d)]
+                file_names = [f for f in file_names if self._visible_name(f)]
+            dir_names = [d for d in dir_names if not self._should_skip_traversal_dir(node.path, d)]
+            yield node, file_names
+            for d in dir_names:
+                stack.append(node.subdirs[d])
+
+    def _sim_organize(self, root: "_SimDir") -> None:
+        """Replay the organize move phase on the model (removal/placement only)."""
+        if not self.recursive:
+            for fn in list(root.files):
+                if not self._visible_name(fn):
+                    continue
+                bucket = self._bucket_for_file(fn, root.path / fn)
+                dest = self._sim_get_or_create_subdir(root, bucket)
+                del root.files[fn]
+                dest.files[fn] = False
+            return
+
+        for node, file_names in self._sim_walk(root):
+            for fn in file_names:
+                bucket = self._bucket_for_file(fn, node.path / fn)
+                if self.strategy == "in-place":
+                    dest = self._sim_get_or_create_subdir(node, bucket)
+                else:
+                    dest = self._sim_get_or_create_subdir(root, bucket)
+                if dest is node or self._resolve_dir(node.path) == self._resolve_dir(dest.path):
+                    continue
+                del node.files[fn]
+                dest.files[fn] = False
+
+    def _sim_inspect_empty_dir_tree(self, node: "_SimDir") -> Tuple[bool, List["_SimDir"]]:
+        if path_excluded(node.path, self.base, self.exclude_patterns):
+            return False, []
+        if node.is_symlink:
+            return False, []
+        if not node.subdirs and not node.files:
+            return True, []
+
+        collectable = True
+        topmost: List[_SimDir] = []
+
+        for name, child in node.subdirs.items():
+            if self._is_for_deletion_name(name) or self._is_organizer_dir(name):
+                collectable = False
+                continue
+            if self._should_skip_traversal_dir(node.path, name):
+                collectable = False
+                continue
+            if not self.include_hidden and not self._visible_name(name):
+                collectable = False
+                continue
+            if child.is_symlink:
+                collectable = False
+                continue
+            child_collectable, child_topmost = self._sim_inspect_empty_dir_tree(child)
+            if child_collectable:
+                topmost.append(child)
+            else:
+                collectable = False
+                topmost.extend(child_topmost)
+
+        if node.files:
+            collectable = False
+
+        if collectable:
+            return True, []
+        return False, topmost
+
+    def _sim_find_empty_dir_candidates(self, root: "_SimDir") -> List["_SimDir"]:
+        candidates: List[_SimDir] = []
+        seen: Set[int] = set()
+        for name in sorted(root.subdirs, key=str.lower):
+            child = root.subdirs[name]
+            if child.is_symlink:
+                continue
+            if not self._visible_name(name):
+                continue
+            if self._is_for_deletion_name(name) or self._is_organizer_dir(name):
+                continue
+            if self._should_skip_traversal_dir(self.base, name):
+                continue
+            child_collectable, child_topmost = self._sim_inspect_empty_dir_tree(child)
+            if child_collectable:
+                paths_to_add = [child]
+            elif self.recursive:
+                paths_to_add = child_topmost
+            else:
+                paths_to_add = []
+            for cand in paths_to_add:
+                if id(cand) in seen:
+                    continue
+                seen.add(id(cand))
+                candidates.append(cand)
+        return candidates
+
+    def _sim_collect_empty_dirs(self, root: "_SimDir") -> EmptyDirStats:
+        stats = EmptyDirStats()
+        fd_node: Optional[_SimDir] = None
+        for name, child in root.subdirs.items():
+            if self._is_for_deletion_name(name):
+                fd_node = child
+                break
+
+        reserved: Optional[Set[str]] = None
+        for _ in range(500):
+            candidates = self._sim_find_empty_dir_candidates(root)
+            if not candidates:
+                break
+            if fd_node is None:
+                fd_node = _SimDir(self.base / FOR_DELETION_DIR_NAME, root, False)
+                root.subdirs[FOR_DELETION_DIR_NAME] = fd_node
+            if reserved is None:
+                reserved = set(fd_node.subdirs) | set(fd_node.files)
+            for cand in candidates:
+                name = cand.path.name
+                final_name = name
+                if final_name in reserved:
+                    stats.name_collisions_resolved += 1
+                    final_name = self._probe_collision_name(reserved, fd_node.path, name)
+                reserved.add(final_name)
+                if len(stats.sample_moves) < EMPTY_DIR_SAMPLE_LIMIT:
+                    stats.sample_moves.append(
+                        {
+                            "from": str(cand.path.relative_to(self.base)),
+                            "to": str((fd_node.path / final_name).relative_to(self.base)),
+                        }
+                    )
+                parent = cand.parent
+                if parent is not None:
+                    for key, val in list(parent.subdirs.items()):
+                        if val is cand:
+                            del parent.subdirs[key]
+                            break
+                cand.parent = fd_node
+                fd_node.subdirs[final_name] = cand
+                stats.folders_moved += 1
+        return stats
 
     def _inspect_empty_dir_tree(self, directory: Path) -> tuple[bool, List[Path]]:
         if path_excluded(directory, self.base, self.exclude_patterns):
             return False, []
-        if directory.is_symlink():
+        if os.path.islink(directory):
             return False, []
 
+        # scandir DirEntry answers is_dir/is_symlink from d_type without extra
+        # stat syscalls; iterdir + per-entry Path checks paid 2-3 per entry.
         try:
-            entries = list(directory.iterdir())
-        except Exception:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except OSError:
             return False, []
 
         if not entries:
@@ -532,7 +915,13 @@ class Organizer:
             if self._is_organizer_dir(entry.name):
                 collectable = False
                 continue
-            if entry.is_dir() and self._should_skip_traversal_dir(directory, entry.name):
+            try:
+                is_symlink = entry.is_symlink()
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                collectable = False
+                continue
+            if is_dir and self._should_skip_traversal_dir(directory, entry.name):
                 collectable = False
                 continue
 
@@ -540,14 +929,15 @@ class Organizer:
                 collectable = False
                 continue
 
-            if entry.is_symlink():
+            if is_symlink:
                 collectable = False
                 continue
 
-            if entry.is_dir():
-                child_collectable, child_topmost = self._inspect_empty_dir_tree(entry)
+            if is_dir:
+                child_path = Path(entry.path)
+                child_collectable, child_topmost = self._inspect_empty_dir_tree(child_path)
                 if child_collectable:
-                    topmost_children.append(entry)
+                    topmost_children.append(child_path)
                 else:
                     collectable = False
                     topmost_children.extend(child_topmost)
@@ -563,18 +953,28 @@ class Organizer:
         candidates: List[Path] = []
         seen: Set[Path] = set()
 
-        for child in sorted(self.base.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir() or child.is_symlink():
+        try:
+            with os.scandir(self.base) as it:
+                children = sorted(it, key=lambda e: e.name.lower())
+        except OSError:
+            return []
+
+        for entry in children:
+            try:
+                if not entry.is_dir(follow_symlinks=False) or entry.is_symlink():
+                    continue
+            except OSError:
                 continue
-            if not self._visible_name(child.name):
+            if not self._visible_name(entry.name):
                 continue
-            if self._is_for_deletion_name(child.name):
+            if self._is_for_deletion_name(entry.name):
                 continue
-            if self._is_organizer_dir(child.name):
+            if self._is_organizer_dir(entry.name):
                 continue
-            if self._should_skip_traversal_dir(self.base, child.name):
+            if self._should_skip_traversal_dir(self.base, entry.name):
                 continue
 
+            child = Path(entry.path)
             child_collectable, child_topmost = self._inspect_empty_dir_tree(child)
             if child_collectable:
                 paths_to_add = [child]
@@ -610,7 +1010,7 @@ class Organizer:
                 )
 
             if not self.dry_run:
-                shutil.move(str(src_dir), str(target))
+                self._fast_move(src_dir, target)
                 rel_src = str(src_dir.relative_to(self.base))
                 rel_dst = str(target.relative_to(self.base))
                 self.empty_dir_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
@@ -680,37 +1080,34 @@ class Organizer:
     def _cleanup_dsstore_files(self) -> None:
         """Remove .DS_Store files (both named and randomly renamed)."""
         dsstore_files_removed = 0
-        
-        for file_path in self.base.rglob("*"):
-            if not file_path.is_file():
-                continue
-                
-            # Check if it's a .DS_Store file
-            is_dsstore = False
-            
-            # Check by name
-            if file_path.name == '.DS_Store' or file_path.suffix == '.DS_Store':
-                is_dsstore = True
-            # Check by content for randomly named .DS_Store files
-            elif not file_path.suffix:
-                try:
-                    with open(file_path, 'rb') as f:
-                        header = f.read(8)
-                    if len(header) >= 8 and header == b'\x00\x00\x00\x01Bud1':
-                        is_dsstore = True
-                except Exception:
-                    pass
-            
-            if is_dsstore:
-                if not self.dry_run:
+
+        for root, _dirs, files in os.walk(self.base, followlinks=False):
+            for name in files:
+                is_dsstore = False
+                if name == ".DS_Store" or name.endswith(".DS_Store"):
+                    is_dsstore = True
+                elif "." not in name and RANDOM_NAME_CANDIDATE_PATTERN.match(name):
+                    # Only content-sniff extensionless files that look like the
+                    # random-rename output; opening every extensionless file made
+                    # this pass dominate large runs.
                     try:
-                        file_path.unlink()
-                        dsstore_files_removed += 1
+                        with open(os.path.join(root, name), "rb") as f:
+                            header = f.read(8)
+                        if header == b"\x00\x00\x00\x01Bud1":
+                            is_dsstore = True
                     except OSError:
                         pass
-                else:
-                    dsstore_files_removed += 1
-        
+
+                if is_dsstore:
+                    if not self.dry_run:
+                        try:
+                            os.unlink(os.path.join(root, name))
+                            dsstore_files_removed += 1
+                        except OSError:
+                            pass
+                    else:
+                        dsstore_files_removed += 1
+
         if dsstore_files_removed > 0:
             action = "Would remove" if self.dry_run else "Removed"
             print(f"{action} {dsstore_files_removed} .DS_Store file(s)")
@@ -729,8 +1126,12 @@ class Organizer:
         # No files in Other bucket, remove empty Other directories
         # For in-place strategy, check subdirectories; for flatten-root, only check base
         if self.recursive and self.strategy == "in-place":
-            # Check all subdirectories for empty Other folders
-            for other_dir in self.base.rglob("Other"):
+            # Other dirs were recorded as the run's walks encountered them (plus
+            # any the run created), so no dedicated rglob() over the whole tree.
+            candidates = set(self._seen_other_dirs)
+            candidates.update(d for d in self._ensured_dirs if d.name.casefold() == "other")
+            candidates.add(self.base / "Other")
+            for other_dir in sorted(candidates):
                 if other_dir.is_dir():
                     try:
                         # Check if directory is empty (excluding hidden files if not including them)
@@ -763,34 +1164,40 @@ class Organizer:
                 if self._visible_name(p.name):
                     root_visible += 1
 
+        # One walk computes both metrics. The noncanonical-dir check needs to
+        # descend into bucket dirs while the in-place file count must not; the
+        # `counted` set tracks which visited dirs count toward the file metric
+        # instead of pruning them from the walk.
         noncanonical_dirs = []
-        for root_path, dirs, _ in self._walk_topdown_organize():
+        remaining_unorganized_visible_files = None
+        checked_non_bucket_directories = None
+        in_place = self.recursive and self.strategy == "in-place"
+        if in_place:
+            remaining_unorganized_visible_files = 0
+            checked_non_bucket_directories = 0
+
+        counted: Set[Path] = {self.base}
+        for root_path, dirs, files in self._walk_topdown_organize():
             if not self.include_hidden:
                 dirs[:] = [d for d in dirs if self._visible_name(d)]
             dirs[:] = [d for d in dirs if not self._is_for_deletion_name(d)]
             dirs[:] = [d for d in dirs if not self._is_organizer_dir(d)]
-            parent = root_path
             for d in dirs:
                 c = self._canonical_folder_name(d)
                 if c is not None and c != d:
-                    noncanonical_dirs.append(str(parent / d))
+                    noncanonical_dirs.append(str(root_path / d))
 
-        remaining_unorganized_visible_files = None
-        checked_non_bucket_directories = None
-
-        if self.recursive and self.strategy == "in-place":
-            remaining_unorganized_visible_files = 0
-            checked_non_bucket_directories = 0
-
-            for root_path, dirs, files in self._walk_topdown_organize():
-                if not self.include_hidden:
-                    dirs[:] = [d for d in dirs if self._visible_name(d)]
-                    files = [f for f in files if self._visible_name(f)]
-
+            if in_place and root_path in counted:
                 checked_non_bucket_directories += 1
-                remaining_unorganized_visible_files += len(files)
-
-                dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
+                if self.include_hidden:
+                    remaining_unorganized_visible_files += len(files)
+                else:
+                    remaining_unorganized_visible_files += sum(
+                        1 for f in files if self._visible_name(f)
+                    )
+                for d in dirs:
+                    if not self._should_skip_traversal_dir(root_path, d):
+                        counted.add(root_path / d)
 
         return {
             "root_files_remaining_visible": root_visible,
@@ -863,8 +1270,12 @@ class Organizer:
         for root, dirs, files in os.walk(self.base, topdown=False):
             root_path = Path(root)
             
-            # Skip organizer and deletion directories
-            if self._is_organizer_dir(root_path.name) or self._is_for_deletion_name(root_path.name):
+            # Skip organizer, deletion, and duplicate-staging directories
+            if (
+                self._is_organizer_dir(root_path.name)
+                or self._is_for_deletion_name(root_path.name)
+                or self._is_duplicates_dir(root_path.name)
+            ):
                 dirs[:] = []
                 continue
                 
@@ -874,9 +1285,19 @@ class Organizer:
                 
             for filename in files:
                 src = root_path / filename
-                if src.is_file() and not src.is_symlink():
-                    all_files.append(src)
-        
+                try:
+                    st = os.lstat(src)  # one syscall replaces is_file()+is_symlink()
+                except OSError:
+                    continue
+                if not stat_module.S_ISREG(st.st_mode):
+                    continue
+                # Names from earlier runs already look random; reserving them means
+                # _generate_random_name can never emit a name that exists on disk,
+                # so no per-file dest.exists() stat is needed below.
+                if RANDOM_NAME_PATTERN.match(filename) or RANDOM_NAME_CANDIDATE_PATTERN.match(filename):
+                    self.used_random_names.add(filename)
+                all_files.append(src)
+
         # Rename each file
         for src in all_files:
             try:
@@ -884,14 +1305,10 @@ class Organizer:
                 if self.skip_randomly_renamed and self._is_randomly_renamed(src.name):
                     rename_stats["files_skipped"] += 1
                     continue
-                
+
                 new_name = self._generate_random_name(src.suffix)
                 dest = src.parent / new_name
-                
-                if dest.exists():
-                    rename_stats["errors"].append(f"Destination already exists: {dest}")
-                    continue
-                
+
                 if not self.dry_run:
                     src.rename(dest)
                     # Update the file_moves manifest with the new name
@@ -915,6 +1332,8 @@ class Organizer:
         except OSError:
             pass
 
+        self._seed_duplicate_index()
+
         if self.recursive:
             if self.strategy == "in-place":
                 self._run_recursive_in_place()
@@ -926,9 +1345,12 @@ class Organizer:
             self._run_non_recursive()
 
         self._maybe_normalize()
+        # .DS_Store cleanup must precede the empty-dir passes: a folder holding
+        # only a .DS_Store is empty once the file is gone, and with
+        # include_hidden=True nothing else would ever purge it.
+        self._cleanup_dsstore_files()
         self._maybe_collect_empty_dirs()
         self._remove_empty_subdirs()
-        self._cleanup_dsstore_files()
         self._cleanup_empty_other_bucket()
 
         # Rename all files after organization if requested
@@ -975,6 +1397,15 @@ class Organizer:
                 "name_collisions_resolved": self.empty_dir_stats.name_collisions_resolved,
                 "sample_moves": self.empty_dir_stats.sample_moves,
             },
+            "duplicates": {
+                "enabled": self.detect_duplicates,
+                "destination_dir_name": DUPLICATES_DIR_NAME if self.detect_duplicates else None,
+                "hardlink": self.duplicates_hardlink,
+                "files_moved": self.duplicate_stats.files_moved,
+                "files_hardlinked": self.duplicate_stats.files_hardlinked,
+                "sample_moves": self.duplicate_stats.sample_moves,
+            },
+            "date_buckets": self.date_buckets,
             "rename_after_organize": {
                 "enabled": self.random_names_after_organize,
                 "files_renamed": rename_stats.get("files_renamed", 0),

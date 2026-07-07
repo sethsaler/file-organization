@@ -27,6 +27,7 @@ from schedule_config import (
     FolderJob,
     SCHEDULE_MODE_DAILY,
     SCHEDULE_MODE_INTERVAL,
+    SCHEDULE_MODE_WATCH,
     build_organize_cmd,
     effective_normalize,
     default_config_path,
@@ -62,10 +63,7 @@ class SchedulePanel(ttk.Frame):
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._cfg_lock = threading.Lock()
         self._last_seen_runs: Dict[str, Optional[str]] = {}
-        self._applied_schedule = (
-            normalize_schedule_mode(self.cfg.schedule_mode),
-            normalize_daily_time(self.cfg.daily_time),
-        )
+        self._applied_schedule = self._schedule_signature()
 
         self.interval_var = tk.IntVar(value=self.cfg.interval_minutes)
         self.schedule_mode_var = tk.StringVar(
@@ -120,7 +118,17 @@ class SchedulePanel(ttk.Frame):
         self.daily_time_entry.bind("<Return>", lambda _e: self._sync_daily_time_to_cfg())
         ttk.Label(daily_row, text="(local time, 24h — default midnight)").pack(side="left", padx=(6, 0))
 
-        ttk.Label(top, text="Max parallel").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        watch_row = ttk.Frame(top)
+        watch_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Radiobutton(
+            watch_row,
+            text="Watch folders and organize when files change (near real-time)",
+            variable=self.schedule_mode_var,
+            value=SCHEDULE_MODE_WATCH,
+            command=self._on_schedule_mode_change,
+        ).pack(side="left")
+
+        ttk.Label(top, text="Max parallel").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
         tk.Spinbox(
             top,
             from_=0,
@@ -128,26 +136,26 @@ class SchedulePanel(ttk.Frame):
             width=8,
             textvariable=self.max_parallel_var,
             command=self._sync_parallel_to_cfg,
-        ).grid(row=2, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=2, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
+        ).grid(row=3, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=3, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
 
         ttk.Checkbutton(
             top,
             text="Enable automatic runs",
             variable=self.scheduler_var,
             command=self._on_scheduler_toggle,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self.next_run_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.next_run_var, wraplength=620, justify="left").grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0)
+            row=5, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
 
         hint = (
             "Automatic runs continue in the background after you close this app. "
-            "Pick folders below, choose daily or interval timing, then enable automatic runs."
+            "Pick folders below, choose daily, interval, or watch timing, then enable automatic runs."
         )
-        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self._on_schedule_mode_change()
 
@@ -195,6 +203,7 @@ class SchedulePanel(ttk.Frame):
         ttk.Button(btn_row, text="Remove", command=self._remove_selected).pack(side="left", padx=(0, 6))
         ttk.Button(btn_row, text="Run selected now", command=self._run_selected_now).pack(side="left", padx=(0, 6))
         ttk.Button(btn_row, text="Run all enabled now", command=self._run_all_enabled_now).pack(side="left")
+        ttk.Button(btn_row, text="History…", command=self._show_history).pack(side="left", padx=(6, 0))
 
         row += 1
         detail = ttk.LabelFrame(frm, text="Selected folder options", padding=8)
@@ -210,6 +219,10 @@ class SchedulePanel(ttk.Frame):
         self.expand_subfolders_var = tk.BooleanVar(value=False)
         self.random_names_after_organize_var = tk.BooleanVar(value=True)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
+        self.min_unsorted_threshold_var = tk.IntVar(value=0)
+        self.detect_duplicates_var = tk.BooleanVar(value=False)
+        self.duplicates_hardlink_var = tk.BooleanVar(value=False)
+        self.date_buckets_var = tk.BooleanVar(value=False)
 
         dr = 0
         ttk.Checkbutton(detail, text="Include in scheduled runs", variable=self.enabled_var, command=self._push_detail_to_job).grid(
@@ -263,10 +276,48 @@ class SchedulePanel(ttk.Frame):
 
         ttk.Checkbutton(
             detail,
+            text="Detect duplicates (identical content) and stage copies in “Duplicates”",
+            variable=self.detect_duplicates_var,
+            command=self._push_detail_to_job,
+        ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
+        dr += 1
+
+        ttk.Checkbutton(
+            detail,
+            text="…keep duplicates in place as hardlinks (no extra disk space)",
+            variable=self.duplicates_hardlink_var,
+            command=self._push_detail_to_job,
+        ).grid(row=dr, column=0, columnspan=2, sticky="w", padx=(18, 0), pady=2)
+        dr += 1
+
+        ttk.Checkbutton(
+            detail,
+            text="Sort into Year/Month subfolders inside each bucket",
+            variable=self.date_buckets_var,
+            command=self._push_detail_to_job,
+        ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
+        dr += 1
+
+        ttk.Checkbutton(
+            detail,
             text="Expand to organize each subfolder separately",
             variable=self.expand_subfolders_var,
             command=self._push_detail_to_job,
         ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
+        dr += 1
+
+        thresh_frame = ttk.Frame(detail)
+        thresh_frame.grid(row=dr, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Label(thresh_frame, text="Min unsorted files to trigger:").pack(side="left")
+        tk.Spinbox(
+            thresh_frame,
+            from_=0,
+            to=999999,
+            width=8,
+            textvariable=self.min_unsorted_threshold_var,
+            command=self._push_detail_to_job,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(thresh_frame, text="(0 = always run)").pack(side="left", padx=(6, 0))
 
         row += 1
         ttk.Label(frm, text="Log:").grid(row=row, column=0, sticky="w", **pad)
@@ -291,13 +342,13 @@ class SchedulePanel(ttk.Frame):
             self._sync_background_service()
 
     def _on_schedule_mode_change(self) -> None:
-        daily = normalize_schedule_mode(self.schedule_mode_var.get()) == SCHEDULE_MODE_DAILY
-        spin_state = "disabled" if daily else "normal"
+        mode = normalize_schedule_mode(self.schedule_mode_var.get())
+        spin_state = "normal" if mode == SCHEDULE_MODE_INTERVAL else "disabled"
         try:
             self.interval_spin.configure(state=spin_state)
         except tk.TclError:
             pass
-        entry_state = "normal" if daily else "disabled"
+        entry_state = "normal" if mode == SCHEDULE_MODE_DAILY else "disabled"
         try:
             self.daily_time_entry.configure(state=entry_state)
         except tk.TclError:
@@ -385,12 +436,18 @@ class SchedulePanel(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True, name="schedule-service-sync").start()
 
+    def _schedule_signature(self) -> tuple:
+        """Everything baked into the installed service file: mode, time, and (for
+        watch mode) the set of watched folder paths."""
+        mode = normalize_schedule_mode(self.cfg.schedule_mode)
+        watched: tuple = ()
+        if mode == SCHEDULE_MODE_WATCH:
+            watched = tuple(sorted(j.path for j in self.cfg.folders if j.enabled))
+        return (mode, normalize_daily_time(self.cfg.daily_time), self.cfg.interval_minutes, watched)
+
     def _apply_schedule_change(self) -> None:
         """Reload the background agent when the run mode/time baked into it changed."""
-        current = (
-            normalize_schedule_mode(self.cfg.schedule_mode),
-            normalize_daily_time(self.cfg.daily_time),
-        )
+        current = self._schedule_signature()
         if current == self._applied_schedule:
             return
         self._applied_schedule = current
@@ -479,6 +536,10 @@ class SchedulePanel(ttk.Frame):
         self.expand_subfolders_var.set(job.expand_subfolders)
         self.random_names_after_organize_var.set(job.random_names_after_organize)
         self.skip_randomly_renamed_var.set(job.skip_randomly_renamed)
+        self.min_unsorted_threshold_var.set(job.min_unsorted_threshold)
+        self.detect_duplicates_var.set(job.detect_duplicates)
+        self.duplicates_hardlink_var.set(job.duplicates_hardlink)
+        self.date_buckets_var.set(job.date_buckets)
 
     def _push_detail_to_job(self) -> None:
         sel = self.tree.selection()
@@ -499,7 +560,40 @@ class SchedulePanel(ttk.Frame):
         job.expand_subfolders = bool(self.expand_subfolders_var.get())
         job.random_names_after_organize = bool(self.random_names_after_organize_var.get())
         job.skip_randomly_renamed = bool(self.skip_randomly_renamed_var.get())
+        job.detect_duplicates = bool(self.detect_duplicates_var.get())
+        job.duplicates_hardlink = bool(self.duplicates_hardlink_var.get())
+        job.date_buckets = bool(self.date_buckets_var.get())
+        try:
+            job.min_unsorted_threshold = max(0, int(self.min_unsorted_threshold_var.get()))
+        except (tk.TclError, ValueError):
+            job.min_unsorted_threshold = 0
         self._refresh_tree_row(idx)
+
+    def _show_history(self) -> None:
+        """Window listing recent background/manual runs from history.jsonl."""
+        from org_logging import read_history
+
+        records = read_history(100)
+        win = tk.Toplevel(self.root)
+        win.title("Run history")
+        win.geometry("760x400")
+        mono = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10)
+        text = scrolledtext.ScrolledText(win, wrap="none", font=mono)
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+        if not records:
+            text.insert("end", "No runs recorded yet.\n")
+        for rec in records:
+            ts = str(rec.get("ts", ""))[:19].replace("T", " ")
+            status = "ok" if rec.get("ok") else f"ERROR: {rec.get('error', '?')}"
+            parts = [f"{ts}  [{rec.get('label', '?')}]  {rec.get('path', '?')}  {status}"]
+            if rec.get("files_moved") is not None:
+                parts.append(f"moved {rec['files_moved']}")
+            if rec.get("duplicates_moved"):
+                parts.append(f"dupes {rec['duplicates_moved']}")
+            if rec.get("empty_dirs_staged"):
+                parts.append(f"empty dirs {rec['empty_dirs_staged']}")
+            text.insert("end", "  |  ".join(parts) + "\n")
+        text.configure(state="disabled")
 
     def _remove_selected(self) -> None:
         sel = self.tree.selection()
@@ -661,13 +755,16 @@ class SchedulePanel(ttk.Frame):
         self._sync_schedule_timing_to_cfg()
         self._reload_config_if_changed()
         mode = normalize_schedule_mode(self.cfg.schedule_mode)
-        sec = estimate_seconds_until_next_run(self.cfg)
-        if mode == SCHEDULE_MODE_DAILY:
-            timing = f"daily at {normalize_daily_time(self.cfg.daily_time)} local"
-        else:
-            timing = f"every {self.cfg.interval_minutes} min"
         status = service_status_line()
-        label = f"Next run: in {_format_duration(sec)} ({timing}) · {status}"
+        if mode == SCHEDULE_MODE_WATCH:
+            label = f"Watching enabled folders — organizes shortly after files change · {status}"
+        else:
+            sec = estimate_seconds_until_next_run(self.cfg)
+            if mode == SCHEDULE_MODE_DAILY:
+                timing = f"daily at {normalize_daily_time(self.cfg.daily_time)} local"
+            else:
+                timing = f"every {self.cfg.interval_minutes} min"
+            label = f"Next run: in {_format_duration(sec)} ({timing}) · {status}"
         if is_service_running():
             log_path = service_log_path()
             label += f" · log: {log_path}"
@@ -687,6 +784,9 @@ class SchedulePanel(ttk.Frame):
         expand_subfolders: bool = False,
         random_names_after_organize: bool = True,
         skip_randomly_renamed: bool = True,
+        detect_duplicates: bool = False,
+        duplicates_hardlink: bool = False,
+        date_buckets: bool = False,
         select: bool = True,
     ) -> bool:
         """Add a folder to the schedule list (or select it if already present)."""
@@ -719,6 +819,9 @@ class SchedulePanel(ttk.Frame):
             expand_subfolders=expand_subfolders,
             random_names_after_organize=random_names_after_organize,
             skip_randomly_renamed=skip_randomly_renamed,
+            detect_duplicates=detect_duplicates,
+            duplicates_hardlink=duplicates_hardlink,
+            date_buckets=date_buckets,
         )
         ok, preview = run_dry_run_preview(job)
         if not ok:

@@ -77,6 +77,21 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(skip_randomly_renamed=True)
     skip_random_group.add_argument("--skip-randomly-renamed", dest="skip_randomly_renamed", action="store_true", help="Skip files that appear to be already randomly renamed (16-char alphanumeric filenames) (default)")
     skip_random_group.add_argument("--no-skip-randomly-renamed", dest="skip_randomly_renamed", action="store_false", help="Do not skip files that appear to be already randomly renamed")
+    parser.add_argument(
+        "--detect-duplicates",
+        action="store_true",
+        help="Detect files with identical content (size + hash) and stage the copies into a Duplicates folder instead of the bucket",
+    )
+    parser.add_argument(
+        "--duplicates-hardlink",
+        action="store_true",
+        help="With --detect-duplicates: keep duplicates in their bucket as hardlinks to the canonical copy (no extra disk space) instead of staging them into Duplicates",
+    )
+    parser.add_argument(
+        "--date-buckets",
+        action="store_true",
+        help="Place files under Bucket/YYYY/MM subfolders based on modification time",
+    )
     return parser.parse_args()
 
 
@@ -134,6 +149,9 @@ def main() -> None:
         random_names=args.random_names,
         random_names_after_organize=args.random_names_after_organize,
         skip_randomly_renamed=args.skip_randomly_renamed,
+        detect_duplicates=args.detect_duplicates,
+        duplicates_hardlink=args.duplicates_hardlink,
+        date_buckets=args.date_buckets,
     )
     result = org.run()
     out = json.dumps(result, indent=2)

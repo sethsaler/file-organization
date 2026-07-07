@@ -15,8 +15,11 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import default_log_path, default_state_dir
+from org_paths import normalize_folder_input
 from schedule_config import (
     SCHEDULE_MODE_DAILY,
+    SCHEDULE_MODE_INTERVAL,
+    SCHEDULE_MODE_WATCH,
     default_config_path,
     load_config,
     normalize_schedule_mode,
@@ -48,8 +51,36 @@ def systemd_unit_path() -> Path:
     return cfg / SYSTEMD_UNIT
 
 
+# Version-stable `python3` symlinks (Apple Silicon / Intel Homebrew). Homebrew
+# keeps these pointing at the current install across version bumps, unlike the
+# versioned paths sys.executable can report.
+_STABLE_PYTHON_CANDIDATES = (
+    Path("/opt/homebrew/bin/python3"),
+    Path("/usr/local/bin/python3"),
+)
+
+
 def _python_executable() -> str:
-    return sys.executable
+    """Interpreter path to bake into service files.
+
+    sys.executable can live under a versioned Homebrew path
+    (e.g. /opt/homebrew/opt/python@3.14/bin/python3.14) that disappears on the
+    next `brew upgrade`, after which launchd keeps firing the agent but every
+    run exits instantly. Prefer a stable symlink that resolves to the same
+    interpreter today and keeps working after upgrades.
+    """
+    exe = Path(sys.executable)
+    try:
+        real = exe.resolve()
+    except OSError:
+        return str(exe)
+    for candidate in _STABLE_PYTHON_CANDIDATES:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK) and candidate.resolve() == real:
+                return str(candidate)
+        except OSError:
+            continue
+    return str(exe)
 
 
 def _log_paths() -> Tuple[Path, Path]:
@@ -58,13 +89,40 @@ def _log_paths() -> Tuple[Path, Path]:
     return state / "schedule-daemon.log", state / "schedule-daemon.err.log"
 
 
-def _current_schedule() -> Tuple[str, str]:
-    """Best-effort (mode, daily_time) from the saved config; safe defaults on error."""
+def _caffeinate_path() -> Optional[Path]:
+    """Path to macOS `caffeinate`, or None if unavailable (e.g. non-macOS)."""
+    candidate = Path("/usr/bin/caffeinate")
+    return candidate if candidate.exists() else None
+
+
+def _current_schedule() -> Tuple[str, str, int]:
+    """Best-effort (mode, daily_time, interval_minutes) from saved config."""
     try:
         cfg = load_config(default_config_path())
-        return normalize_schedule_mode(cfg.schedule_mode), cfg.daily_time
+        return (
+            normalize_schedule_mode(cfg.schedule_mode),
+            cfg.daily_time,
+            max(1, min(10080, int(cfg.interval_minutes))),
+        )
     except Exception:
-        return SCHEDULE_MODE_DAILY, "00:00"
+        return SCHEDULE_MODE_DAILY, "00:00", 60
+
+
+def _enabled_watch_paths() -> list[str]:
+    """Absolute paths of enabled scheduled folders, for launchd WatchPaths."""
+    try:
+        cfg = load_config(default_config_path())
+    except Exception:
+        return []
+    paths: list[str] = []
+    for job in cfg.folders:
+        if not job.enabled:
+            continue
+        try:
+            paths.append(str(normalize_folder_input(job.path)))
+        except Exception:
+            continue
+    return paths
 
 
 def build_launchd_plist() -> dict:
@@ -76,23 +134,68 @@ def build_launchd_plist() -> dict:
         "StandardErrorPath": str(err_log),
     }
 
-    mode, daily_time = _current_schedule()
+    mode, daily_time, interval_minutes = _current_schedule()
     if mode == SCHEDULE_MODE_DAILY:
         # Let launchd own the timing: it fires at the calendar time and, if the Mac
         # was asleep then, runs the missed event once on the next wake (no drift).
         # KeepAlive/RunAtLoad are intentionally omitted so the one-shot run only
         # happens on the schedule rather than every time the agent loads.
         hour, minute = parse_daily_time(daily_time)
-        plist["ProgramArguments"] = [
+        args: list[str] = []
+        # Hold a power assertion for the whole run so a scheduled-wake run does not
+        # fall back asleep mid-reorganization. caffeinate runs the child and asserts
+        # until it exits (-i no idle sleep, -m no disk sleep, -s while on AC power).
+        if _caffeinate_path() is not None:
+            args += [str(_caffeinate_path()), "-i", "-m", "-s"]
+        args += [
             _python_executable(),
             "-u",
             str(daemon_script()),
             "--once",
         ]
+        plist["ProgramArguments"] = args
         plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
         return plist
 
-    # Interval mode keeps the long-running loop alive in the background.
+    # Watch mode: launchd fires a one-shot run whenever a watched folder changes
+    # (WatchPaths is native, event-driven, and needs no resident daemon).
+    # ThrottleInterval debounces bursts; a StartInterval backstop still runs
+    # hourly in case a change event is missed.
+    if mode == SCHEDULE_MODE_WATCH:
+        args = []
+        if _caffeinate_path() is not None:
+            args += [str(_caffeinate_path()), "-i", "-m", "-s"]
+        args += [
+            _python_executable(),
+            "-u",
+            str(daemon_script()),
+            "--once",
+        ]
+        plist["ProgramArguments"] = args
+        watch_paths = _enabled_watch_paths()
+        if watch_paths:
+            plist["WatchPaths"] = watch_paths
+        plist["ThrottleInterval"] = 15
+        plist["StartInterval"] = 3600
+        return plist
+
+    # Interval mode with short intervals (≤ 60 min): use StartInterval + --once so
+    # launchd fires a fresh one-shot every N seconds without a 24/7 daemon.
+    if mode == SCHEDULE_MODE_INTERVAL and interval_minutes <= 60:
+        args: list[str] = []
+        if _caffeinate_path() is not None:
+            args += [str(_caffeinate_path()), "-i", "-m", "-s"]
+        args += [
+            _python_executable(),
+            "-u",
+            str(daemon_script()),
+            "--once",
+        ]
+        plist["ProgramArguments"] = args
+        plist["StartInterval"] = interval_minutes * 60
+        return plist
+
+    # Long interval: keep the long-running loop alive in the background.
     plist["ProgramArguments"] = [
         _python_executable(),
         "-u",
@@ -184,6 +287,27 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _installed_launchd_plist_stale() -> bool:
+    """True when the installed agent no longer matches what we would write now.
+
+    Catches the plist referencing a binary that no longer exists (a Homebrew
+    Python upgrade or macOS update removed the interpreter baked in at install
+    time — launchd keeps firing the agent, but every run exits instantly) as
+    well as any other drift from the current config. Callers use this to force
+    a reload, since rewriting the plist alone does not affect the loaded agent.
+    """
+    path = launchd_plist_path()
+    try:
+        with path.open("rb") as f:
+            installed = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException):
+        return True
+    for arg in installed.get("ProgramArguments", []):
+        if isinstance(arg, str) and arg.startswith("/") and not Path(arg).exists():
+            return True
+    return installed != build_launchd_plist()
+
+
 def install_service_files() -> Tuple[bool, str]:
     if not daemon_script().is_file():
         return False, f"Missing daemon script: {daemon_script()}"
@@ -210,16 +334,31 @@ def install_service_files() -> Tuple[bool, str]:
 
 
 def start_service() -> Tuple[bool, str]:
+    backend = platform_backend()
+    stale = backend == "launchd" and is_service_installed() and _installed_launchd_plist_stale()
+
     ok, msg = install_service_files()
     if not ok:
         return False, msg
+
+    if stale and is_service_running():
+        # The loaded agent was built from an outdated plist (e.g. its Python was
+        # removed by a Homebrew upgrade); unload so the rewritten one gets used.
+        plist = str(launchd_plist_path())
+        domain = f"gui/{os.getuid()}"
+        proc = _run(["launchctl", "bootout", domain, plist])
+        if proc.returncode != 0:
+            _run(["launchctl", "unload", plist])
+
     if is_service_running():
         return True, "Background scheduler already running"
 
-    backend = platform_backend()
     if backend == "launchd":
         plist = str(launchd_plist_path())
         domain = f"gui/{os.getuid()}"
+        # Clear any persisted disable (a launchctl disable or a Background Task
+        # Management toggle survives reboots and would make bootstrap a no-op).
+        _run(["launchctl", "enable", f"{domain}/{SERVICE_LABEL}"])
         proc = _run(["launchctl", "bootstrap", domain, plist])
         if proc.returncode != 0:
             proc = _run(["launchctl", "load", "-w", plist])

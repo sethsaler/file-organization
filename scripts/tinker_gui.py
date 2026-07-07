@@ -51,6 +51,9 @@ class TinkerApp:
         self.exclude_defaults_var = tk.BooleanVar(value=True)
         self.verbose_var = tk.BooleanVar(value=False)
         self.mime_var = tk.BooleanVar(value=False)
+        self.detect_duplicates_var = tk.BooleanVar(value=False)
+        self.duplicates_hardlink_var = tk.BooleanVar(value=False)
+        self.date_buckets_var = tk.BooleanVar(value=False)
         self.rename_after_organize_var = tk.BooleanVar(value=True)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.expand_subfolders_var = tk.BooleanVar(value=False)
@@ -143,6 +146,9 @@ class TinkerApp:
         ttk.Checkbutton(file_opts, text="Include hidden files and folders", variable=self.hidden_var).pack(anchor="w")
         ttk.Checkbutton(file_opts, text="Collect empty folders into “For Deletion”", variable=self.collect_empty_var).pack(anchor="w")
         ttk.Checkbutton(file_opts, text="Exclude .git, node_modules, venv, …", variable=self.exclude_defaults_var).pack(anchor="w")
+        ttk.Checkbutton(file_opts, text="Detect duplicates (identical content) into “Duplicates”", variable=self.detect_duplicates_var).pack(anchor="w")
+        ttk.Checkbutton(file_opts, text="…keep duplicates in place as hardlinks (no extra disk space)", variable=self.duplicates_hardlink_var).pack(anchor="w", padx=(18, 0))
+        ttk.Checkbutton(file_opts, text="Sort into Year/Month subfolders inside each bucket", variable=self.date_buckets_var).pack(anchor="w")
         row += 1
 
         # Random rename options
@@ -424,6 +430,9 @@ class TinkerApp:
             expand_subfolders=self.expand_subfolders_var.get(),
             random_names_after_organize=self.rename_after_organize_var.get(),
             skip_randomly_renamed=self.skip_randomly_renamed_var.get(),
+            detect_duplicates=self.detect_duplicates_var.get(),
+            duplicates_hardlink=self.duplicates_hardlink_var.get(),
+            date_buckets=self.date_buckets_var.get(),
         )
         self.notebook.select(1)
 
@@ -460,6 +469,12 @@ class TinkerApp:
             cmd.append("--verbose")
         if self.mime_var.get():
             cmd.append("--mime-sniff")
+        if self.detect_duplicates_var.get():
+            cmd.append("--detect-duplicates")
+            if self.duplicates_hardlink_var.get():
+                cmd.append("--duplicates-hardlink")
+        if self.date_buckets_var.get():
+            cmd.append("--date-buckets")
         if self.rename_after_organize_var.get():
             cmd.append("--random-names-after-organize")
         if self.skip_randomly_renamed_var.get():

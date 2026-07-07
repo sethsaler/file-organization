@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 GIF_EXTS: Set[str] = {"GIF"}
 
@@ -72,6 +72,15 @@ def canonical_dir_map(profile: str) -> Dict[str, str]:
     for bucket, _ in buckets_for_profile(profile):
         out[bucket.casefold()] = bucket
     out["other"] = "Other"
+    return out
+
+
+def extension_bucket_map(buckets: List[Tuple[str, Set[str]]]) -> Dict[str, str]:
+    """Flatten an ordered bucket list into ext -> bucket (first bucket wins on overlap)."""
+    out: Dict[str, str] = {}
+    for bucket, exts in buckets:
+        for ext in exts:
+            out.setdefault(ext, bucket)
     return out
 
 

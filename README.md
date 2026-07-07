@@ -17,6 +17,8 @@ It supports recursive modes, dry-run previews, normalization, automatic empty-fo
 - In flatten-root mode (default), collectable empty folder trees are staged into `For Deletion` first (multi-round), then any remaining empty directories (including empty bucket folders) are removed
 - In non-recursive and in-place modes, collectable empty folder trees are staged into a root-level `For Deletion` folder by default; a final pass removes leftover empties
 - Includes hidden files and folders by default; use `--no-include-hidden` to skip dotfiles
+- Optional duplicate detection (`--detect-duplicates`): identical-content files are staged into a root-level `Duplicates` folder instead of their bucket (size-first grouping with lazy hashing, so unique files are never read)
+- Scheduled folders can run daily, on an interval, or in **watch** mode (organize shortly after files change)
 - Emits structured JSON output for scripting and automation
 
 ## Requirements
@@ -48,7 +50,7 @@ python3 ~/.local/share/organize-folder-by-filetype/scripts/tinker_gui.py
 Use the **Schedule** tab in the same app (or the standalone `schedule_gui.py`) to auto-organize folders on a timer. Config is saved to `~/.config/file-organization/schedule.json`.
 
 1. On **Organize**, pick a folder and click **Add to schedule…**, or on **Schedule** click **Add folder…**
-2. Choose **Once daily at** `00:00` for midnight (local time), or **Run every** *N* **minutes**
+2. Choose **Once daily at** `00:00` for midnight (local time), **Run every** *N* **minutes**, or **Watch folders** to organize shortly after files change
 3. Optionally enable **Expand to organize each subfolder separately** to organize each immediate subdirectory independently instead of treating the parent as a single recursive target
 4. Enable **automatic runs** — a background scheduler keeps running after you close the app (LaunchAgent on macOS, systemd user unit on Linux)
 
@@ -103,6 +105,56 @@ To organize each subfolder of a parent directory independently, set `"expand_sub
 ```
 
 Set `max_parallel` in the JSON: **0** means all enabled folders at once (capped at 32); a positive number limits concurrent runs. Example unit files: `install/systemd/`, `install/launchd/`.
+
+### Watch mode (near real-time)
+
+Set `"schedule_mode": "watch"` to organize a folder shortly after files land in it instead of waiting for a timer:
+
+```json
+{
+  "version": 5,
+  "schedule_mode": "watch",
+  "scheduler_enabled": true,
+  "folders": [
+    {
+      "path": "/path/to/your/folder",
+      "enabled": true,
+      "dry_run_verified": true
+    }
+  ]
+}
+```
+
+- **macOS (LaunchAgent):** the agent is installed with launchd `WatchPaths` covering each enabled folder — event-driven, no resident daemon. Runs are throttled to at most one per 15 seconds, with an hourly backstop run in case an event is missed. Re-enable automatic runs (or save in the GUI) after adding/removing folders so the watched path list is refreshed.
+- **Linux / manual (`--foreground`):** the daemon polls a cheap mtime signature (folder root plus immediate subdirectories, one `stat` sweep every 2 s) and fires after the folder has been quiet for 5 s, running only the folder(s) that changed. Note that changes deeper than one level don't bump these mtimes; drop files at the folder root (the normal flow) or within one level for instant pickup.
+- Combine with `min_unsorted_threshold` to only fire once enough files have accumulated.
+
+### Duplicate detection
+
+Add `--detect-duplicates` (CLI), tick "Detect duplicates" (Tinker GUI / Schedule tab), or set `"detect_duplicates": true` on a folder job. During organization each file's size is indexed and, only when two files share a size, their contents are hashed (BLAKE2). Later copies of identical content are staged into a root-level `Duplicates` folder instead of their bucket — nothing is ever deleted, and the moves are recorded in the backup manifest so `--restore` undoes them. Files already inside root bucket folders count as the canonical copies, so re-running against a folder keeps the organized file and stages the new arrival.
+
+### Threshold-gated runs
+
+Set `min_unsorted_threshold` on a folder to skip the run when fewer than N unsorted files have accumulated. The scheduler counts loose files before running — for `flatten-root`, this is files directly at the folder root; for `in-place`, it walks recursively (skipping bucket dirs, `For Deletion`, `.organizer`). Useful with short interval polling so the organizer only fires when there's actual work to do:
+
+```json
+{
+  "version": 5,
+  "schedule_mode": "interval",
+  "interval_minutes": 30,
+  "scheduler_enabled": true,
+  "folders": [
+    {
+      "path": "/path/to/folder",
+      "enabled": true,
+      "dry_run_verified": true,
+      "min_unsorted_threshold": 20
+    }
+  ]
+}
+```
+
+With the above config, launchd fires `--once` every 30 minutes; the scheduler checks the unsorted count and only runs the organizer when ≥ 20 loose files are present. The "Min unsorted files" spinbox in the Schedule tab GUI sets this per folder.
 
 ## Quick start
 
@@ -161,6 +213,9 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--exclude-defaults` — also skip `.git`, `node_modules`, `venv`, `__pycache__`, etc.
 - `--no-follow-symlinks` — do not follow directory symlinks when walking
 - `--mime-sniff` — classify extensionless files from file headers
+- `--detect-duplicates` — stage identical-content copies into `Duplicates` instead of their bucket
+- `--duplicates-hardlink` — with `--detect-duplicates`, keep duplicates in their bucket as hardlinks to the canonical copy (no extra disk space)
+- `--date-buckets` — place files under `Bucket/YYYY/MM` subfolders by modification time
 - `--verbose` — progress on stderr during large runs
 - `--ocr-index` — after organizing, OCR PNG/JPEG under `Images/` into `.organizer/ocr_index.csv` (needs OCR deps)
 - `--collect-empty-dirs` / `--no-collect-empty-dirs` — empty-folder staging (default: on)
@@ -197,6 +252,7 @@ The script prints a JSON summary including:
 - files moved
 - `moved_by_category` — counts per bucket folder
 - collision count
+- `duplicates` — whether detection ran, how many copies were staged, sample moves
 - folders touched
 - normalization stats
 - empty-folder collection stats

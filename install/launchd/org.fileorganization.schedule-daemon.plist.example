@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  Two ways to run the scheduler:
+  Three ways to run the scheduler:
 
   1. Daily mode (recommended for laptops): let launchd own the timing with
      StartCalendarInterval and run a single batch with `--once`. launchd fires at
@@ -14,14 +14,36 @@
      KeepAlive (see the commented block at the bottom). Use this with
      `schedule_mode: interval`.
 
+  3. Watch mode: let launchd fire a one-shot run whenever a watched folder
+     changes (see the WatchPaths block at the bottom). Use this with
+     `schedule_mode: watch`. List each enabled folder under WatchPaths;
+     ThrottleInterval debounces bursts and StartInterval is an hourly backstop.
+
   The GUI ("Enable automatic runs") writes the right variant automatically based
   on your schedule.json; this file is only for manual installs.
+
+  If you use Homebrew Python, point ProgramArguments at the stable symlink
+  (/opt/homebrew/bin/python3 or /usr/local/bin/python3), NOT a versioned path
+  like /opt/homebrew/opt/python@3.14/bin/python3.14 — versioned paths vanish on
+  the next `brew upgrade` and the agent then fails silently on every fire.
+
+  To also run while the Mac is ASLEEP, schedule a daily wake a couple minutes
+  before the calendar time, e.g.:
+      sudo pmset repeat wake MTWRFSU 01:58:00
+  (Lid-closed-on-battery sleep cannot be overridden by software; keep the Mac on
+  power, or lid-open, for unattended overnight runs.)
 -->
 <dict>
   <key>Label</key>
   <string>org.fileorganization.schedule-daemon</string>
   <key>ProgramArguments</key>
   <array>
+    <!-- caffeinate holds a power assertion so a scheduled-wake run does not
+         fall back asleep before the reorganization finishes. -->
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-m</string>
+    <string>-s</string>
     <string>/usr/bin/python3</string>
     <string>-u</string>
     <string>INSTALL_DIR/scripts/schedule_daemon.py</string>
@@ -62,6 +84,41 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>StandardOutPath</key>
+    <string>INSTALL_DIR/logs/schedule-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>INSTALL_DIR/logs/schedule-daemon.err.log</string>
+  </dict>
+-->
+
+<!--
+  Watch-mode alternative (replace the <dict> above with this; one <string> per
+  enabled folder under WatchPaths):
+
+  <dict>
+    <key>Label</key>
+    <string>org.fileorganization.schedule-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/usr/bin/caffeinate</string>
+      <string>-i</string>
+      <string>-m</string>
+      <string>-s</string>
+      <string>/usr/bin/python3</string>
+      <string>-u</string>
+      <string>INSTALL_DIR/scripts/schedule_daemon.py</string>
+      <string>--once</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>INSTALL_DIR/scripts</string>
+    <key>WatchPaths</key>
+    <array>
+      <string>/path/to/your/folder</string>
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+    <key>StartInterval</key>
+    <integer>3600</integer>
     <key>StandardOutPath</key>
     <string>INSTALL_DIR/logs/schedule-daemon.log</string>
     <key>StandardErrorPath</key>

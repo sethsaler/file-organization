@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 from pathlib import Path
 from typing import List, Optional, Sequence, Set
 
@@ -33,12 +34,24 @@ def dir_name_excluded(dir_name: str, patterns: Sequence[str]) -> bool:
 
 
 def path_excluded(path: Path, base: Path, patterns: Sequence[str]) -> bool:
-    try:
-        rel = path.resolve().relative_to(base.resolve())
-    except (ValueError, OSError):
+    if not patterns:
         return False
-    parts = list(rel.parts)
-    rel_s = "/".join(parts)
+    # Fast path: when `path` is textually under `base` (the common case — callers
+    # build paths from walks rooted at an already-resolved base), derive the
+    # relative path with a string prefix strip instead of two resolve() chains
+    # (each an lstat/readlink walk over every path component).
+    path_s = os.fspath(path)
+    base_s = os.fspath(base)
+    if path_s.startswith(base_s + os.sep):
+        rel_s = path_s[len(base_s) + 1 :].replace(os.sep, "/")
+        parts = rel_s.split("/")
+    else:
+        try:
+            rel = path.resolve().relative_to(base.resolve())
+        except (ValueError, OSError):
+            return False
+        parts = list(rel.parts)
+        rel_s = "/".join(parts)
     for pat in patterns:
         if not pat:
             continue

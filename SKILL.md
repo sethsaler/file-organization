@@ -35,6 +35,9 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 - No overwrite ever; collisions are suffixed (_1, _2, ...).
 - Hidden files and folders are included by default (`--no-include-hidden` to exclude dotfiles).
 - With default empty-folder handling (`--collect-empty-dirs`), collectable empty folder trees move to root-level `For Deletion` (multi-round passes), then leftover empty directories are removed (including empty bucket folders). Applies to flatten-root, in-place, and non-recursive runs. Use `--no-collect-empty-dirs` to skip staging.
+- Optional `--detect-duplicates`: identical-content copies (size + BLAKE2 hash, hashed lazily only on size collisions) are staged into a root-level `Duplicates` folder instead of their bucket. Nothing is deleted; moves are in the backup manifest and `Duplicates` is skipped on later runs. Files already in root bucket folders count as the canonical copies. Cloud-placeholder files with no local data (undownloaded iCloud items) are never hashed, so runs cannot trigger downloads.
+- Optional `--duplicates-hardlink` (with `--detect-duplicates`): duplicates stay in their bucket as hardlinks to the canonical copy (zero extra disk space) instead of moving to `Duplicates`; falls back to a plain move if the filesystem cannot hardlink.
+- Optional `--date-buckets`: files land under `Bucket/YYYY/MM` (by modification time) in every mode.
 
 ## Modes
 
@@ -59,10 +62,11 @@ Performance characteristics:
 
 - single command execution for main operation
 - O(N) directory walk for movement stage
-- top-down walk skips only `For Deletion` / `.organizer`; follows directory symlinks with inode cycle guard
+- top-down walk skips only `For Deletion` / `.organizer` (and `Duplicates` when duplicate detection is on); follows directory symlinks with inode cycle guard
+- O(1) extension→bucket lookup via a precomputed map; per-directory `resolve()` caching on the move path
 - optional bottom-up normalization pass only when requested
 - structured JSON output for direct reporting
-- dry-run mode for fast planning and validation without writes
+- dry-run mode for fast planning and validation without writes; the empty-folder preview is simulated in memory (no temp-dir tree clone)
 
 ## Project structure
 
@@ -71,7 +75,7 @@ Performance characteristics:
 - `scripts/schedule_panel.py` — shared Schedule tab / panel (folder list, timing, worker)
 - `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
 - `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
-- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel
+- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop polls folder mtimes and organizes shortly after files change (macOS installs a launchd `WatchPaths` agent instead)
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
 - **Background scheduling:** enabling automatic runs in the Schedule tab installs a LaunchAgent (macOS) or systemd user unit (Linux) so `schedule_daemon.py` keeps running after the app closes. See `scripts/schedule_service.py`.
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI

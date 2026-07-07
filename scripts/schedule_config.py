@@ -11,12 +11,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+from org_buckets import bucket_names_for_profile
 from org_paths import normalize_folder_input
 
 
@@ -24,7 +25,13 @@ CONFIG_VERSION = 5
 
 SCHEDULE_MODE_INTERVAL = "interval"
 SCHEDULE_MODE_DAILY = "daily"
+SCHEDULE_MODE_WATCH = "watch"
 DEFAULT_DAILY_TIME = "00:00"
+
+# Watch mode: how often the foreground daemon polls folder mtimes, and how long a
+# folder must stay quiet after a change before a run fires (lets copies finish).
+WATCH_POLL_SECONDS = 2.0
+WATCH_QUIET_SECONDS = 5.0
 
 
 def _helper_script() -> Path:
@@ -63,6 +70,11 @@ class FolderJob:
     expand_subfolders: bool = False
     random_names_after_organize: bool = True
     skip_randomly_renamed: bool = True
+    min_unsorted_threshold: int = 0
+    detect_duplicates: bool = False
+    duplicates_hardlink: bool = False
+    date_buckets: bool = False
+    timeout_minutes: int = 60  # 0 = no timeout
 
 
 def parse_daily_time(value: str) -> Tuple[int, int]:
@@ -90,7 +102,11 @@ def normalize_daily_time(value: str) -> str:
 
 def normalize_schedule_mode(value: str) -> str:
     mode = (value or SCHEDULE_MODE_INTERVAL).strip().casefold()
-    return SCHEDULE_MODE_DAILY if mode == SCHEDULE_MODE_DAILY else SCHEDULE_MODE_INTERVAL
+    if mode == SCHEDULE_MODE_DAILY:
+        return SCHEDULE_MODE_DAILY
+    if mode == SCHEDULE_MODE_WATCH:
+        return SCHEDULE_MODE_WATCH
+    return SCHEDULE_MODE_INTERVAL
 
 
 def seconds_until_next_daily_run(
@@ -110,16 +126,44 @@ def seconds_until_next_daily_run(
 
 def wait_seconds_after_run(cfg: ScheduleConfig) -> float:
     """How long to sleep after a batch before the next scheduled run."""
-    if normalize_schedule_mode(cfg.schedule_mode) == SCHEDULE_MODE_DAILY:
+    mode = normalize_schedule_mode(cfg.schedule_mode)
+    if mode == SCHEDULE_MODE_DAILY:
         return seconds_until_next_daily_run(cfg.daily_time)
+    if mode == SCHEDULE_MODE_WATCH:
+        return WATCH_POLL_SECONDS
     minutes = max(1, min(10080, int(cfg.interval_minutes)))
     return float(minutes * 60)
 
 
+def watch_signature(job: FolderJob) -> Tuple[float, ...]:
+    """Cheap change signature for watch mode: mtime of the folder root plus its
+    immediate subdirectories (a new/removed direct entry bumps the parent mtime)."""
+    base = normalize_folder_input(job.path)
+    sig: List[float] = []
+    try:
+        sig.append(os.stat(base).st_mtime)
+    except OSError:
+        return (0.0,)
+    try:
+        with os.scandir(base) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        sig.append(entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return tuple(sig)
+
+
 def estimate_seconds_until_next_run(cfg: ScheduleConfig) -> float:
     """Best-effort countdown until the next scheduled batch (for UI display)."""
-    if normalize_schedule_mode(cfg.schedule_mode) == SCHEDULE_MODE_DAILY:
+    mode = normalize_schedule_mode(cfg.schedule_mode)
+    if mode == SCHEDULE_MODE_DAILY:
         return seconds_until_next_daily_run(cfg.daily_time)
+    if mode == SCHEDULE_MODE_WATCH:
+        return 0.0
 
     interval_sec = float(max(1, min(10080, int(cfg.interval_minutes))) * 60)
     latest: Optional[datetime] = None
@@ -150,6 +194,7 @@ class ScheduleConfig:
     scheduler_enabled: bool = False
     max_parallel: int = 0
     max_failures_before_disable: int = 5
+    notify_on_run: bool = True
     folders: List[FolderJob] = field(default_factory=list)
 
     def to_json_dict(self) -> Dict[str, Any]:
@@ -166,6 +211,8 @@ class ScheduleConfig:
             d["max_parallel"] = self.max_parallel
         if self.max_failures_before_disable != 5:
             d["max_failures_before_disable"] = self.max_failures_before_disable
+        if not self.notify_on_run:
+            d["notify_on_run"] = False
         return d
 
     @classmethod
@@ -213,6 +260,11 @@ class ScheduleConfig:
                     expand_subfolders=bool(item.get("expand_subfolders", False)),
                     random_names_after_organize=bool(item.get("random_names_after_organize", True)),
                     skip_randomly_renamed=bool(item.get("skip_randomly_renamed", True)),
+                    min_unsorted_threshold=max(0, int(item.get("min_unsorted_threshold", 0))),
+                    detect_duplicates=bool(item.get("detect_duplicates", False)),
+                    duplicates_hardlink=bool(item.get("duplicates_hardlink", False)),
+                    date_buckets=bool(item.get("date_buckets", False)),
+                    timeout_minutes=max(0, min(1440, int(item.get("timeout_minutes", 60)))),
                 )
             )
         max_parallel = max(0, min(128, int(data.get("max_parallel", 0))))
@@ -226,6 +278,7 @@ class ScheduleConfig:
             scheduler_enabled=bool(data.get("scheduler_enabled", False)),
             max_parallel=max_parallel,
             max_failures_before_disable=mfd,
+            notify_on_run=bool(data.get("notify_on_run", True)),
             folders=folders,
         )
 
@@ -290,6 +343,12 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
         cmd.append("--random-names-after-organize")
     if job.skip_randomly_renamed:
         cmd.append("--skip-randomly-renamed")
+    if job.detect_duplicates:
+        cmd.append("--detect-duplicates")
+        if job.duplicates_hardlink:
+            cmd.append("--duplicates-hardlink")
+    if job.date_buckets:
+        cmd.append("--date-buckets")
     cmd.append("--backup")
     if dry_run:
         cmd.append("--dry-run")
@@ -345,10 +404,61 @@ def expand_subfolders(job: FolderJob) -> List[FolderJob]:
                 expand_subfolders=False,
                 random_names_after_organize=job.random_names_after_organize,
                 skip_randomly_renamed=job.skip_randomly_renamed,
+                min_unsorted_threshold=job.min_unsorted_threshold,
+                detect_duplicates=job.detect_duplicates,
             )
             subfolders.append(sub_job)
 
     return subfolders if subfolders else [job]
+
+
+_ALWAYS_SKIP_DIRS: Set[str] = {".organizer", "For Deletion"}
+
+
+def count_unsorted_files(job: FolderJob, *, stop_at: int = 0) -> int:
+    """Count loose files that would be moved by an organize run.
+
+    For ``flatten-root`` (or non-recursive): counts regular files directly at the
+    folder root, excluding ``.DS_Store``.
+
+    For ``in-place`` recursive: walks the tree, skipping directories whose names
+    match bucket names (from the job's profile) or ``.organizer`` / ``For Deletion``,
+    and counts regular files (excluding ``.DS_Store``) in each remaining directory.
+
+    If *stop_at* > 0, stops early once the count reaches that value.
+    """
+    base = normalize_folder_input(job.path)
+    if not base.is_dir():
+        return 0
+
+    bucket_names: Set[str] = set()
+    try:
+        for name in bucket_names_for_profile(job.profile):
+            bucket_names.add(name.casefold())
+    except (ValueError, OSError):
+        bucket_names = {b.casefold() for b in bucket_names_for_profile("standard")}
+
+    skip_dirs = bucket_names | {d.casefold() for d in _ALWAYS_SKIP_DIRS}
+
+    if job.strategy == "in-place" and job.recursive:
+        count = 0
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d.casefold() not in skip_dirs]
+            for fname in files:
+                if fname == ".DS_Store":
+                    continue
+                count += 1
+                if stop_at > 0 and count >= stop_at:
+                    return count
+        return count
+
+    count = 0
+    for item in base.iterdir():
+        if item.is_file() and item.name != ".DS_Store":
+            count += 1
+            if stop_at > 0 and count >= stop_at:
+                return count
+    return count
 
 
 def run_dry_run_preview(job: FolderJob) -> Tuple[bool, str]:
@@ -377,11 +487,12 @@ def _run_single_job(args: Tuple[int, FolderJob, List[str]]) -> Tuple[int, str, O
     if not base.is_dir():
         ts = datetime.now(timezone.utc).isoformat()
         return idx, ts, "path missing or not a directory", "", "", 1
+    timeout_sec = job.timeout_minutes * 60 if job.timeout_minutes > 0 else None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     except subprocess.TimeoutExpired:
         ts = datetime.now(timezone.utc).isoformat()
-        return idx, ts, "timed out after 1 hour", "", "", 1
+        return idx, ts, f"timed out after {job.timeout_minutes} minute(s)", "", "", 1
     except OSError as e:
         ts = datetime.now(timezone.utc).isoformat()
         return idx, ts, str(e), "", "", 1
@@ -401,8 +512,12 @@ def run_enabled_folders(
     log: Optional[Callable[[str], None]] = None,
     label: str = "run",
     file_log_path: Optional[Path] = None,
-) -> None:
-    from org_logging import append_log_line
+    only_paths: Optional[Set[str]] = None,
+) -> Dict[str, int]:
+    """Run all runnable enabled folders; returns {"ran", "failed", "skipped"} counts."""
+    from org_logging import append_history_entry, append_log_line
+
+    result = {"ran": 0, "failed": 0, "skipped": 0}
 
     conflicts = find_path_conflicts(cfg)
     if conflicts and log:
@@ -417,6 +532,8 @@ def run_enabled_folders(
     for idx, job in enumerate(cfg.folders):
         if not job.enabled:
             continue
+        if only_paths is not None and job.path not in only_paths:
+            continue
         expanded = expand_subfolders(job)
         for sub_job in expanded:
             expanded_jobs.append((idx, sub_job))
@@ -430,12 +547,28 @@ def run_enabled_folders(
                 )
             if file_log_path:
                 append_log_line(file_log_path, f"{job.path}: skipped (dry-run not verified)")
+            result["skipped"] += 1
             continue
+        if job.min_unsorted_threshold > 0:
+            unsorted = count_unsorted_files(job, stop_at=job.min_unsorted_threshold)
+            if unsorted < job.min_unsorted_threshold:
+                result["skipped"] += 1
+                if log:
+                    log(
+                        f"\n[skip {job.path}]: {unsorted} unsorted file(s) "
+                        f"< threshold {job.min_unsorted_threshold}\n"
+                    )
+                if file_log_path:
+                    append_log_line(
+                        file_log_path,
+                        f"{job.path}: skipped ({unsorted} < {job.min_unsorted_threshold} unsorted)",
+                    )
+                continue
         cmd = build_organize_cmd(job)
         tasks.append((idx, job, cmd))
 
     if not tasks:
-        return
+        return result
 
     workers = _effective_max_workers(len(tasks), mp)
     msg = f"{label}: {len(tasks)} folder(s), up to {workers} parallel"
@@ -445,9 +578,14 @@ def run_enabled_folders(
         append_log_line(file_log_path, msg)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_run_single_job, t): t[0] for t in tasks}
+        futures = {ex.submit(_run_single_job, t): (t[0], t[1]) for t in tasks}
         for fut in as_completed(futures):
             idx, ts, last_err, out, err, rc = fut.result()
+            task_job = futures[fut][1]
+            result["ran"] += 1
+            if last_err:
+                result["failed"] += 1
+            append_history_entry(_history_record(task_job, label, last_err, out))
             if 0 <= idx < len(cfg.folders):
                 job = cfg.folders[idx]
                 job.last_run = ts
@@ -479,3 +617,26 @@ def run_enabled_folders(
         save_config(config_path, cfg)
     except OSError:
         pass
+    return result
+
+
+def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: str) -> Dict[str, Any]:
+    """Compact per-run history entry; pulls key stats from the organizer's JSON summary."""
+    rec: Dict[str, Any] = {"path": job.path, "label": label, "ok": not last_err}
+    if last_err:
+        rec["error"] = last_err
+    start = out.find("{")
+    if start != -1:
+        try:
+            summary = json.loads(out[start:])
+        except ValueError:
+            return rec
+        if isinstance(summary, dict):
+            rec["files_moved"] = summary.get("files_moved")
+            dup = summary.get("duplicates")
+            if isinstance(dup, dict) and dup.get("enabled"):
+                rec["duplicates_moved"] = dup.get("files_moved")
+            efc = summary.get("empty_folder_collection")
+            if isinstance(efc, dict) and efc.get("folders_moved"):
+                rec["empty_dirs_staged"] = efc.get("folders_moved")
+    return rec
