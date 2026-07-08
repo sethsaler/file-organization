@@ -50,6 +50,35 @@ from schedule_service import (
 )
 
 
+class CollapsibleFrame(ttk.Frame):
+    """A grid-based frame with a toggle button that shows or hides its child frame."""
+
+    def __init__(self, parent: tk.Widget, title: str, *, expanded: bool = False, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        self._title = title
+        self._expanded = expanded
+        self.columnconfigure(0, weight=1)
+        self._button = ttk.Button(self, text=self._button_text(), command=self._toggle)
+        self._button.grid(row=0, column=0, sticky="ew")
+        self.content = ttk.Frame(self)
+        if expanded:
+            self.content.grid(row=1, column=0, sticky="nsew")
+            self.rowconfigure(1, weight=1)
+
+    def _button_text(self) -> str:
+        return f"Hide {self._title}" if self._expanded else f"Show {self._title}"
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._button.configure(text=self._button_text())
+        if self._expanded:
+            self.content.grid(row=1, column=0, sticky="nsew")
+            self.rowconfigure(1, weight=1)
+        else:
+            self.content.grid_forget()
+            self.rowconfigure(1, weight=0)
+
+
 class SchedulePanel(ttk.Frame):
     """Schedule UI + background worker; pack into a tab or standalone window."""
 
@@ -206,8 +235,15 @@ class SchedulePanel(ttk.Frame):
         ttk.Button(btn_row, text="History…", command=self._show_history).pack(side="left", padx=(6, 0))
 
         row += 1
-        detail = ttk.LabelFrame(frm, text="Selected folder options", padding=8)
-        detail.grid(row=row, column=0, sticky="ew", **pad)
+        collapsible = CollapsibleFrame(frm, "Selected folder options")
+        collapsible.grid(row=row, column=0, sticky="ew", **pad)
+        collapsible.columnconfigure(0, weight=1)
+
+        content = collapsible.content
+        content.columnconfigure(0, weight=1)
+
+        detail = ttk.Frame(content, padding=8)
+        detail.grid(row=0, column=0, sticky="nsew")
         detail.columnconfigure(1, weight=1)
 
         self.enabled_var = tk.BooleanVar(value=True)

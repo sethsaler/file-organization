@@ -33,7 +33,37 @@ def _rename_script() -> Path:
     return _SCRIPT_DIR / "rename_files_randomly.py"
 
 
+_OUTPUT_FONT = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10)
+
+
+class CollapsibleFrame(ttk.Frame):
+    """A frame with a toggle button that shows or hides its child frame."""
+
+    def __init__(self, parent: tk.Widget, title: str, *, expanded: bool = False, **kwargs) -> None:
+        super().__init__(parent, **kwargs)
+        self._title = title
+        self._expanded = expanded
+        self._button = ttk.Button(self, text=self._button_text(), command=self._toggle)
+        self._button.pack(fill="x")
+        self.content = ttk.Frame(self)
+        if expanded:
+            self.content.pack(fill="x", expand=True)
+
+    def _button_text(self) -> str:
+        return f"Hide {self._title}" if self._expanded else f"Show {self._title}"
+
+    def _toggle(self) -> None:
+        self._expanded = not self._expanded
+        self._button.configure(text=self._button_text())
+        if self._expanded:
+            self.content.pack(fill="x", expand=True)
+        else:
+            self.content.pack_forget()
+
+
 class TinkerApp:
+    """Simple Tkinter front end for the organizer and random-renamer scripts."""
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Organize by file type")
@@ -41,6 +71,7 @@ class TinkerApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
+        # Organize tab state
         self.path_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=True)
         self.strategy_var = tk.StringVar(value="flatten-root")
@@ -58,14 +89,14 @@ class TinkerApp:
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.expand_subfolders_var = tk.BooleanVar(value=False)
 
-        # Random rename tab variables
+        # Random rename tab state
         self.rename_path_var = tk.StringVar()
         self.rename_recursive_var = tk.BooleanVar(value=True)
         self.rename_hidden_var = tk.BooleanVar(value=True)
         self.rename_verbose_var = tk.BooleanVar(value=False)
         self.rename_skip_randomly_renamed_var = tk.BooleanVar(value=True)
 
-        # Background command execution state
+        # Background worker state
         self._out_queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
         self._active_proc: subprocess.Popen | None = None
@@ -78,9 +109,9 @@ class TinkerApp:
         notebook.grid(row=0, column=0, sticky="nsew")
         self.notebook = notebook
 
-        organize_tab = ttk.Frame(notebook, padding=10)
+        organize_tab = ttk.Frame(notebook)
         schedule_tab = ttk.Frame(notebook)
-        rename_tab = ttk.Frame(notebook, padding=10)
+        rename_tab = ttk.Frame(notebook)
         notebook.add(organize_tab, text="Organize")
         notebook.add(schedule_tab, text="Schedule")
         notebook.add(rename_tab, text="Random Rename")
@@ -96,162 +127,159 @@ class TinkerApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if not _helper_script().is_file():
-            self._append_text(f"Missing helper:\n{_helper_script()}\n")
+            self._append_to("organize", f"Missing helper:\n{_helper_script()}\n")
         if not _rename_script().is_file():
-            self._append_text(f"Missing rename script:\n{_rename_script()}\n")
+            self._append_to("organize", f"Missing rename script:\n{_rename_script()}\n")
 
-    def _build_organize_tab(self, frm: ttk.Frame) -> None:
-        pad = {"padx": 8, "pady": 4}
-        row = 0
-        frm.columnconfigure(1, weight=1)
+    # --------------------------------------------------------------------- #
+    # Common UI builders
+    # --------------------------------------------------------------------- #
 
-        ttk.Label(frm, text="Folder:").grid(row=row, column=0, sticky="w", **pad)
-        self.path_entry = tk.Entry(frm, textvariable=self.path_var)
-        self.path_entry.grid(row=row, column=1, sticky="ew", **pad)
-        self._bind_path_entry_clipboard(self.path_entry)
-        ttk.Button(frm, text="Browse…", command=self._browse).grid(row=row, column=2, **pad)
-        row += 1
+    def _make_path_row(self, parent: ttk.Frame, var: tk.StringVar, title: str) -> tk.Entry:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Label(row, text="Folder:").pack(side="left")
+        entry = tk.Entry(row, textvariable=var)
+        entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self._bind_path_entry_clipboard(entry)
+        ttk.Button(row, text="Browse…", command=lambda: self._browse(var, title)).pack(side="left")
+        return entry
 
-        ttk.Checkbutton(frm, text="Recursive", variable=self.recursive_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad
-        )
-        row += 1
+    def _make_output(self, parent: ttk.Frame) -> scrolledtext.ScrolledText:
+        header = ttk.Frame(parent)
+        header.pack(fill="x", pady=(8, 0))
+        ttk.Label(header, text="Output:").pack(side="left")
+        ttk.Label(header, textvariable=self.status_var, foreground="gray").pack(side="right")
+        out = scrolledtext.ScrolledText(parent, height=14, wrap="word", font=_OUTPUT_FONT)
+        out.pack(fill="both", expand=True, pady=(4, 0))
+        return out
 
-        prof = ttk.LabelFrame(frm, text="Profile", padding=6)
-        prof.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
+    def _make_label_frame(self, parent: ttk.Frame, title: str) -> ttk.LabelFrame:
+        group = ttk.LabelFrame(parent, text=title, padding=6)
+        group.pack(fill="x", pady=4)
+        return group
+
+    def _make_check(self, parent: ttk.Widget, text: str, variable: tk.BooleanVar, **kwargs) -> ttk.Checkbutton:
+        btn = ttk.Checkbutton(parent, text=text, variable=variable)
+        btn.pack(anchor="w", **kwargs)
+        return btn
+
+    def _make_radio(self, parent: ttk.Widget, text: str, variable: tk.StringVar, value: str, **kwargs) -> ttk.Radiobutton:
+        btn = ttk.Radiobutton(parent, text=text, variable=variable, value=value)
+        btn.pack(anchor="w", **kwargs)
+        return btn
+
+    def _make_button_row(self, parent: ttk.Frame, buttons: list[tuple[str, object, str, str | None, dict | None]]) -> None:
+        """Pack a row of buttons.
+
+        Each entry is (text, command, side, kind, pack_options):
+          - kind: "run" (disabled while busy), "cancel" (enabled while busy), or None.
+          - pack_options: extra kwargs for pack, or None.
+        """
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=4)
+        for text, command, side, kind, pack_opts in buttons:
+            pack_opts = pack_opts or {}
+            btn = ttk.Button(row, text=text, command=command)
+            btn.pack(side=side, **pack_opts)
+            if kind == "run":
+                self._run_buttons.append(btn)
+            elif kind == "cancel":
+                self._cancel_buttons.append(btn)
+
+    def _make_collapsible(self, parent: ttk.Frame, title: str, *, expanded: bool = False) -> ttk.Frame:
+        frame = CollapsibleFrame(parent, title, expanded=expanded)
+        frame.pack(fill="x", pady=4)
+        return frame.content
+
+    # --------------------------------------------------------------------- #
+    # Tabs
+    # --------------------------------------------------------------------- #
+
+    def _build_organize_tab(self, tab: ttk.Frame) -> None:
+        frm = ttk.Frame(tab, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        self.path_entry = self._make_path_row(frm, self.path_var, "Choose folder to organize")
+        self._make_check(frm, "Recursive", self.recursive_var)
+
+        group = self._make_label_frame(frm, "Profile")
         ttk.Combobox(
-            prof,
+            group,
             textvariable=self.profile_var,
             values=("standard", "extended"),
             state="readonly",
             width=24,
         ).pack(anchor="w")
-        row += 1
 
-        strat = ttk.LabelFrame(frm, text="Recursive strategy", padding=6)
-        strat.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Radiobutton(strat, text="Flatten to root buckets", variable=self.strategy_var, value="flatten-root").pack(anchor="w")
-        ttk.Radiobutton(strat, text="In-place", variable=self.strategy_var, value="in-place").pack(anchor="w")
-        row += 1
+        group = self._make_label_frame(frm, "Recursive strategy")
+        self._make_radio(group, "Flatten to root buckets", self.strategy_var, "flatten-root")
+        self._make_radio(group, "In-place", self.strategy_var, "in-place")
 
-        norm = ttk.LabelFrame(frm, text="Normalization", padding=6)
-        norm.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Radiobutton(norm, text="Standard", variable=self.normalize_var, value="standard").pack(anchor="w")
-        ttk.Radiobutton(norm, text="None", variable=self.normalize_var, value="none").pack(anchor="w")
-        row += 1
+        group = self._make_label_frame(frm, "Normalization")
+        self._make_radio(group, "Standard", self.normalize_var, "standard")
+        self._make_radio(group, "None", self.normalize_var, "none")
 
-        # File handling options
-        file_opts = ttk.LabelFrame(frm, text="File handling", padding=6)
-        file_opts.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Checkbutton(file_opts, text="Include hidden files and folders", variable=self.hidden_var).pack(anchor="w")
-        ttk.Checkbutton(file_opts, text="Collect empty folders into “For Deletion”", variable=self.collect_empty_var).pack(anchor="w")
-        ttk.Checkbutton(file_opts, text="Exclude .git, node_modules, venv, …", variable=self.exclude_defaults_var).pack(anchor="w")
-        ttk.Checkbutton(file_opts, text="Detect duplicates (identical content) into “Duplicates”", variable=self.detect_duplicates_var).pack(anchor="w")
-        ttk.Checkbutton(file_opts, text="…keep duplicates in place as hardlinks (no extra disk space)", variable=self.duplicates_hardlink_var).pack(anchor="w", padx=(18, 0))
-        ttk.Checkbutton(file_opts, text="Sort into Year/Month subfolders inside each bucket", variable=self.date_buckets_var).pack(anchor="w")
-        row += 1
+        advanced = self._make_collapsible(frm, "Advanced options")
 
-        # Random rename options
-        rename_opts = ttk.LabelFrame(frm, text="Random rename (default: on)", padding=6)
-        rename_opts.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Checkbutton(rename_opts, text="Rename all files with random names after organizing", variable=self.rename_after_organize_var).pack(anchor="w")
-        ttk.Checkbutton(rename_opts, text="Skip already-randomly-renamed files (16-char names)", variable=self.skip_randomly_renamed_var).pack(anchor="w")
-        row += 1
+        group = self._make_label_frame(advanced, "File handling")
+        self._make_check(group, "Include hidden files and folders", self.hidden_var)
+        self._make_check(group, "Collect empty folders into “For Deletion”", self.collect_empty_var)
+        self._make_check(group, "Exclude .git, node_modules, venv, …", self.exclude_defaults_var)
+        self._make_check(group, "Detect duplicates (identical content) into “Duplicates”", self.detect_duplicates_var)
+        self._make_check(group, "…keep duplicates in place as hardlinks (no extra disk space)", self.duplicates_hardlink_var, padx=(18, 0))
+        self._make_check(group, "Sort into Year/Month subfolders inside each bucket", self.date_buckets_var)
 
-        # Advanced options
-        adv_opts = ttk.LabelFrame(frm, text="Advanced", padding=6)
-        adv_opts.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Checkbutton(adv_opts, text="Verbose progress (stderr)", variable=self.verbose_var).pack(anchor="w")
-        ttk.Checkbutton(adv_opts, text="MIME-sniff extensionless files", variable=self.mime_var).pack(anchor="w")
-        ttk.Checkbutton(adv_opts, text="Expand to organize each subfolder separately", variable=self.expand_subfolders_var).pack(anchor="w")
-        row += 1
+        group = self._make_label_frame(advanced, "Random rename (default: on)")
+        self._make_check(group, "Rename all files with random names after organizing", self.rename_after_organize_var)
+        self._make_check(group, "Skip already-randomly-renamed files (16-char names)", self.skip_randomly_renamed_var)
 
-        btn_row = ttk.Frame(frm)
-        btn_row.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        dry_btn = ttk.Button(btn_row, text="Dry run", command=lambda: self._run(dry_run=True))
-        dry_btn.pack(side="left", padx=(0, 6))
-        run_btn = ttk.Button(btn_row, text="Run", command=lambda: self._run(dry_run=False))
-        run_btn.pack(side="left", padx=(0, 6))
-        restore_btn = ttk.Button(btn_row, text="Restore…", command=self._restore)
-        restore_btn.pack(side="left", padx=(0, 6))
-        ttk.Button(btn_row, text="Add to schedule…", command=self._add_to_schedule).pack(side="left")
-        cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel, state="disabled")
-        cancel_btn.pack(side="right")
-        ttk.Button(btn_row, text="Clear", command=lambda: self.out.delete("1.0", "end")).pack(side="right", padx=(0, 6))
-        self._run_buttons.extend([dry_btn, run_btn, restore_btn])
-        self._cancel_buttons.append(cancel_btn)
-        row += 1
+        group = self._make_label_frame(advanced, "Advanced")
+        self._make_check(group, "Verbose progress (stderr)", self.verbose_var)
+        self._make_check(group, "MIME-sniff extensionless files", self.mime_var)
+        self._make_check(group, "Expand to organize each subfolder separately", self.expand_subfolders_var)
 
-        out_header = ttk.Frame(frm)
-        out_header.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        ttk.Label(out_header, text="Output (JSON or errors):").pack(side="left")
-        ttk.Label(out_header, textvariable=self.status_var, foreground="gray").pack(side="right")
-        row += 1
-        self.out = scrolledtext.ScrolledText(
+        self._make_button_row(
             frm,
-            height=14,
-            wrap="word",
-            font=("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10),
+            [
+                ("Dry run", lambda: self._run_organize(True), "left", "run", {"padx": (0, 6)}),
+                ("Run", lambda: self._run_organize(False), "left", "run", {"padx": (0, 6)}),
+                ("Restore…", self._restore, "left", "run", {"padx": (0, 6)}),
+                ("Add to schedule…", self._add_to_schedule, "left", None, {}),
+                ("Cancel", self._cancel, "right", "cancel", {}),
+                ("Clear", lambda: self.out.delete("1.0", "end"), "right", None, {"padx": (0, 6)}),
+            ],
         )
-        self.out.grid(row=row, column=0, columnspan=3, sticky="nsew", **pad)
-        frm.rowconfigure(row, weight=1)
 
-    def _build_rename_tab(self, frm: ttk.Frame) -> None:
-        """Build the Random Rename tab UI."""
-        pad = {"padx": 8, "pady": 4}
-        row = 0
-        frm.columnconfigure(1, weight=1)
+        self.out = self._make_output(frm)
 
-        ttk.Label(frm, text="Folder:").grid(row=row, column=0, sticky="w", **pad)
-        self.rename_path_entry = tk.Entry(frm, textvariable=self.rename_path_var)
-        self.rename_path_entry.grid(row=row, column=1, sticky="ew", **pad)
-        self._bind_path_entry_clipboard(self.rename_path_entry)
-        ttk.Button(frm, text="Browse…", command=self._rename_browse).grid(row=row, column=2, **pad)
-        row += 1
+    def _build_rename_tab(self, tab: ttk.Frame) -> None:
+        frm = ttk.Frame(tab, padding=10)
+        frm.pack(fill="both", expand=True)
 
-        ttk.Checkbutton(frm, text="Recursive (all subfolders)", variable=self.rename_recursive_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad
-        )
-        row += 1
+        self.rename_path_entry = self._make_path_row(frm, self.rename_path_var, "Choose folder for random renaming")
+        self._make_check(frm, "Recursive (all subfolders)", self.rename_recursive_var)
+        self._make_check(frm, "Include hidden files", self.rename_hidden_var)
 
-        ttk.Checkbutton(frm, text="Include hidden files", variable=self.rename_hidden_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad
-        )
-        row += 1
+        advanced = self._make_collapsible(frm, "Advanced options")
+        self._make_check(advanced, "Verbose progress", self.rename_verbose_var)
+        self._make_check(advanced, "Skip already-randomly-renamed files (16-char names)", self.rename_skip_randomly_renamed_var)
 
-        ttk.Checkbutton(frm, text="Verbose progress", variable=self.rename_verbose_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad
-        )
-        row += 1
-
-        ttk.Checkbutton(frm, text="Skip already-randomly-renamed files (16-char names)", variable=self.rename_skip_randomly_renamed_var).grid(
-            row=row, column=0, columnspan=3, sticky="w", **pad
-        )
-        row += 1
-
-        btn_row = ttk.Frame(frm)
-        btn_row.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
-        dry_btn = ttk.Button(btn_row, text="Dry run", command=lambda: self._run_rename(dry_run=True))
-        dry_btn.pack(side="left", padx=(0, 6))
-        run_btn = ttk.Button(btn_row, text="Run", command=lambda: self._run_rename(dry_run=False))
-        run_btn.pack(side="left")
-        cancel_btn = ttk.Button(btn_row, text="Cancel", command=self._cancel, state="disabled")
-        cancel_btn.pack(side="right")
-        ttk.Button(btn_row, text="Clear", command=lambda: self.rename_out.delete("1.0", "end")).pack(side="right", padx=(0, 6))
-        self._run_buttons.extend([dry_btn, run_btn])
-        self._cancel_buttons.append(cancel_btn)
-        row += 1
-
-        ttk.Label(frm, text="Output:").grid(row=row, column=0, columnspan=3, sticky="w", **pad)
-        row += 1
-        self.rename_out = scrolledtext.ScrolledText(
+        self._make_button_row(
             frm,
-            height=14,
-            wrap="word",
-            font=("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10),
+            [
+                ("Dry run", lambda: self._run_rename(True), "left", "run", {"padx": (0, 6)}),
+                ("Run", lambda: self._run_rename(False), "left", "run", {}),
+                ("Cancel", self._cancel, "right", "cancel", {}),
+                ("Clear", lambda: self.rename_out.delete("1.0", "end"), "right", None, {"padx": (0, 6)}),
+            ],
         )
-        self.rename_out.grid(row=row, column=0, columnspan=3, sticky="nsew", **pad)
-        frm.rowconfigure(row, weight=1)
+
+        self.rename_out = self._make_output(frm)
+
+    # --------------------------------------------------------------------- #
+    # Event handlers
+    # --------------------------------------------------------------------- #
 
     def _on_close(self) -> None:
         self._cancel_requested = True
@@ -264,15 +292,10 @@ class TinkerApp:
         self.schedule_panel.shutdown()
         self.root.destroy()
 
-    def _browse(self) -> None:
-        d = filedialog.askdirectory(title="Choose folder to organize")
+    def _browse(self, var: tk.StringVar, title: str) -> None:
+        d = filedialog.askdirectory(title=title)
         if d:
-            self.path_var.set(d)
-
-    def _rename_browse(self) -> None:
-        d = filedialog.askdirectory(title="Choose folder for random renaming")
-        if d:
-            self.rename_path_var.set(d)
+            var.set(d)
 
     def _bind_path_entry_clipboard(self, entry: tk.Entry) -> None:
         """Cmd+V fallback for macOS when the default Entry paste binding fails."""
@@ -280,8 +303,8 @@ class TinkerApp:
             entry.bind("<Command-v>", self._on_path_paste)
             entry.bind("<Command-V>", self._on_path_paste)
 
-    def _on_path_paste(self, event: tk.Event | None = None) -> str:
-        entry = event.widget if event is not None else self.path_entry
+    def _on_path_paste(self, event: tk.Event) -> str:
+        entry = event.widget
         try:
             clip = self.root.clipboard_get()
         except tk.TclError:
@@ -294,26 +317,25 @@ class TinkerApp:
         entry.insert(tk.INSERT, clip)
         return "break"
 
-    def _append_text(self, s: str) -> None:
-        self.out.insert("end", s)
-        self.out.see("end")
+    # --------------------------------------------------------------------- #
+    # Background command execution
+    # --------------------------------------------------------------------- #
 
-    def _append_rename_text(self, s: str) -> None:
-        self.rename_out.insert("end", s)
-        self.rename_out.see("end")
+    def _append_to(self, target: str, s: str) -> None:
+        out = self.rename_out if target == "rename" else self.out
+        out.insert("end", s)
+        out.see("end")
 
-    def _parse_folder_path(self, raw: str | None = None) -> Path | None:
-        text = self.path_var.get() if raw is None else raw
-        if not text.strip():
+    def _resolve_path(self, var: tk.StringVar) -> Path | None:
+        text = var.get().strip()
+        if not text:
             return None
         return normalize_folder_input(text)
 
-    def _show_resolved_path(self, path: Path) -> None:
+    def _show_resolved_path(self, var: tk.StringVar, path: Path) -> None:
         resolved = str(path)
-        if self.path_var.get() != resolved:
-            self.path_var.set(resolved)
-
-    # --- Background command execution -------------------------------------
+        if var.get() != resolved:
+            var.set(resolved)
 
     def _is_running(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
@@ -337,10 +359,6 @@ class TinkerApp:
         self.status_var.set("Cancelling…")
 
     def _start_jobs(self, jobs: list[tuple[str, list[str]]], target: str) -> None:
-        """Run *jobs* (header, cmd) sequentially in a worker thread.
-
-        *target* is "organize" or "rename" and selects the output pane.
-        """
         if self._is_running():
             messagebox.showwarning("Busy", "A command is already running.")
             return
@@ -395,13 +413,20 @@ class TinkerApp:
                     self._set_busy(False)
                     return
                 target, text = item
-                if target == "rename":
-                    self._append_rename_text(text)
-                else:
-                    self._append_text(text)
+                self._append_to(target, text)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
+
+    # --------------------------------------------------------------------- #
+    # Commands
+    # --------------------------------------------------------------------- #
+
+    @staticmethod
+    def _flag(variable: tk.BooleanVar, true_flag: str, false_flag: str | None = None) -> list[str]:
+        if variable.get():
+            return [true_flag]
+        return [false_flag] if false_flag is not None else []
 
     def _effective_normalize(self) -> str | None:
         recursive = self.recursive_var.get()
@@ -409,15 +434,26 @@ class TinkerApp:
         eff_norm = "standard" if recursive else "none"
         return None if norm_ui == eff_norm else norm_ui
 
+    def _ensure_folder(self, var: tk.StringVar) -> Path | None:
+        path = self._resolve_path(var)
+        if path is None:
+            messagebox.showwarning("Folder", "Choose a folder first.")
+            return None
+        if not path.is_dir():
+            messagebox.showerror("Folder", f"Not a directory:\n{path}")
+            return None
+        self._show_resolved_path(var, path)
+        return path
+
     def _add_to_schedule(self) -> None:
-        path = self._parse_folder_path()
+        path = self._resolve_path(self.path_var)
         if path is None:
             messagebox.showwarning("Folder", "Choose a folder on the Organize tab first.")
             return
         if not path.is_dir():
             messagebox.showerror("Folder", f"Not a directory:\n{path}")
             return
-        self._show_resolved_path(path)
+        self._show_resolved_path(self.path_var, path)
         self.schedule_panel.add_folder_path(
             str(path),
             recursive=self.recursive_var.get(),
@@ -436,8 +472,8 @@ class TinkerApp:
         )
         self.notebook.select(1)
 
-    def _build_cmd(self, dry_run: bool, *, base: Path | None = None) -> list[str]:
-        folder = base or self._parse_folder_path() or Path()
+    def _build_organize_cmd(self, dry_run: bool, *, base: Path | None = None) -> list[str]:
+        folder = base or self._resolve_path(self.path_var) or Path()
         recursive = self.recursive_var.get()
         norm_ui = self.normalize_var.get()
         eff_norm = "standard" if recursive else "none"
@@ -453,16 +489,9 @@ class TinkerApp:
         ]
         if norm_ui != eff_norm:
             cmd.extend(["--normalize", norm_ui])
-        if recursive:
-            cmd.append("--recursive")
-        else:
-            cmd.append("--no-recursive")
-        if not self.hidden_var.get():
-            cmd.append("--no-include-hidden")
-        if self.collect_empty_var.get():
-            cmd.append("--collect-empty-dirs")
-        else:
-            cmd.append("--no-collect-empty-dirs")
+        cmd.extend(self._flag(self.recursive_var, "--recursive", "--no-recursive"))
+        cmd.extend(self._flag(self.hidden_var, "--include-hidden", "--no-include-hidden"))
+        cmd.extend(self._flag(self.collect_empty_var, "--collect-empty-dirs", "--no-collect-empty-dirs"))
         if self.exclude_defaults_var.get():
             cmd.append("--exclude-defaults")
         if self.verbose_var.get():
@@ -477,46 +506,41 @@ class TinkerApp:
             cmd.append("--date-buckets")
         if self.rename_after_organize_var.get():
             cmd.append("--random-names-after-organize")
-        if self.skip_randomly_renamed_var.get():
-            cmd.append("--skip-randomly-renamed")
+        cmd.extend(self._flag(self.skip_randomly_renamed_var, "--skip-randomly-renamed", "--no-skip-randomly-renamed"))
         if dry_run:
             cmd.append("--dry-run")
         return cmd
 
-    def _run(self, dry_run: bool) -> None:
-        path = self._parse_folder_path()
+    def _run_organize(self, dry_run: bool) -> None:
+        path = self._ensure_folder(self.path_var)
         if path is None:
-            messagebox.showwarning("Folder", "Choose a folder first.")
             return
-        if not path.is_dir():
-            messagebox.showerror("Folder", f"Not a directory:\n{path}")
-            return
-        self._show_resolved_path(path)
 
-        # Handle expand_subfolders
         if self.expand_subfolders_var.get():
             subfolders = [item for item in path.iterdir() if item.is_dir()]
             if not subfolders:
-                self._append_text("No subfolders found to organize.\n")
+                self._append_to("organize", "No subfolders found to organize.\n")
                 return
-            self._append_text(f"Organizing {len(subfolders)} subfolder(s) separately:\n")
+            self._append_to("organize", f"Organizing {len(subfolders)} subfolder(s) separately:\n")
             jobs = [
-                (f"\n--- {sub.name} ---\n", self._build_cmd(dry_run, base=sub))
+                (f"\n--- {sub.name} ---\n", self._build_organize_cmd(dry_run, base=sub))
                 for sub in subfolders
             ]
             self._start_jobs(jobs, "organize")
             return
 
-        # Normal single-folder run
-        cmd = self._build_cmd(dry_run, base=path)
+        cmd = self._build_organize_cmd(dry_run)
         self._start_jobs([("\n---\n", cmd)], "organize")
 
     def _restore(self) -> None:
-        base = self._parse_folder_path()
+        base = self._resolve_path(self.path_var)
         if base is None:
             messagebox.showwarning("Restore", "Choose the folder that was organized.")
             return
-        self._show_resolved_path(base)
+        if not base.is_dir():
+            messagebox.showerror("Restore", f"Not a directory:\n{base}")
+            return
+        self._show_resolved_path(self.path_var, base)
         manifests = list_manifests(base)
         if not manifests:
             messagebox.showinfo("Restore", "No backup manifests found in .organizer/")
@@ -541,44 +565,28 @@ class TinkerApp:
         cmd = [sys.executable, str(_restore_script()), str(manifest)]
         self._start_jobs([("\n--- restore ---\n", cmd)], "organize")
 
-    def _run_rename(self, dry_run: bool) -> None:
-        """Run the random rename operation."""
-        path_str = self.rename_path_var.get()
-        if not path_str.strip():
-            messagebox.showwarning("Folder", "Choose a folder first.")
-            return
-
-        path = normalize_folder_input(path_str)
-        if not path.is_dir():
-            messagebox.showerror("Folder", f"Not a directory:\n{path}")
-            return
-
-        self.rename_path_var.set(str(path))
-
+    def _build_rename_cmd(self, dry_run: bool, path: Path) -> list[str]:
         cmd = [
             sys.executable,
             str(_rename_script()),
             "--path",
             str(path),
         ]
-
-        if self.rename_recursive_var.get():
-            cmd.append("--recursive")
-        else:
-            cmd.append("--no-recursive")
-
-        if not self.rename_hidden_var.get():
-            cmd.append("--no-include-hidden")
-
+        cmd.extend(self._flag(self.rename_recursive_var, "--recursive", "--no-recursive"))
+        cmd.extend(self._flag(self.rename_hidden_var, "--include-hidden", "--no-include-hidden"))
         if self.rename_verbose_var.get():
             cmd.append("--verbose")
-
         if self.rename_skip_randomly_renamed_var.get():
             cmd.append("--skip-randomly-renamed")
-
         if dry_run:
             cmd.append("--dry-run")
+        return cmd
 
+    def _run_rename(self, dry_run: bool) -> None:
+        path = self._ensure_folder(self.rename_path_var)
+        if path is None:
+            return
+        cmd = self._build_rename_cmd(dry_run, path)
         self._start_jobs([("\n---\n", cmd)], "rename")
 
 
