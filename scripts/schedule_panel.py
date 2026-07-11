@@ -28,6 +28,8 @@ from schedule_config import (
     SCHEDULE_MODE_DAILY,
     SCHEDULE_MODE_INTERVAL,
     SCHEDULE_MODE_WATCH,
+    WATCH_POLL_SECONDS,
+    WATCH_QUIET_SECONDS,
     build_organize_cmd,
     effective_normalize,
     default_config_path,
@@ -101,6 +103,9 @@ class SchedulePanel(ttk.Frame):
         self.daily_time_var = tk.StringVar(value=normalize_daily_time(self.cfg.daily_time))
         self.scheduler_var = tk.BooleanVar(value=self.cfg.scheduler_enabled)
         self.max_parallel_var = tk.IntVar(value=self.cfg.max_parallel)
+        self.notify_on_run_var = tk.BooleanVar(value=self.cfg.notify_on_run)
+        self.watch_poll_var = tk.DoubleVar(value=self.cfg.watch_poll_seconds)
+        self.watch_quiet_var = tk.DoubleVar(value=self.cfg.watch_quiet_seconds)
 
         pad = {"padx": 8, "pady": 4}
         frm = self
@@ -157,7 +162,35 @@ class SchedulePanel(ttk.Frame):
             command=self._on_schedule_mode_change,
         ).pack(side="left")
 
-        ttk.Label(top, text="Max parallel").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        timing_row = ttk.Frame(top)
+        timing_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(timing_row, text="Poll every").pack(side="left")
+        self.watch_poll_spin = tk.Spinbox(
+            timing_row,
+            from_=0.05,
+            to=60.0,
+            increment=0.25,
+            width=6,
+            textvariable=self.watch_poll_var,
+            command=self._sync_watch_timing_to_cfg,
+            format="%.2f",
+        )
+        self.watch_poll_spin.pack(side="left", padx=(6, 0))
+        ttk.Label(timing_row, text="s, quiet for").pack(side="left", padx=(6, 0))
+        self.watch_quiet_spin = tk.Spinbox(
+            timing_row,
+            from_=0.0,
+            to=60.0,
+            increment=0.25,
+            width=6,
+            textvariable=self.watch_quiet_var,
+            command=self._sync_watch_timing_to_cfg,
+            format="%.2f",
+        )
+        self.watch_quiet_spin.pack(side="left", padx=(6, 0))
+        ttk.Label(timing_row, text="s before organizing").pack(side="left", padx=(6, 0))
+
+        ttk.Label(top, text="Max parallel").grid(row=4, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
         tk.Spinbox(
             top,
             from_=0,
@@ -165,26 +198,33 @@ class SchedulePanel(ttk.Frame):
             width=8,
             textvariable=self.max_parallel_var,
             command=self._sync_parallel_to_cfg,
-        ).grid(row=3, column=1, sticky="w", pady=(6, 0))
-        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=3, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
+        ).grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(top, text="(0 = all enabled folders at once, max 32)").grid(row=4, column=2, sticky="w", padx=(6, 0), pady=(6, 0))
 
         ttk.Checkbutton(
             top,
             text="Enable automatic runs",
             variable=self.scheduler_var,
             command=self._on_scheduler_toggle,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        ttk.Checkbutton(
+            top,
+            text="Show macOS notification after automatic runs",
+            variable=self.notify_on_run_var,
+            command=self._on_notify_toggle,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         self.next_run_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.next_run_var, wraplength=620, justify="left").grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(4, 0)
+            row=7, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
 
         hint = (
             "Automatic runs continue in the background after you close this app. "
             "Pick folders below, choose daily, interval, or watch timing, then enable automatic runs."
         )
-        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(top, text=hint, wraplength=620, justify="left").grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         self._on_schedule_mode_change()
 
@@ -389,6 +429,12 @@ class SchedulePanel(ttk.Frame):
             self.daily_time_entry.configure(state=entry_state)
         except tk.TclError:
             pass
+        watch_state = "normal" if mode == SCHEDULE_MODE_WATCH else "disabled"
+        for widget in (self.watch_poll_spin, self.watch_quiet_spin):
+            try:
+                widget.configure(state=watch_state)
+            except tk.TclError:
+                pass
         self._sync_schedule_timing_to_cfg()
 
     def _sync_schedule_timing_to_cfg(self) -> None:
@@ -396,6 +442,7 @@ class SchedulePanel(ttk.Frame):
         editing_daily = self.root.focus_get() == self.daily_time_entry
         if not editing_daily:
             self._sync_daily_time_to_cfg(quiet=True)
+        self._sync_watch_timing_to_cfg(quiet=True)
         mode = normalize_schedule_mode(self.schedule_mode_var.get())
         prev_mode = normalize_schedule_mode(self.cfg.schedule_mode)
         prev_time = normalize_daily_time(self.cfg.daily_time)
@@ -436,6 +483,35 @@ class SchedulePanel(ttk.Frame):
         v = max(0, min(128, v))
         self.max_parallel_var.set(v)
         self.cfg.max_parallel = v
+
+    def _sync_notify_to_cfg(self) -> None:
+        self.cfg.notify_on_run = bool(self.notify_on_run_var.get())
+
+    def _sync_watch_timing_to_cfg(self, *, quiet: bool = False) -> None:
+        try:
+            poll = float(self.watch_poll_var.get())
+        except (tk.TclError, ValueError):
+            poll = WATCH_POLL_SECONDS
+        poll = round(max(0.05, min(60.0, poll)), 3)
+        self.watch_poll_var.set(poll)
+
+        try:
+            quiet_sec = float(self.watch_quiet_var.get())
+        except (tk.TclError, ValueError):
+            quiet_sec = WATCH_QUIET_SECONDS
+        quiet_sec = round(max(0.0, min(60.0, quiet_sec)), 3)
+        self.watch_quiet_var.set(quiet_sec)
+
+        prev_poll = self.cfg.watch_poll_seconds
+        prev_quiet = self.cfg.watch_quiet_seconds
+        self.cfg.watch_poll_seconds = poll
+        self.cfg.watch_quiet_seconds = quiet_sec
+        if not quiet and (poll != prev_poll or quiet_sec != prev_quiet):
+            self._save_quiet()
+
+    def _on_notify_toggle(self) -> None:
+        self._sync_notify_to_cfg()
+        self._save_quiet()
 
     def _on_scheduler_toggle(self) -> None:
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
@@ -506,7 +582,9 @@ class SchedulePanel(ttk.Frame):
 
     def _save_quiet(self) -> None:
         self._sync_schedule_timing_to_cfg()
+        self._sync_watch_timing_to_cfg(quiet=True)
         self._sync_parallel_to_cfg()
+        self._sync_notify_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
             save_config(self.config_path, self.cfg)
@@ -736,6 +814,7 @@ class SchedulePanel(ttk.Frame):
     def _save(self) -> None:
         self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
+        self._sync_notify_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
             save_config(self.config_path, self.cfg)
@@ -749,6 +828,7 @@ class SchedulePanel(ttk.Frame):
         """Persist config before destroying the root window (background scheduler keeps running)."""
         self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
+        self._sync_notify_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
             save_config(self.config_path, self.cfg)

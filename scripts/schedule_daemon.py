@@ -18,7 +18,9 @@ import json
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional, Set
 
@@ -29,8 +31,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from org_logging import default_log_path, default_state_dir
 from schedule_config import (
     SCHEDULE_MODE_WATCH,
-    WATCH_POLL_SECONDS,
-    WATCH_QUIET_SECONDS,
+    FolderJob,
     default_config_path,
     load_config,
     normalize_schedule_mode,
@@ -269,71 +270,100 @@ def _run_watch_loop(
 ) -> None:
     """React to folder changes in near real time.
 
-    Polls a cheap mtime signature (folder root + immediate subdirs) every
-    WATCH_POLL_SECONDS; when a folder changes and then stays quiet for
-    WATCH_QUIET_SECONDS, only that folder is organized. Falls back to the
-    normal loop if the config's schedule_mode changes away from watch.
+    Polls a cheap mtime signature (all directories under the watched root) every
+    cfg.watch_poll_seconds. Each folder gets its own background worker once it
+    has stayed quiet for cfg.watch_quiet_seconds, so a long-running folder cannot
+    stop the watcher from noticing and organizing other folders.
     """
+    cfg = load_config(config_path)
+    state_lock = threading.Lock()
     signatures: dict = {}
     dirty_since: dict = {}
+    in_flight: set = set()
     last_reload = 0.0
-    cfg = load_config(config_path)
+    file_log_path = default_log_path()
 
-    print(json.dumps({"watch": True, "poll_seconds": WATCH_POLL_SECONDS, "quiet_seconds": WATCH_QUIET_SECONDS}, indent=2))
+    mp = max_parallel if max_parallel is not None else cfg.max_parallel
+    max_workers = max(1, min(mp, 32)) if mp and mp > 0 else 32
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="watch-organize")
 
-    while not should_stop():
-        now = time.monotonic()
-        if now - last_reload >= WATCH_CONFIG_RELOAD_SECONDS:
-            cfg = load_config(config_path)
-            last_reload = now
-            if normalize_schedule_mode(cfg.schedule_mode) != SCHEDULE_MODE_WATCH:
-                print(json.dumps({"watch": False, "reason": "schedule_mode changed"}, indent=2))
-                return
+    print(json.dumps({"watch": True, "poll_seconds": cfg.watch_poll_seconds, "quiet_seconds": cfg.watch_quiet_seconds, "max_workers": max_workers}, indent=2))
 
-        if force or cfg.scheduler_enabled:
-            due_paths = set()
-            for job in cfg.folders:
-                if not job.enabled:
-                    continue
-                sig = watch_signature(job)
-                prev = signatures.get(job.path)
-                signatures[job.path] = sig
-                if prev is None:
-                    continue  # first observation is the baseline, not a change
-                if sig != prev:
-                    dirty_since[job.path] = now
-                    continue
-                started = dirty_since.get(job.path)
-                if started is not None and now - started >= WATCH_QUIET_SECONDS:
-                    due_paths.add(job.path)
-                    del dirty_since[job.path]
+    def _organize_path(path: str) -> None:
+        sub_cfg: Optional[object] = None
+        try:
+            sub_cfg = load_config(config_path)
+            summary = run_enabled_folders(
+                sub_cfg,
+                config_path,
+                max_parallel=1,
+                log=lambda s: print(s, end=""),
+                label="watch",
+                file_log_path=file_log_path,
+                only_paths={path},
+            )
+            if summary:
+                _notify_run(sub_cfg, summary, "watch")
+        finally:
+            with state_lock:
+                in_flight.discard(path)
+                if sub_cfg is not None:
+                    # Update the baseline so the organizer's own moves do not retrigger.
+                    for job in sub_cfg.folders:
+                        if job.path == path:
+                            signatures[path] = watch_signature(job)
+                            break
+                    else:
+                        signatures[path] = watch_signature(FolderJob(path=path))
+                dirty_since.pop(path, None)
 
-            if due_paths:
-                summary = run_enabled_folders(
-                    cfg,
-                    config_path,
-                    max_parallel=max_parallel,
-                    log=lambda s: print(s, end=""),
-                    label="watch",
-                    file_log_path=default_log_path(),
-                    only_paths=due_paths,
-                )
-                _notify_run(cfg, summary, "watch")
+    try:
+        while not should_stop():
+            now = time.monotonic()
+            if now - last_reload >= WATCH_CONFIG_RELOAD_SECONDS:
                 cfg = load_config(config_path)
-                last_reload = time.monotonic()
-                # The run itself changed the folders; refresh baselines so the
-                # organizer's own moves do not retrigger a run.
-                for job in cfg.folders:
-                    if job.path in due_paths:
-                        signatures[job.path] = watch_signature(job)
+                last_reload = now
+                if normalize_schedule_mode(cfg.schedule_mode) != SCHEDULE_MODE_WATCH:
+                    print(json.dumps({"watch": False, "reason": "schedule_mode changed"}, indent=2))
+                    return
 
-        remaining = WATCH_POLL_SECONDS
-        while remaining > 0:
-            if should_stop():
-                return
-            step = min(remaining, 1.0)
-            time.sleep(step)
-            remaining -= step
+            if force or cfg.scheduler_enabled:
+                due_paths = set()
+                enabled = [job for job in cfg.folders if job.enabled]
+                new_sigs = {job.path: watch_signature(job) for job in enabled}
+
+                with state_lock:
+                    for job in enabled:
+                        path = job.path
+                        if path in in_flight:
+                            continue
+                        sig = new_sigs[path]
+                        prev = signatures.get(path)
+                        signatures[path] = sig
+                        if prev is None:
+                            continue
+                        if sig != prev:
+                            dirty_since[path] = now
+                            continue
+                        started = dirty_since.get(path)
+                        if started is not None and now - started >= cfg.watch_quiet_seconds:
+                            due_paths.add(path)
+                            del dirty_since[path]
+                            in_flight.add(path)
+
+                for path in due_paths:
+                    executor.submit(_organize_path, path)
+
+            poll_seconds = cfg.watch_poll_seconds
+            remaining = poll_seconds
+            while remaining > 0:
+                if should_stop():
+                    return
+                step = min(remaining, 1.0)
+                time.sleep(step)
+                remaining -= step
+    finally:
+        executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

@@ -126,7 +126,7 @@ Set `"schedule_mode": "watch"` to organize a folder shortly after files land in 
 ```
 
 - **macOS (LaunchAgent):** the agent is installed with launchd `WatchPaths` covering each enabled folder — event-driven, no resident daemon. Runs are throttled to at most one per 15 seconds, with an hourly backstop run in case an event is missed. Re-enable automatic runs (or save in the GUI) after adding/removing folders so the watched path list is refreshed.
-- **Linux / manual (`--foreground`):** the daemon polls a cheap mtime signature (folder root plus immediate subdirectories, one `stat` sweep every 2 s) and fires after the folder has been quiet for 5 s, running only the folder(s) that changed. Note that changes deeper than one level don't bump these mtimes; drop files at the folder root (the normal flow) or within one level for instant pickup.
+- **Linux / manual (`--foreground`):** the daemon polls a cheap mtime signature (one `stat` per directory under the watched root) every 0.25 s and fires after the folder has been quiet for 1 s, running only the folder(s) that changed. Each folder gets its own background worker, so a long-running folder does not block the watcher from organizing other folders. The signature covers all subdirectories, so changes at any depth are detected. Both timings are configurable in `schedule.json` (`watch_poll_seconds`, `watch_quiet_seconds`) or in the Schedule tab.
 - Combine with `min_unsorted_threshold` to only fire once enough files have accumulated.
 
 ### Duplicate detection

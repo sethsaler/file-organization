@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,9 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_buckets import bucket_names_for_profile
+
+# Protects the read-modify-write of schedule.json when multiple threads run folders in parallel.
+_config_lock = threading.Lock()
 from org_paths import normalize_folder_input
 
 
@@ -30,8 +34,9 @@ DEFAULT_DAILY_TIME = "00:00"
 
 # Watch mode: how often the foreground daemon polls folder mtimes, and how long a
 # folder must stay quiet after a change before a run fires (lets copies finish).
-WATCH_POLL_SECONDS = 2.0
-WATCH_QUIET_SECONDS = 5.0
+# These are defaults; both can be overridden per-config.
+WATCH_POLL_SECONDS = 0.25
+WATCH_QUIET_SECONDS = 1.0
 
 
 def _helper_script() -> Path:
@@ -130,31 +135,46 @@ def wait_seconds_after_run(cfg: ScheduleConfig) -> float:
     if mode == SCHEDULE_MODE_DAILY:
         return seconds_until_next_daily_run(cfg.daily_time)
     if mode == SCHEDULE_MODE_WATCH:
-        return WATCH_POLL_SECONDS
+        return cfg.watch_poll_seconds
     minutes = max(1, min(10080, int(cfg.interval_minutes)))
     return float(minutes * 60)
 
 
 def watch_signature(job: FolderJob) -> Tuple[float, ...]:
-    """Cheap change signature for watch mode: mtime of the folder root plus its
-    immediate subdirectories (a new/removed direct entry bumps the parent mtime)."""
+    """Cheap change signature for watch mode: mtimes of the watched root and all
+    directories beneath it (one stat per directory, symlinks are not followed).
+
+    A new/removed/modified file changes the mtime of its immediate parent directory,
+    so this catches changes anywhere inside the watched tree.
+    """
     base = normalize_folder_input(job.path)
-    sig: List[float] = []
     try:
-        sig.append(os.stat(base).st_mtime)
+        base_stat = os.stat(base)
     except OSError:
         return (0.0,)
-    try:
-        with os.scandir(base) as it:
-            for entry in it:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        sig.append(entry.stat(follow_symlinks=False).st_mtime)
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return tuple(sig)
+
+    base_str = str(base)
+    entries: List[Tuple[str, float]] = [(base_str, base_stat.st_mtime)]
+    stack = [base_str]
+
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            st = entry.stat(follow_symlinks=False)
+                            entries.append((entry.path, st.st_mtime))
+                            stack.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+    # Stable ordering by absolute path; all entries share the same base prefix.
+    entries.sort(key=lambda x: x[0])
+    return tuple(mtime for _, mtime in entries)
 
 
 def estimate_seconds_until_next_run(cfg: ScheduleConfig) -> float:
@@ -195,6 +215,8 @@ class ScheduleConfig:
     max_parallel: int = 0
     max_failures_before_disable: int = 5
     notify_on_run: bool = True
+    watch_poll_seconds: float = WATCH_POLL_SECONDS
+    watch_quiet_seconds: float = WATCH_QUIET_SECONDS
     folders: List[FolderJob] = field(default_factory=list)
 
     def to_json_dict(self) -> Dict[str, Any]:
@@ -213,6 +235,10 @@ class ScheduleConfig:
             d["max_failures_before_disable"] = self.max_failures_before_disable
         if not self.notify_on_run:
             d["notify_on_run"] = False
+        if self.watch_poll_seconds != WATCH_POLL_SECONDS:
+            d["watch_poll_seconds"] = round(self.watch_poll_seconds, 3)
+        if self.watch_quiet_seconds != WATCH_QUIET_SECONDS:
+            d["watch_quiet_seconds"] = round(self.watch_quiet_seconds, 3)
         return d
 
     @classmethod
@@ -270,6 +296,8 @@ class ScheduleConfig:
         max_parallel = max(0, min(128, int(data.get("max_parallel", 0))))
         mfd = int(data.get("max_failures_before_disable", 5))
         mfd = max(0, min(1000, mfd))
+        watch_poll_seconds = float(data.get("watch_poll_seconds", WATCH_POLL_SECONDS))
+        watch_quiet_seconds = float(data.get("watch_quiet_seconds", WATCH_QUIET_SECONDS))
         return cls(
             version=max(int(data.get("version", 1)), 1),
             schedule_mode=normalize_schedule_mode(str(data.get("schedule_mode", SCHEDULE_MODE_INTERVAL))),
@@ -279,6 +307,8 @@ class ScheduleConfig:
             max_parallel=max_parallel,
             max_failures_before_disable=mfd,
             notify_on_run=bool(data.get("notify_on_run", True)),
+            watch_poll_seconds=max(0.05, min(60.0, watch_poll_seconds)),
+            watch_quiet_seconds=max(0.0, min(60.0, watch_quiet_seconds)),
             folders=folders,
         )
 
@@ -307,6 +337,21 @@ def save_config(path: Path, cfg: ScheduleConfig) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(cfg.to_json_dict(), indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _merge_and_save_config(cfg: ScheduleConfig, config_path: Path) -> None:
+    """Merge per-run updates back into the latest on-disk config without overwriting concurrent runs."""
+    with _config_lock:
+        fresh = load_config(config_path)
+        updated = {j.path: j for j in cfg.folders}
+        for job in fresh.folders:
+            if job.path in updated:
+                u = updated[job.path]
+                job.last_run = u.last_run
+                job.last_error = u.last_error
+                job.consecutive_failures = u.consecutive_failures
+                job.enabled = u.enabled
+        save_config(config_path, fresh)
 
 
 def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, *, dry_run: bool = False) -> List[str]:
@@ -614,7 +659,7 @@ def run_enabled_folders(
                 append_log_line(file_log_path, f"{path_log}: {status}")
 
     try:
-        save_config(config_path, cfg)
+        _merge_and_save_config(cfg, config_path)
     except OSError:
         pass
     return result

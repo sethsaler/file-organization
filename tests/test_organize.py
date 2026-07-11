@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +20,7 @@ from org_buckets import bucket_for_filename, resolve_profile
 from org_exclude import dir_name_excluded, merge_exclude_patterns
 from org_organizer import Organizer
 from org_paths import normalize_folder_input
-from schedule_config import ScheduleConfig, find_path_conflicts
+from schedule_config import ScheduleConfig, find_path_conflicts, save_config
 
 
 @pytest.fixture
@@ -755,6 +757,15 @@ def test_watch_signature_detects_changes(tmp_path: Path):
     (tmp_path / "sub" / "deep.jpg").write_bytes(b"y")
     sig3 = watch_signature(job)
     assert sig2 != sig3
+    # Changes several levels deep should also be detected.
+    (tmp_path / "sub" / "nested").mkdir()
+    (tmp_path / "sub" / "nested" / "deep.jpg").write_bytes(b"z")
+    sig4 = watch_signature(job)
+    assert sig3 != sig4
+    (tmp_path / "sub" / "nested" / "another").mkdir()
+    (tmp_path / "sub" / "nested" / "another" / "file.txt").write_text("txt")
+    sig5 = watch_signature(job)
+    assert sig4 != sig5
 
 
 def test_wait_seconds_watch_mode_is_poll_interval():
@@ -762,6 +773,42 @@ def test_wait_seconds_watch_mode_is_poll_interval():
 
     cfg = ScheduleConfig(schedule_mode=SCHEDULE_MODE_WATCH)
     assert wait_seconds_after_run(cfg) == WATCH_POLL_SECONDS
+    assert wait_seconds_after_run(cfg) == cfg.watch_poll_seconds
+    cfg.watch_poll_seconds = 0.5
+    assert wait_seconds_after_run(cfg) == 0.5
+
+
+def test_watch_timing_config_round_trip_and_bounds():
+    from schedule_config import (
+        WATCH_POLL_SECONDS,
+        WATCH_QUIET_SECONDS,
+        ScheduleConfig,
+        load_config,
+        save_config,
+    )
+
+    cfg = ScheduleConfig(watch_poll_seconds=0.5, watch_quiet_seconds=2.0)
+    assert cfg.to_json_dict().get("watch_poll_seconds") == 0.5
+    assert cfg.to_json_dict().get("watch_quiet_seconds") == 2.0
+
+    defaults = ScheduleConfig()
+    assert "watch_poll_seconds" not in defaults.to_json_dict()
+    assert "watch_quiet_seconds" not in defaults.to_json_dict()
+    assert defaults.watch_poll_seconds == WATCH_POLL_SECONDS
+    assert defaults.watch_quiet_seconds == WATCH_QUIET_SECONDS
+
+    bounded = ScheduleConfig.from_json_dict(
+        {"watch_poll_seconds": -1.0, "watch_quiet_seconds": 100.0}
+    )
+    assert bounded.watch_poll_seconds == 0.05
+    assert bounded.watch_quiet_seconds == 60.0
+
+    path = Path("/tmp/test-watch-timing.json")
+    save_config(path, cfg)
+    loaded = load_config(path)
+    assert loaded.watch_poll_seconds == 0.5
+    assert loaded.watch_quiet_seconds == 2.0
+    path.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -935,3 +982,66 @@ def test_folderjob_new_fields_roundtrip_and_cmd():
     assert old.folders[0].timeout_minutes == 60
     assert old.folders[0].duplicates_hardlink is False
     assert old.notify_on_run is True
+
+
+def test_watch_loop_runs_folders_concurrently(tmp_path: Path, monkeypatch):
+    import schedule_daemon
+    from schedule_config import FolderJob, ScheduleConfig
+
+    fa, fb = tmp_path / "A", tmp_path / "B"
+    fa.mkdir()
+    fb.mkdir()
+    cfg = ScheduleConfig(
+        folders=[FolderJob(path=str(fa)), FolderJob(path=str(fb))],
+        schedule_mode="watch",
+        scheduler_enabled=True,
+        watch_poll_seconds=0.05,
+        watch_quiet_seconds=0.05,
+    )
+    config_path = tmp_path / "schedule.json"
+    save_config(config_path, cfg)
+
+    # Deterministic signature sequence: first call baseline, second and later changed.
+    # Only the main polling thread increments the counter so worker signature refreshes
+    # don't create a new "change" and re-trigger the folder.
+    call_counts = {}
+
+    def mock_signature(job):
+        if threading.current_thread().name == "MainThread":
+            call_counts[job.path] = call_counts.get(job.path, 0) + 1
+        return (job.path, 1 if call_counts.get(job.path, 0) >= 2 else 0)
+
+    monkeypatch.setattr(schedule_daemon, "watch_signature", mock_signature)
+
+    records = []
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def mock_run_enabled_folders(
+        c, path, *, max_parallel=None, log=None, label=None, file_log_path=None, only_paths=None
+    ):
+        p = next(iter(only_paths or []))
+        start = time.monotonic()
+        # "A" is a slow folder; "B" is fast.
+        time.sleep(0.5 if Path(p).name == "A" else 0.05)
+        end = time.monotonic()
+        with lock:
+            records.append((p, start, end))
+            if len(records) >= 2:
+                stop.set()
+        return {"ran": 1, "failed": 0}
+
+    monkeypatch.setattr(schedule_daemon, "run_enabled_folders", mock_run_enabled_folders)
+
+    schedule_daemon._run_watch_loop(
+        config_path,
+        force=False,
+        max_parallel=0,
+        should_stop=stop.is_set,
+    )
+
+    assert len(records) == 2, records
+    times = {Path(p).name: (s, e) for p, s, e in records}
+    assert "A" in times and "B" in times
+    # If B finished before A, the loop ran them concurrently rather than sequentially.
+    assert times["B"][1] < times["A"][1]
