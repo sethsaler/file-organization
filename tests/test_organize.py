@@ -768,6 +768,38 @@ def test_watch_signature_detects_changes(tmp_path: Path):
     assert sig4 != sig5
 
 
+def test_watch_signature_fast_is_lightweight_but_shallow(tmp_path: Path):
+    from schedule_config import FolderJob, watch_signature, watch_signature_fast
+
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "nested").mkdir()
+    job = FolderJob(path=str(tmp_path))
+
+    fast1 = watch_signature_fast(job)
+    full1 = watch_signature(job)
+
+    # A file at the root is detected by the fast signature.
+    (tmp_path / "new.jpg").write_bytes(b"x")
+    fast2 = watch_signature_fast(job)
+    full2 = watch_signature(job)
+    assert fast1 != fast2
+    assert full1 != full2
+
+    # A file in an immediate subdirectory is also detected.
+    (tmp_path / "sub" / "shallow.jpg").write_bytes(b"y")
+    fast3 = watch_signature_fast(job)
+    full3 = watch_signature(job)
+    assert fast2 != fast3
+    assert full2 != full3
+
+    # A file deeper than one level is NOT detected by the fast signature.
+    (tmp_path / "sub" / "nested" / "deep.jpg").write_bytes(b"z")
+    fast4 = watch_signature_fast(job)
+    full4 = watch_signature(job)
+    assert fast3 == fast4, "fast signature should miss deep changes"
+    assert full3 != full4, "full signature should catch deep changes"
+
+
 def test_wait_seconds_watch_mode_is_poll_interval():
     from schedule_config import SCHEDULE_MODE_WATCH, WATCH_POLL_SECONDS, ScheduleConfig, wait_seconds_after_run
 
@@ -1012,6 +1044,7 @@ def test_watch_loop_runs_folders_concurrently(tmp_path: Path, monkeypatch):
         return (job.path, 1 if call_counts.get(job.path, 0) >= 2 else 0)
 
     monkeypatch.setattr(schedule_daemon, "watch_signature", mock_signature)
+    monkeypatch.setattr(schedule_daemon, "watch_signature_fast", mock_signature)
 
     records = []
     lock = threading.Lock()

@@ -38,9 +38,15 @@ from schedule_config import (
     run_enabled_folders,
     wait_seconds_after_run,
     watch_signature,
+    watch_signature_fast,
 )
 
 WATCH_CONFIG_RELOAD_SECONDS = 30.0
+
+# How often the watch loop does a full recursive mtime scan to catch changes
+# that occurred deeper than one level under the watched root. The fast signature
+# (root + immediate subdirs) runs every poll.
+WATCH_FULL_SCAN_SECONDS = 5.0
 
 
 def _watch_state_path() -> Path:
@@ -270,24 +276,38 @@ def _run_watch_loop(
 ) -> None:
     """React to folder changes in near real time.
 
-    Polls a cheap mtime signature (all directories under the watched root) every
-    cfg.watch_poll_seconds. Each folder gets its own background worker once it
-    has stayed quiet for cfg.watch_quiet_seconds, so a long-running folder cannot
-    stop the watcher from noticing and organizing other folders.
+    Uses a lightweight fast signature (watched root + immediate subdirs) every
+    cfg.watch_poll_seconds; a full recursive scan runs every WATCH_FULL_SCAN_SECONDS
+    to catch deep changes. Each folder gets its own background worker once it has
+    stayed quiet for cfg.watch_quiet_seconds, so a long-running folder cannot stop
+    the watcher from noticing and organizing other folders.
     """
     cfg = load_config(config_path)
     state_lock = threading.Lock()
-    signatures: dict = {}
+    signatures_fast: dict = {}
+    signatures_full: dict = {}
     dirty_since: dict = {}
     in_flight: set = set()
     last_reload = 0.0
+    last_full_scan = 0.0
     file_log_path = default_log_path()
 
     mp = max_parallel if max_parallel is not None else cfg.max_parallel
     max_workers = max(1, min(mp, 32)) if mp and mp > 0 else 32
     executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="watch-organize")
 
-    print(json.dumps({"watch": True, "poll_seconds": cfg.watch_poll_seconds, "quiet_seconds": cfg.watch_quiet_seconds, "max_workers": max_workers}, indent=2))
+    print(json.dumps({
+        "watch": True,
+        "poll_seconds": cfg.watch_poll_seconds,
+        "quiet_seconds": cfg.watch_quiet_seconds,
+        "full_scan_seconds": WATCH_FULL_SCAN_SECONDS,
+        "max_workers": max_workers,
+    }, indent=2))
+
+    def _update_both_signatures(path: str, job: Optional[FolderJob] = None) -> None:
+        target = job if job is not None else FolderJob(path=path)
+        signatures_fast[path] = watch_signature_fast(target)
+        signatures_full[path] = watch_signature(target)
 
     def _organize_path(path: str) -> None:
         sub_cfg: Optional[object] = None
@@ -308,13 +328,13 @@ def _run_watch_loop(
             with state_lock:
                 in_flight.discard(path)
                 if sub_cfg is not None:
-                    # Update the baseline so the organizer's own moves do not retrigger.
+                    # Update both baselines so the organizer's own moves do not retrigger.
                     for job in sub_cfg.folders:
                         if job.path == path:
-                            signatures[path] = watch_signature(job)
+                            _update_both_signatures(path, job)
                             break
                     else:
-                        signatures[path] = watch_signature(FolderJob(path=path))
+                        _update_both_signatures(path)
                 dirty_since.pop(path, None)
 
     try:
@@ -327,24 +347,43 @@ def _run_watch_loop(
                     print(json.dumps({"watch": False, "reason": "schedule_mode changed"}, indent=2))
                     return
 
+            do_full_scan = now - last_full_scan >= WATCH_FULL_SCAN_SECONDS
+            if do_full_scan:
+                last_full_scan = now
+
             if force or cfg.scheduler_enabled:
                 due_paths = set()
                 enabled = [job for job in cfg.folders if job.enabled]
-                new_sigs = {job.path: watch_signature(job) for job in enabled}
+                new_fast_sigs = {job.path: watch_signature_fast(job) for job in enabled}
+                new_full_sigs = (
+                    {job.path: watch_signature(job) for job in enabled}
+                    if do_full_scan else {}
+                )
 
                 with state_lock:
                     for job in enabled:
                         path = job.path
                         if path in in_flight:
                             continue
-                        sig = new_sigs[path]
-                        prev = signatures.get(path)
-                        signatures[path] = sig
-                        if prev is None:
-                            continue
-                        if sig != prev:
+                        sig_changed = False
+
+                        fast_prev = signatures_fast.get(path)
+                        fast_sig = new_fast_sigs[path]
+                        signatures_fast[path] = fast_sig
+                        if fast_prev is not None and fast_sig != fast_prev:
+                            sig_changed = True
+
+                        if do_full_scan:
+                            full_prev = signatures_full.get(path)
+                            full_sig = new_full_sigs[path]
+                            signatures_full[path] = full_sig
+                            if full_prev is not None and full_sig != full_prev:
+                                sig_changed = True
+
+                        if sig_changed:
                             dirty_since[path] = now
                             continue
+
                         started = dirty_since.get(path)
                         if started is not None and now - started >= cfg.watch_quiet_seconds:
                             due_paths.add(path)

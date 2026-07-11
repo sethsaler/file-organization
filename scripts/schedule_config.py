@@ -177,6 +177,38 @@ def watch_signature(job: FolderJob) -> Tuple[float, ...]:
     return tuple(mtime for _, mtime in entries)
 
 
+def watch_signature_fast(job: FolderJob) -> Tuple[float, ...]:
+    """Lightweight change signature for high-frequency polling.
+
+    Only stats the watched root and its immediate subdirectories. Files dropped at
+    the folder root or one level deep change those mtimes, so this catches the
+    common case with dramatically less work than the recursive signature. Deep
+    changes are still caught by the periodic full scan in the watch loop.
+    """
+    base = normalize_folder_input(job.path)
+    try:
+        base_stat = os.stat(base)
+    except OSError:
+        return (0.0,)
+
+    base_str = str(base)
+    entries: List[Tuple[str, float]] = [(base_str, base_stat.st_mtime)]
+    try:
+        with os.scandir(base_str) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        st = entry.stat(follow_symlinks=False)
+                        entries.append((entry.path, st.st_mtime))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+    entries.sort(key=lambda x: x[0])
+    return tuple(mtime for _, mtime in entries)
+
+
 def estimate_seconds_until_next_run(cfg: ScheduleConfig) -> float:
     """Best-effort countdown until the next scheduled batch (for UI display)."""
     mode = normalize_schedule_mode(cfg.schedule_mode)
