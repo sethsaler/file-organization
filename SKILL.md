@@ -75,7 +75,8 @@ Performance characteristics:
 - `scripts/schedule_panel.py` — shared Schedule tab / panel (folder list, timing, worker)
 - `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
 - `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
-- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop polls folder mtimes and organizes shortly after files change (macOS installs a launchd `WatchPaths` agent instead)
+- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop reacts to native FS events via the optional `watchdog` package (near-instant, any depth; falls back to mtime polling without it) and organizes once a folder stays quiet
+- `scripts/schedule_watch.py` — native filesystem-event monitor for watch mode (watchdog/FSEvents/inotify wrapper with polling fallback)
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
 - **Background scheduling:** enabling automatic runs in the Schedule tab installs a LaunchAgent (macOS) or systemd user unit (Linux) so `schedule_daemon.py` keeps running after the app closes. See `scripts/schedule_service.py`.
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI

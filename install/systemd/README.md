@@ -36,6 +36,8 @@ journalctl --user -u file-org-scheduler.service -f
 
 Set `scheduler_enabled` to true in `schedule.json` (via the GUI), or run the daemon with `--force` to ignore that flag.
 
+With `"schedule_mode": "watch"`, install the optional `watchdog` package (`python3 -m pip install --user watchdog`) so the daemon uses native inotify events — changes anywhere in a watched tree trigger reorganization within milliseconds. Without watchdog it falls back to sub-second mtime polling.
+
 ## Option B: cron + `--once`
 
 Add a crontab line. **Once per day at midnight** (set `"schedule_mode": "daily"` and `"daily_time": "00:00"` in `schedule.json`, or use interval mode with a long `interval_minutes`):

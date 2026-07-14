@@ -66,6 +66,15 @@ exec python3 "$INSTALL_DIR/scripts/restore_from_backup.py" "\$@"
 WRAP
 chmod +x "$RESTORE_WRAPPER"
 
+# Best-effort: install the optional `watchdog` package so watch mode uses native
+# filesystem events (near-instant) instead of the mtime-polling fallback.
+if ! python3 -c "import watchdog" >/dev/null 2>&1; then
+  echo "Installing optional dependency: watchdog (native FS events for watch mode)…"
+  python3 -m pip install --user --quiet "watchdog>=3.0" >/dev/null 2>&1 \
+    || python3 -m pip install --user --quiet --break-system-packages "watchdog>=3.0" >/dev/null 2>&1 \
+    || echo "  Skipped (pip install failed) — watch mode will use polling fallback."
+fi
+
 echo "Done."
 echo
 echo "CLI on PATH (if ~/.local/bin is in PATH):"

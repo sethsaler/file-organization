@@ -15,7 +15,6 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import default_log_path, default_state_dir
-from org_paths import normalize_folder_input
 from schedule_config import (
     SCHEDULE_MODE_DAILY,
     SCHEDULE_MODE_INTERVAL,
@@ -108,23 +107,6 @@ def _current_schedule() -> Tuple[str, str, int]:
         return SCHEDULE_MODE_DAILY, "00:00", 60
 
 
-def _enabled_watch_paths() -> list[str]:
-    """Absolute paths of enabled scheduled folders, for launchd WatchPaths."""
-    try:
-        cfg = load_config(default_config_path())
-    except Exception:
-        return []
-    paths: list[str] = []
-    for job in cfg.folders:
-        if not job.enabled:
-            continue
-        try:
-            paths.append(str(normalize_folder_input(job.path)))
-        except Exception:
-            continue
-    return paths
-
-
 def build_launchd_plist() -> dict:
     out_log, err_log = _log_paths()
     plist: dict = {
@@ -157,26 +139,22 @@ def build_launchd_plist() -> dict:
         plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
         return plist
 
-    # Watch mode: launchd fires a one-shot run whenever a watched folder changes
-    # (WatchPaths is native, event-driven, and needs no resident daemon).
-    # ThrottleInterval debounces bursts; a StartInterval backstop still runs
-    # hourly in case a change event is missed.
+    # Watch mode: run the daemon's watch loop as a persistent agent. The loop
+    # reacts to native FS events (watchdog/FSEvents) within milliseconds — or
+    # falls back to sub-second mtime polling — so responsiveness no longer
+    # depends on launchd's WatchPaths + ThrottleInterval (which imposed a hard
+    # 15s debounce and only saw top-level changes). Watched paths live in
+    # schedule.json and are picked up on the daemon's periodic config reload,
+    # so the plist no longer needs reinstalling when folders change.
     if mode == SCHEDULE_MODE_WATCH:
-        args = []
-        if _caffeinate_path() is not None:
-            args += [str(_caffeinate_path()), "-i", "-m", "-s"]
-        args += [
+        plist["ProgramArguments"] = [
             _python_executable(),
             "-u",
             str(daemon_script()),
-            "--once",
+            "--foreground",
         ]
-        plist["ProgramArguments"] = args
-        watch_paths = _enabled_watch_paths()
-        if watch_paths:
-            plist["WatchPaths"] = watch_paths
-        plist["ThrottleInterval"] = 15
-        plist["StartInterval"] = 3600
+        plist["RunAtLoad"] = True
+        plist["KeepAlive"] = True
         return plist
 
     # Interval mode with short intervals (≤ 60 min): use StartInterval + --once so

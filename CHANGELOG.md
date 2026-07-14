@@ -21,9 +21,16 @@ This project tracks changes using the Hermes skill version as its public version
 - Recursive runs default to `--normalize standard` when not specified.
 - `schedule.json` schema version 3 (`profile`, `exclude`, failure counters).
 
-## [Unreleased]
+## [1.9.0] - 2026-07-14
 
 ### Added
+
+- **Near-instant watch mode via native filesystem events:** with the optional [`watchdog`](https://pypi.org/project/watchdog/) package installed (`pip install "organize-folder-by-filetype[watch]"`; the curl installer adds it automatically), the watch daemon subscribes to native FS events (FSEvents on macOS, inotify on Linux) with one recursive watch per enabled folder — changes at **any depth** are detected in milliseconds instead of waiting up to 5 s for the recursive mtime scan. A relaxed 60 s full-scan safety net catches any dropped events, and the organizer's own moves plus noise files (`.DS_Store`, `.organizer/` manifests) are filtered so runs don't retrigger themselves. Without watchdog, the previous tiered mtime polling is used unchanged. The daemon logs the active backend at startup (`"backend": "fsevents" | "inotify" | "polling"`). New module: `scripts/schedule_watch.py`.
+
+### Changed
+
+- **macOS watch mode now runs a persistent daemon instead of launchd `WatchPaths`:** the one-shot `WatchPaths` agent imposed a hard 15 s `ThrottleInterval` and only saw top-level changes; enabling automatic runs in watch mode now installs a `--foreground` agent with `RunAtLoad` + `KeepAlive` running the event-driven watch loop. Watched folders are picked up from `schedule.json` on the daemon's periodic config reload, so adding/removing folders no longer requires reinstalling the agent.
+- **Snappier watch debounce:** `watch_quiet_seconds` default lowered from 1.0 s to 0.3 s. In-progress copies keep emitting events/mtime bumps that reset the quiet timer, so large files still finish before being moved. End-to-end, a file dropped anywhere in a watched tree is now typically organized in ~0.3–0.5 s (previously ~6–20 s depending on depth and platform).
 
 - **Duplicate hardlinking (`--duplicates-hardlink`):** with `--detect-duplicates`, duplicates stay in their bucket as hardlinks to the canonical copy instead of being staged into `Duplicates` — the copy costs no disk space and both paths remain valid. Falls back to a plain move if the filesystem cannot hardlink. Toggle in the Tinker GUI and Schedule tab (`duplicates_hardlink` in `schedule.json`).
 - **Date-based bucketing (`--date-buckets`):** files are placed under `Bucket/YYYY/MM` subfolders by modification time, in every strategy. Toggle in the Tinker GUI and Schedule tab (`date_buckets` in `schedule.json`).

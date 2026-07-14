@@ -669,20 +669,22 @@ def test_watch_mode_normalize_and_roundtrip():
 
 
 def test_schedule_service_launchd_plist_watch(monkeypatch):
-    """Watch mode uses launchd WatchPaths with a one-shot run and throttle."""
+    """Watch mode runs the persistent event-driven daemon (no WatchPaths throttle)."""
     import schedule_service
     from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
 
     monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("watch", "00:00", 60))
-    monkeypatch.setattr(schedule_service, "_enabled_watch_paths", lambda: ["/tmp/watched"])
     plist = build_launchd_plist()
     assert plist["Label"] == SERVICE_LABEL
-    assert plist["ProgramArguments"][-1] == "--once"
+    assert plist["ProgramArguments"][-1] == "--foreground"
     assert str(daemon_script()) in plist["ProgramArguments"]
-    assert plist["WatchPaths"] == ["/tmp/watched"]
-    assert plist["ThrottleInterval"] == 15
-    assert plist["StartInterval"] == 3600  # backstop for missed events
-    assert "KeepAlive" not in plist
+    assert plist["RunAtLoad"] is True
+    assert plist["KeepAlive"] is True
+    # The old WatchPaths one-shot shape imposed a 15 s throttle and only saw
+    # top-level changes; none of it should remain.
+    assert "WatchPaths" not in plist
+    assert "ThrottleInterval" not in plist
+    assert "StartInterval" not in plist
     assert "StartCalendarInterval" not in plist
 
 

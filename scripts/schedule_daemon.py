@@ -40,13 +40,22 @@ from schedule_config import (
     watch_signature,
     watch_signature_fast,
 )
+from schedule_watch import create_event_monitor
 
 WATCH_CONFIG_RELOAD_SECONDS = 30.0
 
-# How often the watch loop does a full recursive mtime scan to catch changes
-# that occurred deeper than one level under the watched root. The fast signature
-# (root + immediate subdirs) runs every poll.
+# Polling fallback (no watchdog installed): how often the watch loop does a full
+# recursive mtime scan to catch changes that occurred deeper than one level under
+# the watched root. The fast signature (root + immediate subdirs) runs every poll.
 WATCH_FULL_SCAN_SECONDS = 5.0
+
+# Event mode (watchdog installed): loop tick while waiting for events to settle.
+# No filesystem I/O happens on this tick — it only ages the dirty/quiet state.
+WATCH_EVENT_TICK_SECONDS = 0.1
+
+# Event mode safety net: native events can theoretically be dropped, so a full
+# recursive mtime scan still runs occasionally to catch anything missed.
+WATCH_SAFETY_SCAN_SECONDS = 60.0
 
 
 def _watch_state_path() -> Path:
@@ -276,11 +285,18 @@ def _run_watch_loop(
 ) -> None:
     """React to folder changes in near real time.
 
-    Uses a lightweight fast signature (watched root + immediate subdirs) every
-    cfg.watch_poll_seconds; a full recursive scan runs every WATCH_FULL_SCAN_SECONDS
-    to catch deep changes. Each folder gets its own background worker once it has
-    stayed quiet for cfg.watch_quiet_seconds, so a long-running folder cannot stop
-    the watcher from noticing and organizing other folders.
+    Preferred backend: native filesystem events via the optional `watchdog`
+    package (FSEvents/inotify) — changes at any depth beneath a watched root are
+    detected instantly, with a relaxed full-scan safety net every
+    WATCH_SAFETY_SCAN_SECONDS in case an event is ever dropped.
+
+    Fallback (watchdog not installed): a lightweight fast signature (watched
+    root + immediate subdirs) every cfg.watch_poll_seconds, plus a full
+    recursive scan every WATCH_FULL_SCAN_SECONDS to catch deep changes.
+
+    In both modes, each folder gets its own background worker once it has
+    stayed quiet for cfg.watch_quiet_seconds, so a long-running folder cannot
+    stop the watcher from noticing and organizing other folders.
     """
     cfg = load_config(config_path)
     state_lock = threading.Lock()
@@ -296,17 +312,33 @@ def _run_watch_loop(
     max_workers = max(1, min(mp, 32)) if mp and mp > 0 else 32
     executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="watch-organize")
 
+    def _mark_dirty(path: str) -> None:
+        """Native event callback (observer thread): mark a watched root dirty."""
+        with state_lock:
+            if path in in_flight:
+                # The organizer's own moves fire events for the root being
+                # organized; ignore them (baselines are reset after the run).
+                return
+            dirty_since[path] = time.monotonic()
+
+    monitor = create_event_monitor(_mark_dirty)
+    use_events = monitor is not None
+    if use_events:
+        monitor.set_watched_paths(job.path for job in cfg.folders if job.enabled)
+
     print(json.dumps({
         "watch": True,
-        "poll_seconds": cfg.watch_poll_seconds,
+        "backend": monitor.backend_name() if use_events else "polling",
+        "poll_seconds": WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds,
         "quiet_seconds": cfg.watch_quiet_seconds,
-        "full_scan_seconds": WATCH_FULL_SCAN_SECONDS,
+        "full_scan_seconds": WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS,
         "max_workers": max_workers,
     }, indent=2))
 
     def _update_both_signatures(path: str, job: Optional[FolderJob] = None) -> None:
         target = job if job is not None else FolderJob(path=path)
-        signatures_fast[path] = watch_signature_fast(target)
+        if not use_events:
+            signatures_fast[path] = watch_signature_fast(target)
         signatures_full[path] = watch_signature(target)
 
     def _organize_path(path: str) -> None:
@@ -328,7 +360,7 @@ def _run_watch_loop(
             with state_lock:
                 in_flight.discard(path)
                 if sub_cfg is not None:
-                    # Update both baselines so the organizer's own moves do not retrigger.
+                    # Update baselines so the organizer's own moves do not retrigger.
                     for job in sub_cfg.folders:
                         if job.path == path:
                             _update_both_signatures(path, job)
@@ -336,6 +368,8 @@ def _run_watch_loop(
                     else:
                         _update_both_signatures(path)
                 dirty_since.pop(path, None)
+
+    full_scan_interval = WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS
 
     try:
         while not should_stop():
@@ -346,15 +380,22 @@ def _run_watch_loop(
                 if normalize_schedule_mode(cfg.schedule_mode) != SCHEDULE_MODE_WATCH:
                     print(json.dumps({"watch": False, "reason": "schedule_mode changed"}, indent=2))
                     return
+                if use_events:
+                    monitor.set_watched_paths(
+                        job.path for job in cfg.folders if job.enabled
+                    )
 
-            do_full_scan = now - last_full_scan >= WATCH_FULL_SCAN_SECONDS
+            do_full_scan = now - last_full_scan >= full_scan_interval
             if do_full_scan:
                 last_full_scan = now
 
             if force or cfg.scheduler_enabled:
                 due_paths = set()
                 enabled = [job for job in cfg.folders if job.enabled]
-                new_fast_sigs = {job.path: watch_signature_fast(job) for job in enabled}
+                new_fast_sigs = (
+                    {job.path: watch_signature_fast(job) for job in enabled}
+                    if not use_events else {}
+                )
                 new_full_sigs = (
                     {job.path: watch_signature(job) for job in enabled}
                     if do_full_scan else {}
@@ -367,11 +408,12 @@ def _run_watch_loop(
                             continue
                         sig_changed = False
 
-                        fast_prev = signatures_fast.get(path)
-                        fast_sig = new_fast_sigs[path]
-                        signatures_fast[path] = fast_sig
-                        if fast_prev is not None and fast_sig != fast_prev:
-                            sig_changed = True
+                        if not use_events:
+                            fast_prev = signatures_fast.get(path)
+                            fast_sig = new_fast_sigs[path]
+                            signatures_fast[path] = fast_sig
+                            if fast_prev is not None and fast_sig != fast_prev:
+                                sig_changed = True
 
                         if do_full_scan:
                             full_prev = signatures_full.get(path)
@@ -393,7 +435,7 @@ def _run_watch_loop(
                 for path in due_paths:
                     executor.submit(_organize_path, path)
 
-            poll_seconds = cfg.watch_poll_seconds
+            poll_seconds = WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds
             remaining = poll_seconds
             while remaining > 0:
                 if should_stop():
@@ -402,6 +444,8 @@ def _run_watch_loop(
                 time.sleep(step)
                 remaining -= step
     finally:
+        if monitor is not None:
+            monitor.stop()
         executor.shutdown(wait=True)
 
 

@@ -14,10 +14,14 @@
      KeepAlive (see the commented block at the bottom). Use this with
      `schedule_mode: interval`.
 
-  3. Watch mode: let launchd fire a one-shot run whenever a watched folder
-     changes (see the WatchPaths block at the bottom). Use this with
-     `schedule_mode: watch`. List each enabled folder under WatchPaths;
-     ThrottleInterval debounces bursts and StartInterval is an hourly backstop.
+  3. Watch mode: run the persistent watch daemon with `--foreground` plus
+     RunAtLoad and KeepAlive (same shape as the interval block at the bottom).
+     Use this with `schedule_mode: watch`. The daemon reacts to native
+     filesystem events (install the optional `watchdog` package:
+     `python3 -m pip install --user watchdog`) at any depth under each watched
+     folder within milliseconds, falling back to sub-second mtime polling when
+     watchdog is missing. Watched folders live in schedule.json, so no paths
+     need to be baked into this plist.
 
   The GUI ("Enable automatic runs") writes the right variant automatically based
   on your schedule.json; this file is only for manual installs.
@@ -66,7 +70,9 @@
 </plist>
 
 <!--
-  Interval-mode alternative (replace the <dict> above with this):
+  Interval-mode / watch-mode alternative (replace the <dict> above with this).
+  With `schedule_mode: watch` in schedule.json this same block runs the
+  near-instant watch loop:
 
   <dict>
     <key>Label</key>
@@ -91,38 +97,4 @@
   </dict>
 -->
 
-<!--
-  Watch-mode alternative (replace the <dict> above with this; one <string> per
-  enabled folder under WatchPaths):
-
-  <dict>
-    <key>Label</key>
-    <string>org.fileorganization.schedule-daemon</string>
-    <key>ProgramArguments</key>
-    <array>
-      <string>/usr/bin/caffeinate</string>
-      <string>-i</string>
-      <string>-m</string>
-      <string>-s</string>
-      <string>/usr/bin/python3</string>
-      <string>-u</string>
-      <string>INSTALL_DIR/scripts/schedule_daemon.py</string>
-      <string>--once</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>INSTALL_DIR/scripts</string>
-    <key>WatchPaths</key>
-    <array>
-      <string>/path/to/your/folder</string>
-    </array>
-    <key>ThrottleInterval</key>
-    <integer>15</integer>
-    <key>StartInterval</key>
-    <integer>3600</integer>
-    <key>StandardOutPath</key>
-    <string>INSTALL_DIR/logs/schedule-daemon.log</string>
-    <key>StandardErrorPath</key>
-    <string>INSTALL_DIR/logs/schedule-daemon.err.log</string>
-  </dict>
--->
 

@@ -549,13 +549,14 @@ class SchedulePanel(ttk.Frame):
         threading.Thread(target=worker, daemon=True, name="schedule-service-sync").start()
 
     def _schedule_signature(self) -> tuple:
-        """Everything baked into the installed service file: mode, time, and (for
-        watch mode) the set of watched folder paths."""
+        """Everything baked into the installed service file: mode and timing.
+
+        Watched folder paths are intentionally not part of the signature: watch
+        mode now runs a persistent daemon that picks up folder changes from
+        schedule.json on its periodic config reload, so adding/removing watched
+        folders needs no service reinstall."""
         mode = normalize_schedule_mode(self.cfg.schedule_mode)
-        watched: tuple = ()
-        if mode == SCHEDULE_MODE_WATCH:
-            watched = tuple(sorted(j.path for j in self.cfg.folders if j.enabled))
-        return (mode, normalize_daily_time(self.cfg.daily_time), self.cfg.interval_minutes, watched)
+        return (mode, normalize_daily_time(self.cfg.daily_time), self.cfg.interval_minutes)
 
     def _apply_schedule_change(self) -> None:
         """Reload the background agent when the run mode/time baked into it changed."""

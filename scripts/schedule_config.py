@@ -32,11 +32,14 @@ SCHEDULE_MODE_DAILY = "daily"
 SCHEDULE_MODE_WATCH = "watch"
 DEFAULT_DAILY_TIME = "00:00"
 
-# Watch mode: how often the foreground daemon polls folder mtimes, and how long a
-# folder must stay quiet after a change before a run fires (lets copies finish).
-# These are defaults; both can be overridden per-config.
+# Watch mode: how often the foreground daemon polls folder mtimes (only used by
+# the polling fallback when the optional `watchdog` package is not installed),
+# and how long a folder must stay quiet after a change before a run fires (lets
+# copies finish — in-progress writes keep emitting events/mtime bumps, which
+# keeps resetting the quiet timer). These are defaults; both can be overridden
+# per-config.
 WATCH_POLL_SECONDS = 0.25
-WATCH_QUIET_SECONDS = 1.0
+WATCH_QUIET_SECONDS = 0.3
 
 
 def _helper_script() -> Path:

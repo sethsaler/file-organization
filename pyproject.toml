@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "organize-folder-by-filetype"
-version = "1.8.0"
+version = "1.9.0"
 description = "Collision-safe folder organizer by file type"
 readme = "README.md"
 license = { text = "MIT" }
@@ -13,6 +13,7 @@ dependencies = []
 
 [project.optional-dependencies]
 ocr = ["pytesseract", "Pillow", "openpyxl"]
+watch = ["watchdog>=3.0"]
 dev = ["pytest>=7.0"]
 
 [tool.pytest.ini_options]

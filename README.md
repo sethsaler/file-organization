@@ -125,9 +125,12 @@ Set `"schedule_mode": "watch"` to organize a folder shortly after files land in 
 }
 ```
 
-- **macOS (LaunchAgent):** the agent is installed with launchd `WatchPaths` covering each enabled folder — event-driven, no resident daemon. Runs are throttled to at most one per 15 seconds, with an hourly backstop run in case an event is missed. Re-enable automatic runs (or save in the GUI) after adding/removing folders so the watched path list is refreshed.
-- **Linux / manual (`--foreground`):** the daemon uses tiered polling to stay lightweight. A fast signature (`stat` of the watched root and its immediate subdirectories) runs every `watch_poll_seconds` (default 0.25 s); a full recursive scan runs every 5 s to catch changes deeper than one level. After a change, the folder must stay quiet for `watch_quiet_seconds` (default 1 s) before organizing. Each folder gets its own background worker, so a long-running folder does not block the watcher from organizing other folders. Both timings are configurable in `schedule.json` (`watch_poll_seconds`, `watch_quiet_seconds`) or in the Schedule tab.
+- **Native FS events (recommended):** install the optional [`watchdog`](https://pypi.org/project/watchdog/) package (`python3 -m pip install --user watchdog`, or `pip install "organize-folder-by-filetype[watch]"`) and the watch daemon reacts to filesystem events (FSEvents on macOS, inotify on Linux) at **any depth** under each watched folder within milliseconds. A relaxed full recursive scan still runs every 60 s as a safety net in case an event is ever dropped. The `curl | bash` installer installs watchdog automatically (best-effort).
+- **Polling fallback (no watchdog):** the daemon uses tiered polling. A fast signature (`stat` of the watched root and its immediate subdirectories) runs every `watch_poll_seconds` (default 0.25 s); a full recursive scan runs every 5 s to catch changes deeper than one level.
+- After a change is detected, the folder must stay quiet for `watch_quiet_seconds` (default 0.3 s) before organizing — in-progress copies keep resetting the timer, so large files finish before being moved. Each folder gets its own background worker, so a long-running folder does not block the watcher from organizing other folders. Timings are configurable in `schedule.json` (`watch_poll_seconds`, `watch_quiet_seconds`) or in the Schedule tab.
+- **macOS (LaunchAgent):** enabling automatic runs in watch mode installs a persistent agent running the watch daemon (`--foreground`, `RunAtLoad` + `KeepAlive`). Watched folders are read from `schedule.json` on the daemon's periodic config reload, so adding/removing folders needs no reinstall.
 - Combine with `min_unsorted_threshold` to only fire once enough files have accumulated.
+- The daemon logs the active backend at startup (`"backend": "fsevents" | "inotify" | "polling"`) in `~/.local/state/file-organization/schedule-daemon.log`.
 
 ### Duplicate detection
 
