@@ -47,12 +47,20 @@ After install, run the folder-picker GUI (macOS or any OS with Tk):
 python3 ~/.local/share/organize-folder-by-filetype/scripts/tinker_gui.py
 ```
 
-Use the **Schedule** tab in the same app (or the standalone `schedule_gui.py`) to auto-organize folders on a timer. Config is saved to `~/.config/file-organization/schedule.json`.
+The GUI opens as a command center:
 
-1. On **Organize**, pick a folder and click **Add to schedule…**, or on **Schedule** click **Add folder…**
-2. Choose **Once daily at** `00:00` for midnight (local time), **Run every** *N* **minutes**, or **Watch folders** to organize shortly after files change
-3. Optionally enable **Expand to organize each subfolder separately** to organize each immediate subdirectory independently instead of treating the parent as a single recursive target
-4. Enable **automatic runs** — a background scheduler keeps running after you close the app (LaunchAgent on macOS, systemd user unit on Linux)
+- **Overview** shows watched folders, recent results, safety notices, and the main actions.
+- **Organize once** requires a successful preview before the organize action is enabled. The preview lists planned source and destination paths without changing files.
+- **Watched folders** keeps the folder list focused; per-folder and scheduler tuning open only when requested.
+- **History** shows results and enables Undo while a recovery manifest remains available.
+- **Advanced settings** contains the standalone random-rename tool and technical logs. Random naming is opt-in.
+
+Use **Watched folders** (or the standalone `schedule_gui.py`) to auto-organize folders. Config is saved to `~/.config/file-organization/schedule.json`.
+
+1. In **Organize once**, preview a folder and choose **Watch this folder…**, or use **Add folder…** under **Watched folders**.
+2. Open **Scheduler settings…** to run once daily, every *N* minutes, or shortly after watched files change.
+3. Open a folder's settings to organize immediate subfolders independently or set a minimum unsorted-file threshold.
+4. Enable automatic runs — a background scheduler keeps running after you close the app (LaunchAgent on macOS, systemd user unit on Linux).
 
 The GUI installs and controls the background daemon automatically. Advanced setups can still run `schedule_daemon.py` manually:
 
@@ -134,7 +142,7 @@ Set `"schedule_mode": "watch"` to organize a folder shortly after files land in 
 
 ### Duplicate detection
 
-Add `--detect-duplicates` (CLI), tick "Detect duplicates" (Tinker GUI / Schedule tab), or set `"detect_duplicates": true` on a folder job. During organization each file's size is indexed and, only when two files share a size, their contents are hashed (BLAKE2). Later copies of identical content are staged into a root-level `Duplicates` folder instead of their bucket — nothing is ever deleted, and the moves are recorded in the backup manifest so `--restore` undoes them. Files already inside root bucket folders count as the canonical copies, so re-running against a folder keeps the organized file and stages the new arrival.
+Add `--detect-duplicates` (CLI), enable "Detect identical duplicates" in the command center, or set `"detect_duplicates": true` on a folder job. During organization each file's size is indexed and, only when two files share a size, their contents are hashed (BLAKE2). Later copies of identical content are staged into a root-level `Duplicates` folder instead of their bucket — nothing is ever deleted, and the moves are recorded in the backup manifest so `--restore` undoes them. Files already inside root bucket folders count as the canonical copies, so re-running against a folder keeps the organized file and stages the new arrival.
 
 ### Threshold-gated runs
 
@@ -157,7 +165,7 @@ Set `min_unsorted_threshold` on a folder to skip the run when fewer than N unsor
 }
 ```
 
-With the above config, launchd fires `--once` every 30 minutes; the scheduler checks the unsorted count and only runs the organizer when ≥ 20 loose files are present. The "Min unsorted files" spinbox in the Schedule tab GUI sets this per folder.
+With the above config, launchd fires `--once` every 30 minutes; the scheduler checks the unsorted count and only runs the organizer when ≥ 20 loose files are present. **Watched folders → Edit selected…** sets this threshold per folder.
 
 ## Quick start
 
@@ -219,6 +227,8 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--detect-duplicates` — stage identical-content copies into `Duplicates` instead of their bucket
 - `--duplicates-hardlink` — with `--detect-duplicates`, keep duplicates in their bucket as hardlinks to the canonical copy (no extra disk space)
 - `--date-buckets` — place files under `Bucket/YYYY/MM` subfolders by modification time
+- `--random-names` — replace moved filenames with random unique names (opt-in)
+- `--no-random-names` — keep original filenames (default)
 - `--verbose` — progress on stderr during large runs
 - `--ocr-index` — after organizing, OCR PNG/JPEG under `Images/` into `.organizer/ocr_index.csv` (needs OCR deps)
 - `--collect-empty-dirs` / `--no-collect-empty-dirs` — empty-folder staging (default: on)

@@ -21,6 +21,8 @@ from org_exclude import dir_name_excluded, merge_exclude_patterns
 from org_organizer import Organizer
 from org_paths import normalize_folder_input
 from schedule_config import ScheduleConfig, find_path_conflicts, save_config
+import schedule_panel
+from schedule_panel import SchedulePanel
 
 
 @pytest.fixture
@@ -61,6 +63,89 @@ def test_flatten_dry_run(tmp_tree: Path):
     result = org.run()
     assert result["files_moved"] == 3
     assert (tmp_tree / "sub" / "photo.jpg").exists()
+    assert any(m["to"].startswith("Images/") for m in result["planned_moves"])
+
+
+def test_cli_keeps_original_filenames_by_default(tmp_path: Path):
+    (tmp_path / "photo.jpg").write_bytes(b"image")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "organize_by_filetype.py"),
+            "--path",
+            str(tmp_path),
+            "--no-recursive",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+    )
+
+    assert proc.returncode == 0
+    result = json.loads(proc.stdout)
+    assert {move["to"] for move in result["planned_moves"]} == {"Images/photo.jpg"}
+
+
+def test_hidden_only_directory_is_preserved_when_hidden_files_are_excluded(tmp_path: Path):
+    hidden_dir = tmp_path / "hidden-only"
+    hidden_dir.mkdir()
+    hidden_file = hidden_dir / ".keep"
+    hidden_file.write_text("important")
+
+    Organizer(
+        base=tmp_path,
+        recursive=True,
+        strategy="flatten-root",
+        include_hidden=False,
+        normalize="none",
+        collect_empty_dirs=True,
+        dry_run=False,
+        create_backup=False,
+    ).run()
+
+    assert hidden_file.read_text() == "important"
+
+
+def test_existing_other_bucket_contents_are_never_deleted(tmp_path: Path):
+    other = tmp_path / "Other"
+    other.mkdir()
+    existing = other / "keep.txt"
+    existing.write_text("important")
+
+    Organizer(
+        base=tmp_path,
+        recursive=True,
+        strategy="flatten-root",
+        include_hidden=True,
+        normalize="none",
+        collect_empty_dirs=True,
+        dry_run=False,
+        create_backup=False,
+    ).run()
+
+    assert existing.read_text() == "important"
+
+
+def test_preexisting_empty_other_bucket_is_recoverably_staged(tmp_path: Path):
+    other = tmp_path / "Other"
+    other.mkdir()
+    (tmp_path / "photo.jpg").write_text("image")
+
+    Organizer(
+        base=tmp_path,
+        recursive=True,
+        strategy="flatten-root",
+        include_hidden=True,
+        normalize="none",
+        collect_empty_dirs=True,
+        dry_run=False,
+        create_backup=False,
+    ).run()
+
+    assert not other.exists()
+    assert (tmp_path / "For Deletion" / "Other").is_dir()
 
 
 def test_collision_suffix(tmp_path: Path):
@@ -205,6 +290,22 @@ def test_schedule_dry_run_verified_legacy_v3():
         "folders": [{"path": "/tmp/x"}],
     })
     assert cfg.folders[0].dry_run_verified is True
+
+
+def test_failed_schedule_preview_cannot_mark_folder_verified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    panel = object.__new__(SchedulePanel)
+    panel.cfg = ScheduleConfig()
+    panel._cfg_lock = threading.Lock()
+    panel._append_log = lambda _message: None
+    panel._refresh_tree = lambda: None
+    panel._select_tree_index = lambda _index: None
+    panel._save_quiet = lambda: None
+
+    monkeypatch.setattr(schedule_panel, "run_dry_run_preview", lambda _job: (False, "preview failed"))
+    monkeypatch.setattr(schedule_panel.messagebox, "askyesno", lambda *_args, **_kwargs: True)
+
+    assert panel.add_folder_path(str(tmp_path), select=False) is True
+    assert panel.cfg.folders[0].dry_run_verified is False
 
 
 def test_daily_schedule_mode_roundtrip(tmp_path: Path):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tk UI: organize folders by type, with an integrated Schedule tab."""
+"""Compatibility entrypoint for the native File Organizer command center."""
 
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ class TinkerApp:
         self.detect_duplicates_var = tk.BooleanVar(value=False)
         self.duplicates_hardlink_var = tk.BooleanVar(value=False)
         self.date_buckets_var = tk.BooleanVar(value=False)
-        self.rename_after_organize_var = tk.BooleanVar(value=True)
+        self.rename_after_organize_var = tk.BooleanVar(value=False)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.expand_subfolders_var = tk.BooleanVar(value=False)
 
@@ -230,7 +230,7 @@ class TinkerApp:
         self._make_check(group, "…keep duplicates in place as hardlinks (no extra disk space)", self.duplicates_hardlink_var, padx=(18, 0))
         self._make_check(group, "Sort into Year/Month subfolders inside each bucket", self.date_buckets_var)
 
-        group = self._make_label_frame(advanced, "Random rename (default: on)")
+        group = self._make_label_frame(advanced, "Random rename (opt-in)")
         self._make_check(group, "Rename all files with random names after organizing", self.rename_after_organize_var)
         self._make_check(group, "Skip already-randomly-renamed files (16-char names)", self.skip_randomly_renamed_var)
 
@@ -591,9 +591,9 @@ class TinkerApp:
 
 
 def main() -> None:
-    root = tk.Tk()
-    TinkerApp(root)
-    root.mainloop()
+    from command_center import main as command_center_main
+
+    command_center_main()
 
 
 if __name__ == "__main__":

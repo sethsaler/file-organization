@@ -293,7 +293,7 @@ class SchedulePanel(ttk.Frame):
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
         self.expand_subfolders_var = tk.BooleanVar(value=False)
-        self.random_names_after_organize_var = tk.BooleanVar(value=True)
+        self.random_names_after_organize_var = tk.BooleanVar(value=False)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.min_unsorted_threshold_var = tk.IntVar(value=0)
         self.detect_duplicates_var = tk.BooleanVar(value=False)
@@ -334,7 +334,7 @@ class SchedulePanel(ttk.Frame):
         dr += 1
 
         # Random rename section
-        rename_frame = ttk.LabelFrame(detail, text="Random rename (default: on)", padding=6)
+        rename_frame = ttk.LabelFrame(detail, text="Random rename (opt-in)", padding=6)
         rename_frame.grid(row=dr, column=0, columnspan=2, sticky="ew", pady=4)
         ttk.Checkbutton(
             rename_frame,
@@ -899,7 +899,7 @@ class SchedulePanel(ttk.Frame):
         profile: str = "standard",
         exclude_defaults: bool = True,
         expand_subfolders: bool = False,
-        random_names_after_organize: bool = True,
+        random_names_after_organize: bool = False,
         skip_randomly_renamed: bool = True,
         detect_duplicates: bool = False,
         duplicates_hardlink: bool = False,
@@ -944,7 +944,9 @@ class SchedulePanel(ttk.Frame):
         if not ok:
             if not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd to schedule anyway?"):
                 return False
-        job.dry_run_verified = True
+        # Adding an unverified folder is allowed for later repair, but it must not
+        # bypass the scheduler's dry-run safety gate.
+        job.dry_run_verified = ok
         with self._cfg_lock:
             self.cfg.folders.append(job)
         self._append_log(f"Added {raw} to schedule (dry-run preview: {ok})\n")

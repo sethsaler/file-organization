@@ -39,6 +39,7 @@ from org_mime import sniff_bucket_from_file
 EMPTY_DIR_SAMPLE_LIMIT = 20
 DUPLICATES_DIR_NAME = "Duplicates"
 DUPLICATE_SAMPLE_LIMIT = 20
+PLANNED_MOVE_SAMPLE_LIMIT = 200
 
 # Pattern to detect randomly renamed files: 16 alphanumeric characters before extension
 RANDOM_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]{16}\.[^.]+$')
@@ -168,12 +169,14 @@ class Organizer:
         self.file_moves: List[ManifestEntry] = []
         self.empty_dir_moves: List[ManifestEntry] = []
         self.removed_dirs: List[str] = []
+        self.planned_file_moves: List[Dict[str, str]] = []
 
         self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
         self.used_random_names: Set[str] = set()
         self._dup_index: Optional[DuplicateIndex] = DuplicateIndex() if detect_duplicates else None
         self._resolved_dir_cache: Dict[Path, Path] = {}
         self._ensured_dirs: Set[Path] = set()
+        self._created_dirs: Set[Path] = set()
         # Skip decisions are name/pattern-based and stable within a run, but the
         # run makes 5-7 passes over the tree; memoizing avoids re-paying the
         # exclusion checks (and their resolve chains) per pass.
@@ -260,20 +263,6 @@ class Organizer:
             except OSError:
                 pass
             yield root_path, dirs, files
-
-    def _purge_hidden_files_for_cleanup(self, directory: Path) -> None:
-        if self.include_hidden:
-            return
-        try:
-            for entry in list(directory.iterdir()):
-                if entry.is_file() and not self._visible_name(entry.name):
-                    if not self.dry_run:
-                        try:
-                            entry.unlink()
-                        except OSError:
-                            pass
-        except OSError:
-            pass
 
     def _note_collision(self, collision_counter: str) -> None:
         if collision_counter == "files":
@@ -470,12 +459,26 @@ class Organizer:
 
         if not self.dry_run:
             if dest_dir not in self._ensured_dirs:
+                existed_before_run = dest_dir.exists()
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 self._ensured_dirs.add(dest_dir)
+                if not existed_before_run:
+                    self._created_dirs.add(dest_dir)
         else:
             self._init_reserved_dir(dest_dir)
 
         target = self._collision_safe_target(dest_dir, src.name)
+
+        if len(self.planned_file_moves) < PLANNED_MOVE_SAMPLE_LIMIT:
+            try:
+                self.planned_file_moves.append(
+                    {
+                        "from": str(src.relative_to(self.base)),
+                        "to": str(target.relative_to(self.base)),
+                    }
+                )
+            except ValueError:
+                pass
 
         hardlinked = False
         if not self.dry_run:
@@ -1057,17 +1060,13 @@ class Organizer:
             except OSError:
                 continue
 
-            can_remove = False
-            if not entries:
-                can_remove = True
-            elif not self.include_hidden:
-                can_remove = all(e.is_file() and not self._visible_name(e.name) for e in entries)
-
-            if not can_remove:
+            # A directory containing hidden files is not empty. Earlier behavior
+            # purged those files when include_hidden=False, which contradicted the
+            # option's promise to skip them and could destroy user data.
+            if entries:
                 continue
 
             if not self.dry_run:
-                self._purge_hidden_files_for_cleanup(root_path)
                 try:
                     if any(root_path.iterdir()):
                         continue
@@ -1113,47 +1112,22 @@ class Organizer:
             print(f"{action} {dsstore_files_removed} .DS_Store file(s)")
 
     def _cleanup_empty_other_bucket(self) -> None:
-        """Remove the Other directory if no files were moved to it."""
-        # Check if any files were moved to "Other" (case-insensitive check)
-        other_bucket_has_files = any(
-            key.casefold() == "other" and count > 0
-            for key, count in self.ext_counts.items()
-        )
-        
-        if other_bucket_has_files:
-            return
-        
-        # No files in Other bucket, remove empty Other directories
-        # For in-place strategy, check subdirectories; for flatten-root, only check base
-        if self.recursive and self.strategy == "in-place":
-            # Other dirs were recorded as the run's walks encountered them (plus
-            # any the run created), so no dedicated rglob() over the whole tree.
-            candidates = set(self._seen_other_dirs)
-            candidates.update(d for d in self._ensured_dirs if d.name.casefold() == "other")
-            candidates.add(self.base / "Other")
-            for other_dir in sorted(candidates):
-                if other_dir.is_dir():
-                    try:
-                        # Check if directory is empty (excluding hidden files if not including them)
-                        entries = list(other_dir.iterdir())
-                        if not self.include_hidden:
-                            entries = [e for e in entries if self._visible_name(e.name)]
-                        
-                        if not entries:
-                            if not self.dry_run:
-                                shutil.rmtree(other_dir)
-                    except OSError:
-                        pass
-        else:
-            # Only check root level for flatten-root strategy
-            for child in self.base.iterdir():
-                if child.is_dir() and child.name.casefold() == "other":
-                    if not self.dry_run:
-                        try:
-                            shutil.rmtree(child)
-                        except OSError:
-                            pass
-                    break
+        """Remove only genuinely empty Other directories.
+
+        Never infer emptiness from this run's move counters: an existing bucket can
+        contain files even when the current run moved nothing into it.
+        """
+        # Only remove an empty bucket created by this run. A pre-existing empty
+        # directory named Other may be meaningful to the user and is not ours to
+        # clean up.
+        candidates = (d for d in self._created_dirs if d.name.casefold() == "other")
+        for other_dir in sorted(candidates):
+            if other_dir.is_dir():
+                try:
+                    if not any(other_dir.iterdir()) and not self.dry_run:
+                        other_dir.rmdir()
+                except OSError:
+                    pass
 
     def _verify(self) -> Dict[str, object]:
         root_visible = 0
@@ -1406,6 +1380,8 @@ class Organizer:
                 "sample_moves": self.duplicate_stats.sample_moves,
             },
             "date_buckets": self.date_buckets,
+            "planned_moves": self.planned_file_moves,
+            "planned_moves_truncated": self.move_stats.files_moved > len(self.planned_file_moves),
             "rename_after_organize": {
                 "enabled": self.random_names_after_organize,
                 "files_renamed": rename_stats.get("files_renamed", 0),

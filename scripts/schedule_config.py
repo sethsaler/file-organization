@@ -76,7 +76,7 @@ class FolderJob:
     last_run: Optional[str] = None
     last_error: Optional[str] = None
     expand_subfolders: bool = False
-    random_names_after_organize: bool = True
+    random_names_after_organize: bool = False
     skip_randomly_renamed: bool = True
     min_unsorted_threshold: int = 0
     detect_duplicates: bool = False
@@ -319,7 +319,7 @@ class ScheduleConfig:
                     last_run=item.get("last_run"),
                     last_error=item.get("last_error"),
                     expand_subfolders=bool(item.get("expand_subfolders", False)),
-                    random_names_after_organize=bool(item.get("random_names_after_organize", True)),
+                    random_names_after_organize=bool(item.get("random_names_after_organize", False)),
                     skip_randomly_renamed=bool(item.get("skip_randomly_renamed", True)),
                     min_unsorted_threshold=max(0, int(item.get("min_unsorted_threshold", 0))),
                     detect_duplicates=bool(item.get("detect_duplicates", False)),
@@ -713,6 +713,9 @@ def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: st
             return rec
         if isinstance(summary, dict):
             rec["files_moved"] = summary.get("files_moved")
+            rec["moved_by_category"] = summary.get("moved_by_category")
+            rec["name_collisions_resolved"] = summary.get("name_collisions_resolved")
+            rec["backup_manifest"] = summary.get("backup_manifest")
             dup = summary.get("duplicates")
             if isinstance(dup, dict) and dup.get("enabled"):
                 rec["duplicates_moved"] = dup.get("files_moved")

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 This project tracks changes using the Hermes skill version as its public version number.
 
+## [Unreleased]
+
+### Added
+
+- Native command-center GUI with Overview, preview-first one-time organization, compact watched-folder management, recoverable run history, and advanced tools.
+- Human-readable dry-run move previews and macOS File/View menus with Command-number navigation.
+
+### Changed
+
+- Random filename generation is opt-in across the CLI, one-time organization, and new scheduled-folder defaults.
+- Scheduler timing and per-folder options now open on demand instead of occupying the primary watched-folder view.
+- Project metadata now installs cleanly as a scripts-only distribution, so `uv run --with pytest pytest` works from a fresh checkout.
+
+### Fixed
+
+- Hidden-only folders are preserved when hidden files are excluded.
+- Existing `Other` contents are never removed by empty-bucket cleanup.
+- A watched folder is marked preview-verified only after a successful dry run.
+
 ## [1.8.0] - 2026-05-23
 
 ### Added
