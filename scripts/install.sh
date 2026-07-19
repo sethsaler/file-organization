@@ -35,6 +35,9 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 cp -R "$SRC/scripts" "$SRC/launchers" "$INSTALL_DIR/"
+if [[ -d "$SRC/macos" ]]; then
+  cp -R "$SRC/macos" "$INSTALL_DIR/"
+fi
 if [[ -d "$SRC/install" ]]; then
   cp -R "$SRC/install" "$INSTALL_DIR/"
 fi
@@ -65,6 +68,12 @@ cat > "$RESTORE_WRAPPER" << WRAP
 exec python3 "$INSTALL_DIR/scripts/restore_from_backup.py" "\$@"
 WRAP
 chmod +x "$RESTORE_WRAPPER"
+CONTROL_WRAPPER="$BIN_DIR/file-organizer-control"
+cat > "$CONTROL_WRAPPER" << WRAP
+#!/usr/bin/env sh
+exec python3 "$INSTALL_DIR/scripts/quick_controls.py" "\$@"
+WRAP
+chmod +x "$CONTROL_WRAPPER"
 
 # Best-effort: install the optional `watchdog` package so watch mode uses native
 # filesystem events (near-instant) instead of the mtime-polling fallback.
@@ -80,8 +89,9 @@ echo
 echo "CLI on PATH (if ~/.local/bin is in PATH):"
 echo "  organize-by-filetype --path /path/to/folder"
 echo "  restore-file-organization MANIFEST.json"
-echo "GUI (Organize + Schedule tabs; background scheduler when enabled):"
-echo "  python3 \"$INSTALL_DIR/scripts/tinker_gui.py\""
+echo "  file-organizer-control status"
+echo "Command Center (organize, rules, review, safety, schedule, history):"
+echo "  python3 \"$INSTALL_DIR/scripts/command_center.py\""
 echo "Schedule-only window (same Schedule tab):"
 echo "  python3 \"$INSTALL_DIR/scripts/schedule_gui.py\""
 echo "Background scheduler (systemd / cron / launchd; see $INSTALL_DIR/install/):"
@@ -90,5 +100,6 @@ echo "  python3 \"$INSTALL_DIR/scripts/schedule_daemon.py\" --once"
 echo
 echo "macOS double-click (after copying launchers to Desktop or opening in Finder):"
 echo "  $INSTALL_DIR/launchers/Organize by File Type (Tinker).command"
+echo "  $INSTALL_DIR/launchers/File Organizer macOS Controls.command"
 echo "  $INSTALL_DIR/launchers/Organize Files by Type.command"
 echo "  $INSTALL_DIR/launchers/Organize Desktop by File Type.command"

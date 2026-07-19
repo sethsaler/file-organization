@@ -299,6 +299,10 @@ class SchedulePanel(ttk.Frame):
         self.detect_duplicates_var = tk.BooleanVar(value=False)
         self.duplicates_hardlink_var = tk.BooleanVar(value=False)
         self.date_buckets_var = tk.BooleanVar(value=False)
+        self.rules_file_var = tk.StringVar(value="")
+        self.unmatched_mode_var = tk.StringVar(value="bucket")
+        self.archive_root_var = tk.StringVar(value="")
+        self.archive_mapping_var = tk.StringVar(value="")
 
         dr = 0
         ttk.Checkbutton(detail, text="Include in scheduled runs", variable=self.enabled_var, command=self._push_detail_to_job).grid(
@@ -394,6 +398,31 @@ class SchedulePanel(ttk.Frame):
             command=self._push_detail_to_job,
         ).pack(side="left", padx=(6, 0))
         ttk.Label(thresh_frame, text="(0 = always run)").pack(side="left", padx=(6, 0))
+        dr += 1
+
+        routing = ttk.LabelFrame(detail, text="Rules and archive routing", padding=6)
+        routing.grid(row=dr, column=0, columnspan=2, sticky="ew", pady=4)
+        routing.columnconfigure(1, weight=1)
+        ttk.Label(routing, text="Rules file").grid(row=0, column=0, sticky="w")
+        rules_entry = ttk.Entry(routing, textvariable=self.rules_file_var)
+        rules_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Label(routing, text="If unmatched").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Combobox(
+            routing,
+            textvariable=self.unmatched_mode_var,
+            values=("bucket", "needs-review", "leave"),
+            state="readonly",
+            width=16,
+        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        ttk.Label(routing, text="Archive root").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        archive_entry = ttk.Entry(routing, textvariable=self.archive_root_var)
+        archive_entry.grid(row=2, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        ttk.Label(routing, text="Archive mapping").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        mapping_entry = ttk.Entry(routing, textvariable=self.archive_mapping_var)
+        mapping_entry.grid(row=3, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        for entry in (rules_entry, archive_entry, mapping_entry):
+            entry.bind("<FocusOut>", lambda _event: self._push_detail_to_job())
+            entry.bind("<Return>", lambda _event: self._push_detail_to_job())
 
         row += 1
         ttk.Label(frm, text="Log:").grid(row=row, column=0, sticky="w", **pad)
@@ -655,6 +684,10 @@ class SchedulePanel(ttk.Frame):
         self.detect_duplicates_var.set(job.detect_duplicates)
         self.duplicates_hardlink_var.set(job.duplicates_hardlink)
         self.date_buckets_var.set(job.date_buckets)
+        self.rules_file_var.set(job.rules_file or "")
+        self.unmatched_mode_var.set(job.unmatched_mode or "bucket")
+        self.archive_root_var.set(job.archive_root or "")
+        self.archive_mapping_var.set(job.archive_mapping or "")
 
     def _push_detail_to_job(self) -> None:
         sel = self.tree.selection()
@@ -678,6 +711,10 @@ class SchedulePanel(ttk.Frame):
         job.detect_duplicates = bool(self.detect_duplicates_var.get())
         job.duplicates_hardlink = bool(self.duplicates_hardlink_var.get())
         job.date_buckets = bool(self.date_buckets_var.get())
+        job.rules_file = self.rules_file_var.get().strip() or None
+        job.unmatched_mode = self.unmatched_mode_var.get().strip() or "bucket"
+        job.archive_root = self.archive_root_var.get().strip() or None
+        job.archive_mapping = self.archive_mapping_var.get().strip() or None
         try:
             job.min_unsorted_threshold = max(0, int(self.min_unsorted_threshold_var.get()))
         except (tk.TclError, ValueError):
@@ -904,6 +941,10 @@ class SchedulePanel(ttk.Frame):
         detect_duplicates: bool = False,
         duplicates_hardlink: bool = False,
         date_buckets: bool = False,
+        rules_file: Optional[str] = None,
+        unmatched_mode: str = "bucket",
+        archive_root: Optional[str] = None,
+        archive_mapping: Optional[str] = None,
         select: bool = True,
     ) -> bool:
         """Add a folder to the schedule list (or select it if already present)."""
@@ -939,6 +980,10 @@ class SchedulePanel(ttk.Frame):
             detect_duplicates=detect_duplicates,
             duplicates_hardlink=duplicates_hardlink,
             date_buckets=date_buckets,
+            rules_file=rules_file,
+            unmatched_mode=unmatched_mode,
+            archive_root=archive_root,
+            archive_mapping=archive_mapping,
         )
         ok, preview = run_dry_run_preview(job)
         if not ok:

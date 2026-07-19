@@ -17,6 +17,7 @@ from org_exclude import merge_exclude_patterns
 from org_manifest import restore_from_manifest
 from org_organizer import Organizer
 from org_paths import normalize_folder_input
+from org_rules import VALID_FALLBACKS, RuleSet, load_archive_recipe, load_rule_set
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +93,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Place files under Bucket/YYYY/MM subfolders based on modification time",
     )
+    parser.add_argument(
+        "--rules",
+        metavar="FILE",
+        help="Ordered JSON routing rules; the first matching rule chooses the destination",
+    )
+    parser.add_argument(
+        "--unmatched",
+        choices=sorted(VALID_FALLBACKS),
+        default=None,
+        help="What to do when no routing rule matches: bucket, needs-review, or leave",
+    )
+    parser.add_argument(
+        "--archive-root",
+        metavar="DIR",
+        help="Use the Downloader archive recipe and route into this explicit archive root",
+    )
+    parser.add_argument(
+        "--archive-mapping",
+        metavar="FILE",
+        help="JSON map of Downloader source folder names to archive-relative destinations",
+    )
     return parser.parse_args()
 
 
@@ -129,6 +151,31 @@ def main() -> None:
 
     excludes = merge_exclude_patterns(args.exclude or [], use_defaults=args.exclude_defaults)
 
+    if args.rules and args.archive_root:
+        print(json.dumps({"error": "Use --rules or --archive-root, not both"}, indent=2))
+        sys.exit(2)
+    if args.archive_mapping and not args.archive_root:
+        print(json.dumps({"error": "--archive-mapping requires --archive-root"}, indent=2))
+        sys.exit(2)
+    try:
+        rule_set = load_rule_set(Path(args.rules)) if args.rules else None
+        if args.unmatched:
+            if rule_set is None:
+                rule_set = RuleSet(unmatched=args.unmatched)
+            else:
+                rule_set.unmatched = args.unmatched
+        archive_recipe = (
+            load_archive_recipe(
+                Path(args.archive_root),
+                Path(args.archive_mapping) if args.archive_mapping else None,
+            )
+            if args.archive_root
+            else None
+        )
+    except ValueError as e:
+        print(json.dumps({"error": str(e)}, indent=2))
+        sys.exit(2)
+
     org = Organizer(
         base=base,
         recursive=args.recursive,
@@ -152,6 +199,8 @@ def main() -> None:
         detect_duplicates=args.detect_duplicates,
         duplicates_hardlink=args.duplicates_hardlink,
         date_buckets=args.date_buckets,
+        rule_set=rule_set,
+        archive_recipe=archive_recipe,
     )
     result = org.run()
     out = json.dumps(result, indent=2)

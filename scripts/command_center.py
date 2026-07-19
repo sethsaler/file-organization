@@ -26,7 +26,30 @@ if str(_SCRIPT_DIR) not in sys.path:
 from org_logging import append_history_entry, read_history
 from org_manifest import list_manifests
 from org_paths import normalize_folder_input
-from schedule_config import SCHEDULE_MODE_WATCH, normalize_schedule_mode
+from org_rules import (
+    FALLBACK_BUCKET,
+    FALLBACK_NEEDS_REVIEW,
+    FALLBACK_LEAVE,
+    NEEDS_REVIEW_DIR_NAME,
+    append_rule_for_review_choice,
+    archive_mapping_template,
+    load_rule_set,
+    save_rule_set,
+    starter_rule_set,
+)
+from org_safety import (
+    SafetyItem,
+    approve_review_item,
+    handoff_to_dedupe,
+    manifest_for_item,
+    move_to_trash,
+    original_source_for_review,
+    restore_item_run,
+    reveal_in_file_manager,
+    scan_safety_items,
+)
+from org_watch_status import read_watch_status, watch_status_path
+from schedule_config import SCHEDULE_MODE_WATCH, default_config_path, normalize_schedule_mode
 from schedule_panel import SchedulePanel
 from schedule_service import service_log_path
 
@@ -55,6 +78,15 @@ def _display_time(value: Any) -> str:
 
 def _short_path(path: str, limit: int = 64) -> str:
     return path if len(path) <= limit else "…" + path[-(limit - 1) :]
+
+
+def _human_size(value: int) -> str:
+    amount = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024.0 or unit == "TB":
+            return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{amount:.1f} TB"
 
 
 class CollapsibleFrame(ttk.Frame):
@@ -217,8 +249,8 @@ class CompactSchedulePanel(SchedulePanel):
         self._on_tree_select()
         win = tk.Toplevel(self.root)
         win.title("Folder settings")
-        win.geometry("620x590")
-        win.minsize(560, 520)
+        win.geometry("700x720")
+        win.minsize(620, 640)
         body = ttk.Frame(win, padding=18)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
@@ -266,13 +298,62 @@ class CompactSchedulePanel(SchedulePanel):
         spin.bind("<FocusOut>", lambda _event: self._push_detail_and_save())
         spin.bind("<Return>", lambda _event: self._push_detail_and_save())
 
+        routing = ttk.LabelFrame(body, text="Rules and archive routing", padding=10)
+        routing.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        routing.columnconfigure(1, weight=1)
+        ttk.Label(routing, text="Rules file").grid(row=0, column=0, sticky="w")
+        rules_entry = ttk.Entry(routing, textvariable=self.rules_file_var)
+        rules_entry.grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(
+            routing,
+            text="Choose…",
+            command=lambda: self._choose_detail_file(self.rules_file_var, "Choose routing rules"),
+        ).grid(row=0, column=2)
+        ttk.Label(routing, text="If unmatched").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        unmatched = ttk.Combobox(
+            routing,
+            textvariable=self.unmatched_mode_var,
+            values=(FALLBACK_BUCKET, FALLBACK_NEEDS_REVIEW, FALLBACK_LEAVE),
+            state="readonly",
+            width=16,
+        )
+        unmatched.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        unmatched.bind("<<ComboboxSelected>>", lambda _event: self._push_detail_and_save())
+        ttk.Label(routing, text="Archive root").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        archive_entry = ttk.Entry(routing, textvariable=self.archive_root_var)
+        archive_entry.grid(row=2, column=1, sticky="ew", padx=(8, 6), pady=(8, 0))
+        ttk.Button(routing, text="Choose…", command=lambda: self._choose_detail_folder(self.archive_root_var)).grid(row=2, column=2, pady=(8, 0))
+        ttk.Label(routing, text="Folder mapping").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        mapping_entry = ttk.Entry(routing, textvariable=self.archive_mapping_var)
+        mapping_entry.grid(row=3, column=1, sticky="ew", padx=(8, 6), pady=(8, 0))
+        ttk.Button(
+            routing,
+            text="Choose…",
+            command=lambda: self._choose_detail_file(self.archive_mapping_var, "Choose archive mapping"),
+        ).grid(row=3, column=2, pady=(8, 0))
+        for entry in (rules_entry, archive_entry, mapping_entry):
+            entry.bind("<FocusOut>", lambda _event: self._push_detail_and_save())
+            entry.bind("<Return>", lambda _event: self._push_detail_and_save())
+
         buttons = ttk.Frame(body)
-        buttons.grid(row=5, column=0, sticky="ew", pady=(22, 0))
+        buttons.grid(row=6, column=0, sticky="ew", pady=(22, 0))
         ttk.Button(buttons, text="Done", command=lambda: (self._push_detail_and_save(), win.destroy())).pack(side="right")
 
     def _push_detail_and_save(self) -> None:
         self._push_detail_to_job()
         self._save_quiet()
+
+    def _choose_detail_file(self, variable: tk.StringVar, title: str) -> None:
+        selected = filedialog.askopenfilename(title=title, filetypes=(("JSON", "*.json"),))
+        if selected:
+            variable.set(selected)
+            self._push_detail_and_save()
+
+    def _choose_detail_folder(self, variable: tk.StringVar) -> None:
+        selected = filedialog.askdirectory(title="Choose Archive root")
+        if selected:
+            variable.set(selected)
+            self._push_detail_and_save()
 
     def _show_scheduler_settings(self) -> None:
         win = tk.Toplevel(self.root)
@@ -380,6 +461,23 @@ class CommandCenterApp:
         self.rename_after_organize_var = tk.BooleanVar(value=False)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.expand_subfolders_var = tk.BooleanVar(value=False)
+        self.rules_file_var = tk.StringVar()
+        self.unmatched_mode_var = tk.StringVar(value=FALLBACK_BUCKET)
+        self.archive_root_var = tk.StringVar()
+        self.archive_mapping_var = tk.StringVar()
+
+        # Rules/review and Safety Center state.
+        self.review_root_var = tk.StringVar()
+        self.review_destination_var = tk.StringVar(value="Other/Reviewed")
+        self.review_remember_var = tk.BooleanVar(value=True)
+        self.review_criterion_var = tk.StringVar(value="Extension")
+        self.review_rules_file_var = tk.StringVar(
+            value=str(default_config_path().parent / "rules.json")
+        )
+        self._review_items: list[Path] = []
+        self.safety_root_var = tk.StringVar()
+        self.safety_status_var = tk.StringVar(value="")
+        self._safety_items: list[SafetyItem] = []
 
         # Standalone random rename state.
         self.rename_path_var = tk.StringVar()
@@ -404,7 +502,7 @@ class CommandCenterApp:
         self.main.rowconfigure(0, weight=1)
 
         self._pages: dict[str, ttk.Frame] = {}
-        for key in ("overview", "organize", "watched", "history", "advanced"):
+        for key in ("overview", "organize", "rules", "watched", "history", "safety", "advanced"):
             page = ttk.Frame(self.main, padding=(28, 24))
             page.grid(row=0, column=0, sticky="nsew")
             self._pages[key] = page
@@ -413,7 +511,9 @@ class CommandCenterApp:
         self._build_watched_page(self._pages["watched"])
         self._build_overview_page(self._pages["overview"])
         self._build_organize_page(self._pages["organize"])
+        self._build_rules_page(self._pages["rules"])
         self._build_history_page(self._pages["history"])
+        self._build_safety_page(self._pages["safety"])
         self._build_advanced_page(self._pages["advanced"])
         self._build_sidebar()
         self._build_menus()
@@ -455,8 +555,10 @@ class CommandCenterApp:
         labels = (
             ("overview", "Overview"),
             ("organize", "Organize once"),
+            ("rules", "Rules & review"),
             ("watched", "Watched folders"),
             ("history", "History"),
+            ("safety", "Safety center"),
             ("advanced", "Advanced settings"),
         )
         for key, label in labels:
@@ -512,8 +614,10 @@ class CommandCenterApp:
             (
                 ("overview", "Overview"),
                 ("organize", "Organize Once"),
+                ("rules", "Rules & Review"),
                 ("watched", "Watched Folders"),
                 ("history", "History"),
+                ("safety", "Safety Center"),
                 ("advanced", "Advanced Settings"),
             ),
             start=1,
@@ -527,7 +631,7 @@ class CommandCenterApp:
         self.root.configure(menu=menubar)
 
     def _bind_shortcuts(self) -> None:
-        for index, key in enumerate(("overview", "organize", "watched", "history", "advanced"), start=1):
+        for index, key in enumerate(("overview", "organize", "rules", "watched", "history", "safety", "advanced"), start=1):
             self.root.bind_all(f"<Command-Key-{index}>", lambda _event, page=key: self._show_page(page))
         self.root.bind_all("<Command-Key-o>", lambda _event: self._focus_organize())
         self.root.bind_all("<Command-Key-p>", lambda _event: self._run_organize(True))
@@ -550,6 +654,12 @@ class CommandCenterApp:
             )
         if key == "history":
             self._refresh_history()
+        elif key == "rules":
+            self._sync_review_root_from_context()
+            self._refresh_review_queue()
+        elif key == "safety":
+            self._sync_safety_root_from_context()
+            self._refresh_safety_center()
         elif key == "overview":
             self._refresh_overview_once()
 
@@ -566,12 +676,14 @@ class CommandCenterApp:
         header.columnconfigure(0, weight=1)
         self.overview_status_title = tk.StringVar()
         self.overview_status_subtitle = tk.StringVar()
+        self.overview_health_var = tk.StringVar()
         self.overview_warning_var = tk.StringVar()
         self.pause_button_var = tk.StringVar()
         ttk.Label(header, textvariable=self.overview_status_title, style="StatusTitle.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(header, textvariable=self.overview_status_subtitle, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.overview_warning_var, style="Warning.TLabel").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(header, textvariable=self.pause_button_var, command=self._toggle_watching).grid(row=0, column=1, rowspan=3, sticky="e")
+        ttk.Label(header, textvariable=self.overview_health_var, style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(header, textvariable=self.pause_button_var, command=self._toggle_watching).grid(row=0, column=1, rowspan=4, sticky="e")
 
         ttk.Separator(page).grid(row=1, column=0, sticky="ew", pady=20)
         ttk.Label(page, text="Watched folders", style="SectionTitle.TLabel").grid(row=2, column=0, sticky="w")
@@ -634,6 +746,8 @@ class CommandCenterApp:
         cfg = self.schedule_panel.cfg
         enabled = [job for job in cfg.folders if job.enabled]
         watching = bool(cfg.scheduler_enabled) and normalize_schedule_mode(cfg.schedule_mode) == SCHEDULE_MODE_WATCH
+        watch_health = read_watch_status()
+        folder_health = watch_health.get("folders") if isinstance(watch_health.get("folders"), dict) else {}
         if watching:
             self.overview_status_title.set(f"Organizer is watching {len(enabled)} folder{'s' if len(enabled) != 1 else ''}")
             self.overview_status_subtitle.set("Files will be organized automatically when they arrive.")
@@ -646,6 +760,17 @@ class CommandCenterApp:
             self.overview_status_title.set("Automatic organization is paused")
             self.overview_status_subtitle.set("One-time organization and previews are still available.")
             self.pause_button_var.set("Resume automatic runs")
+        if watching and watch_health:
+            backend = str(watch_health.get("backend") or "unknown backend")
+            pending = int(watch_health.get("pending_count", 0) or 0)
+            running = int(watch_health.get("running_count", 0) or 0)
+            self.overview_health_var.set(
+                f"Watcher: {backend} · {running} running · {pending} waiting · health updated {_display_time(watch_health.get('updated_at'))}"
+            )
+        elif watching:
+            self.overview_health_var.set(f"Waiting for watcher health at {watch_status_path()}")
+        else:
+            self.overview_health_var.set("")
         random_name_count = sum(bool(job.random_names_after_organize) for job in cfg.folders)
         self.overview_warning_var.set(
             f"Random filenames are enabled for {random_name_count} watched folder{'s' if random_name_count != 1 else ''}."
@@ -662,7 +787,14 @@ class CommandCenterApp:
             elif not job.enabled:
                 status = "Paused"
             elif watching:
-                status = "Watching"
+                detail = folder_health.get(job.path) if isinstance(folder_health, dict) else None
+                state = str((detail or {}).get("state") or "idle") if isinstance(detail, dict) else "idle"
+                status = {
+                    "running": "Running",
+                    "dirty": "Waiting",
+                    "waiting": "Waiting",
+                    "error": "Failed",
+                }.get(state, "Watching")
             else:
                 status = "Scheduled"
             if job.last_error:
@@ -749,11 +881,13 @@ class CommandCenterApp:
         move_frame.grid(row=6, column=0, sticky="nsew", pady=(12, 0))
         move_frame.columnconfigure(0, weight=1)
         move_frame.rowconfigure(0, weight=1)
-        self.planned_tree = ttk.Treeview(move_frame, columns=("source", "destination"), show="headings", height=8)
+        self.planned_tree = ttk.Treeview(move_frame, columns=("source", "destination", "reason"), show="headings", height=8)
         self.planned_tree.heading("source", text="Current location")
         self.planned_tree.heading("destination", text="Destination")
-        self.planned_tree.column("source", width=430)
-        self.planned_tree.column("destination", width=430)
+        self.planned_tree.heading("reason", text="Why")
+        self.planned_tree.column("source", width=220)
+        self.planned_tree.column("destination", width=280)
+        self.planned_tree.column("reason", width=240)
         self.planned_tree.grid(row=0, column=0, sticky="nsew")
         ttk.Scrollbar(move_frame, orient="vertical", command=self.planned_tree.yview).grid(row=0, column=1, sticky="ns")
 
@@ -797,6 +931,41 @@ class CommandCenterApp:
         ttk.Radiobutton(choices, text="Flatten to root buckets", variable=self.strategy_var, value="flatten-root").pack(side="left", padx=(6, 4))
         ttk.Radiobutton(choices, text="In place", variable=self.strategy_var, value="in-place").pack(side="left")
 
+        routing = ttk.LabelFrame(parent, text="Rules and archive routing", padding=10)
+        routing.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        routing.columnconfigure(1, weight=1)
+        ttk.Label(routing, text="Rules file").grid(row=0, column=0, sticky="w")
+        ttk.Entry(routing, textvariable=self.rules_file_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(
+            routing,
+            text="Choose…",
+            command=lambda: self._browse_file(self.rules_file_var, "Choose routing rules", (("JSON", "*.json"),)),
+        ).grid(row=0, column=2)
+        ttk.Label(routing, text="If unmatched").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            routing,
+            textvariable=self.unmatched_mode_var,
+            values=(FALLBACK_BUCKET, FALLBACK_NEEDS_REVIEW, FALLBACK_LEAVE),
+            state="readonly",
+            width=18,
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(routing, text="Archive root").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(routing, textvariable=self.archive_root_var).grid(row=2, column=1, sticky="ew", padx=(8, 6), pady=(8, 0))
+        ttk.Button(routing, text="Choose…", command=lambda: self._browse(self.archive_root_var, "Choose iCloud Archive root")).grid(row=2, column=2, pady=(8, 0))
+        ttk.Label(routing, text="Folder mapping").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(routing, textvariable=self.archive_mapping_var).grid(row=3, column=1, sticky="ew", padx=(8, 6), pady=(8, 0))
+        ttk.Button(
+            routing,
+            text="Choose…",
+            command=lambda: self._browse_file(self.archive_mapping_var, "Choose archive folder mapping", (("JSON", "*.json"),)),
+        ).grid(row=3, column=2, pady=(8, 0))
+        ttk.Label(
+            routing,
+            text="Use either a rules file or an Archive root. Archive mappings route known creator folders; unknown folders are held for review.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
     def _bind_preview_invalidation(self) -> None:
         variables = (
             self.path_var,
@@ -814,6 +983,10 @@ class CommandCenterApp:
             self.rename_after_organize_var,
             self.skip_randomly_renamed_var,
             self.expand_subfolders_var,
+            self.rules_file_var,
+            self.unmatched_mode_var,
+            self.archive_root_var,
+            self.archive_mapping_var,
         )
         for var in variables:
             var.trace_add("write", lambda *_args: self._invalidate_preview())
@@ -852,7 +1025,15 @@ class CommandCenterApp:
         self.detect_duplicates_var.set(False)
         self.date_buckets_var.set(False)
         self.profile_var.set("extended" if preset == "Extended categories" else "standard")
-        self.rename_after_organize_var.set(preset == "Downloader inbox")
+        self.rename_after_organize_var.set(False)
+        if preset == "Downloader inbox":
+            self.rules_file_var.set("")
+            self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
+        else:
+            self.rules_file_var.set("")
+            self.archive_root_var.set("")
+            self.archive_mapping_var.set("")
+            self.unmatched_mode_var.set(FALLBACK_BUCKET)
 
     def _preview_fingerprint(self) -> tuple:
         return (
@@ -870,7 +1051,281 @@ class CommandCenterApp:
             self.date_buckets_var.get(),
             self.rename_after_organize_var.get(),
             self.expand_subfolders_var.get(),
+            self.rules_file_var.get().strip(),
+            self.unmatched_mode_var.get(),
+            self.archive_root_var.get().strip(),
+            self.archive_mapping_var.get().strip(),
         )
+
+    # ------------------------------------------------------------------
+    # Rules and review queue
+    # ------------------------------------------------------------------
+
+    def _build_rules_page(self, page: ttk.Frame) -> None:
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(6, weight=1)
+        ttk.Label(page, text="Rules & review", style="PageTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            page,
+            text="Use deterministic rules for known files and hold everything else for a human decision.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 16))
+
+        setup = ttk.LabelFrame(page, text="Rule setup", padding=12)
+        setup.grid(row=2, column=0, sticky="ew")
+        setup.columnconfigure(1, weight=1)
+        ttk.Label(setup, text="Organizer root").grid(row=0, column=0, sticky="w")
+        ttk.Entry(setup, textvariable=self.review_root_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(setup, text="Choose…", command=lambda: self._browse(self.review_root_var, "Choose organizer root")).grid(row=0, column=2)
+        ttk.Label(setup, text="Rules file").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(setup, textvariable=self.review_rules_file_var).grid(row=1, column=1, sticky="ew", padx=(8, 6), pady=(8, 0))
+        ttk.Button(
+            setup,
+            text="Choose…",
+            command=lambda: self._browse_file(self.review_rules_file_var, "Choose routing rules", (("JSON", "*.json"),)),
+        ).grid(row=1, column=2, pady=(8, 0))
+        setup_actions = ttk.Frame(setup)
+        setup_actions.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Button(setup_actions, text="Create starter rules", command=self._create_starter_rules).pack(side="left")
+        ttk.Button(setup_actions, text="Validate rules", command=self._validate_rules).pack(side="left", padx=(8, 0))
+        ttk.Button(setup_actions, text="Use for Organize once", command=self._use_rules_for_organize).pack(side="left", padx=(8, 0))
+
+        archive_box = CollapsibleFrame(page, "Downloader → Archive recipe")
+        archive_box.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        archive = archive_box.content
+        archive.columnconfigure(1, weight=1)
+        ttk.Label(archive, text="Archive root").grid(row=0, column=0, sticky="w")
+        ttk.Entry(archive, textvariable=self.archive_root_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(archive, text="Choose…", command=lambda: self._browse(self.archive_root_var, "Choose Archive root")).grid(row=0, column=2)
+        ttk.Label(archive, text="Creator mapping").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(archive, textvariable=self.archive_mapping_var).grid(row=1, column=1, sticky="ew", padx=(8, 6), pady=(8, 0))
+        ttk.Button(archive, text="Create…", command=self._create_archive_mapping).grid(row=1, column=2, pady=(8, 0))
+        ttk.Label(
+            archive,
+            text="Loose media goes to exact Recents category folders. Known creator folders use the mapping; unknown folders go to Needs Review.",
+            style="Muted.TLabel",
+            wraplength=760,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Button(archive, text="Use archive recipe for Organize once", command=self._use_archive_for_organize).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        review_header = ttk.Frame(page)
+        review_header.grid(row=4, column=0, sticky="ew", pady=(18, 8))
+        ttk.Label(review_header, text="Needs Review", style="SectionTitle.TLabel").pack(side="left")
+        self.review_status_var = tk.StringVar(value="")
+        ttk.Label(review_header, textvariable=self.review_status_var, style="Muted.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Button(review_header, text="Refresh", command=self._refresh_review_queue).pack(side="right")
+
+        decision = ttk.Frame(page)
+        decision.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(decision, text="Destination").pack(side="left")
+        ttk.Entry(decision, textvariable=self.review_destination_var, width=28).pack(side="left", padx=(6, 12))
+        ttk.Checkbutton(decision, text="Remember as rule", variable=self.review_remember_var).pack(side="left")
+        ttk.Combobox(
+            decision,
+            textvariable=self.review_criterion_var,
+            values=("Extension", "Filename", "Parent folder"),
+            state="readonly",
+            width=14,
+        ).pack(side="left", padx=(6, 0))
+
+        frame = ttk.Frame(page)
+        frame.grid(row=6, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.review_tree = ttk.Treeview(
+            frame,
+            columns=("name", "location", "size", "modified"),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label in (("name", "Item"), ("location", "Review location"), ("size", "Size"), ("modified", "Modified")):
+            self.review_tree.heading(key, text=label)
+        self.review_tree.column("name", width=155)
+        self.review_tree.column("location", width=330)
+        self.review_tree.column("size", width=75, anchor="e", stretch=False)
+        self.review_tree.column("modified", width=125, stretch=False)
+        self.review_tree.grid(row=0, column=0, sticky="nsew")
+        ttk.Scrollbar(frame, orient="vertical", command=self.review_tree.yview).grid(row=0, column=1, sticky="ns")
+        actions = ttk.Frame(page)
+        actions.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(actions, text="Approve selected", style="Primary.TButton", command=self._approve_review_selected).pack(side="left")
+        ttk.Button(actions, text="Reveal in Finder", command=self._reveal_review_selected).pack(side="left", padx=(8, 0))
+
+    def _sync_review_root_from_context(self) -> None:
+        if self.review_root_var.get().strip():
+            return
+        current = self.path_var.get().strip()
+        if current:
+            self.review_root_var.set(current)
+        elif self.schedule_panel.cfg.folders:
+            self.review_root_var.set(self.schedule_panel.cfg.folders[0].path)
+
+    def _create_starter_rules(self) -> None:
+        raw = self.review_rules_file_var.get().strip()
+        if not raw:
+            raw = str(default_config_path().parent / "rules.json")
+            self.review_rules_file_var.set(raw)
+        path = Path(raw).expanduser()
+        if path.exists() and not messagebox.askyesno("Replace rules", f"Replace the existing rules file?\n{path}"):
+            return
+        try:
+            save_rule_set(path, starter_rule_set())
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Rules", str(exc))
+            return
+        self.rules_file_var.set(str(path))
+        self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
+        messagebox.showinfo("Rules", f"Starter rules created at:\n{path}")
+
+    def _validate_rules(self) -> None:
+        path = Path(self.review_rules_file_var.get().strip()).expanduser()
+        try:
+            rules = load_rule_set(path)
+        except ValueError as exc:
+            messagebox.showerror("Rules", str(exc))
+            return
+        enabled = sum(1 for rule in rules.rules if rule.enabled)
+        messagebox.showinfo("Rules", f"Valid: {enabled} enabled rule{'s' if enabled != 1 else ''}; unmatched → {rules.unmatched}.")
+
+    def _use_rules_for_organize(self) -> None:
+        root = self.review_root_var.get().strip()
+        rules = self.review_rules_file_var.get().strip()
+        if not root or not rules:
+            messagebox.showwarning("Rules", "Choose an organizer root and rules file first.")
+            return
+        self.path_var.set(root)
+        self.rules_file_var.set(rules)
+        self.archive_root_var.set("")
+        self.archive_mapping_var.set("")
+        try:
+            self.unmatched_mode_var.set(load_rule_set(Path(rules)).unmatched)
+        except ValueError:
+            self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
+        self._show_page("organize")
+
+    def _create_archive_mapping(self) -> None:
+        initial = self.archive_mapping_var.get().strip() or str(default_config_path().parent / "archive-mapping.json")
+        selected = filedialog.asksaveasfilename(
+            title="Create archive folder mapping",
+            initialfile=Path(initial).name,
+            initialdir=str(Path(initial).expanduser().parent),
+            defaultextension=".json",
+            filetypes=(("JSON", "*.json"),),
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        if path.exists() and not messagebox.askyesno("Replace mapping", f"Replace the existing mapping?\n{path}"):
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(archive_mapping_template(), indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Archive mapping", str(exc))
+            return
+        self.archive_mapping_var.set(str(path))
+        messagebox.showinfo("Archive mapping", f"Mapping template created at:\n{path}")
+
+    def _use_archive_for_organize(self) -> None:
+        source = self.review_root_var.get().strip() or self.path_var.get().strip()
+        archive = self.archive_root_var.get().strip()
+        if not source or not archive:
+            messagebox.showwarning("Archive recipe", "Choose the Downloader source and Archive root first.")
+            return
+        self.path_var.set(source)
+        self.rules_file_var.set("")
+        self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
+        self.preset_var.set("Downloader inbox")
+        self.rename_after_organize_var.set(False)
+        self._show_page("organize")
+
+    def _refresh_review_queue(self) -> None:
+        for item in self.review_tree.get_children():
+            self.review_tree.delete(item)
+        raw = self.review_root_var.get().strip()
+        if not raw:
+            self.review_status_var.set("Choose an organizer root")
+            self._review_items = []
+            return
+        root = normalize_folder_input(raw)
+        review_root = root / NEEDS_REVIEW_DIR_NAME
+        if not review_root.is_dir():
+            self.review_status_var.set("Queue is empty")
+            self._review_items = []
+            return
+        try:
+            items = [path for path in review_root.rglob("*") if path.is_file()]
+        except OSError:
+            items = []
+        def modified_time(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        items.sort(key=modified_time, reverse=True)
+        self._review_items = items[:1000]
+        for index, path in enumerate(self._review_items):
+            try:
+                stat = path.stat()
+                size = _human_size(stat.st_size)
+                modified = _display_time(datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat())
+            except OSError:
+                size, modified = "—", "Unknown"
+            self.review_tree.insert(
+                "",
+                "end",
+                iid=f"review-{index}",
+                values=(path.name, _short_path(str(path.relative_to(root)), 58), size, modified),
+            )
+        self.review_status_var.set(f"{len(self._review_items)} item{'s' if len(self._review_items) != 1 else ''}")
+
+    def _selected_review_item(self) -> Optional[Path]:
+        selection = self.review_tree.selection()
+        if not selection:
+            messagebox.showwarning("Needs Review", "Select an item first.")
+            return None
+        try:
+            return self._review_items[int(selection[0].split("-")[-1])]
+        except (ValueError, IndexError):
+            return None
+
+    def _approve_review_selected(self) -> None:
+        item = self._selected_review_item()
+        if item is None:
+            return
+        root = normalize_folder_input(self.review_root_var.get().strip())
+        destination = self.review_destination_var.get().strip()
+        if not messagebox.askyesno("Approve reviewed item", f"Move:\n{item.name}\n\nTo:\n{destination}\n\nA recovery backup will be created."):
+            return
+        original = original_source_for_review(root, item)
+        try:
+            target, _manifest = approve_review_item(root, item, destination)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Needs Review", str(exc))
+            return
+        rule_note = ""
+        if self.review_remember_var.get():
+            rules_path = Path(self.review_rules_file_var.get().strip()).expanduser()
+            try:
+                rule = append_rule_for_review_choice(
+                    rules_path,
+                    source=original,
+                    destination=destination,
+                    criterion=self.review_criterion_var.get(),
+                )
+                self.rules_file_var.set(str(rules_path))
+                self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
+                rule_note = f"\n\nRemembered rule: {rule.name}"
+            except (OSError, ValueError) as exc:
+                rule_note = f"\n\nThe file moved, but the rule could not be saved: {exc}"
+        messagebox.showinfo("Needs Review", f"Moved to:\n{target}{rule_note}")
+        self._refresh_review_queue()
+
+    def _reveal_review_selected(self) -> None:
+        item = self._selected_review_item()
+        if item is not None and not reveal_in_file_manager(item):
+            messagebox.showerror("Finder", "The selected item could not be revealed.")
 
     # ------------------------------------------------------------------
     # Watched folders
@@ -951,6 +1406,12 @@ class CommandCenterApp:
         collisions = rec.get("name_collisions_resolved")
         if collisions:
             parts.append(f"{collisions} collision{'s' if collisions != 1 else ''} resolved")
+        needs_review = rec.get("needs_review_files")
+        if needs_review:
+            parts.append(f"{needs_review} held for review")
+        external = rec.get("external_moves")
+        if external:
+            parts.append(f"{external} archived")
         return " · ".join(parts)
 
     def _on_history_select(self, _event: Any = None) -> None:
@@ -978,6 +1439,170 @@ class CommandCenterApp:
         records = read_history(1)
         if records:
             self._restore_manifest(str(records[0].get("backup_manifest") or ""))
+
+    # ------------------------------------------------------------------
+    # Safety Center
+    # ------------------------------------------------------------------
+
+    def _build_safety_page(self, page: ttk.Frame) -> None:
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(4, weight=1)
+        ttk.Label(page, text="Safety center", style="PageTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            page,
+            text="Review held items, recover their originating run, hand media to Dedupe, or move selected items to the macOS Trash.",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 16))
+
+        chooser = ttk.Frame(page)
+        chooser.grid(row=2, column=0, sticky="ew")
+        chooser.columnconfigure(1, weight=1)
+        ttk.Label(chooser, text="Organizer root").grid(row=0, column=0, sticky="w")
+        ttk.Entry(chooser, textvariable=self.safety_root_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(chooser, text="Choose…", command=lambda: self._browse(self.safety_root_var, "Choose organizer root")).grid(row=0, column=2)
+        ttk.Button(chooser, text="Refresh", command=self._refresh_safety_center).grid(row=0, column=3, padx=(8, 0))
+        ttk.Label(chooser, textvariable=self.safety_status_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        ttk.Label(page, text="Held items", style="SectionTitle.TLabel").grid(row=3, column=0, sticky="w", pady=(18, 8))
+        frame = ttk.Frame(page)
+        frame.grid(row=4, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.safety_tree = ttk.Treeview(
+            frame,
+            columns=("kind", "item", "root", "files", "size", "modified", "recovery"),
+            show="headings",
+            selectmode="browse",
+        )
+        for key, label in (
+            ("kind", "Area"),
+            ("item", "Item"),
+            ("root", "Organizer root"),
+            ("files", "Files"),
+            ("size", "Size"),
+            ("modified", "Modified"),
+            ("recovery", "Recovery"),
+        ):
+            self.safety_tree.heading(key, text=label)
+        self.safety_tree.column("kind", width=90, stretch=False)
+        self.safety_tree.column("item", width=140)
+        self.safety_tree.column("root", width=170)
+        self.safety_tree.column("files", width=45, anchor="e", stretch=False)
+        self.safety_tree.column("size", width=70, anchor="e", stretch=False)
+        self.safety_tree.column("modified", width=115, stretch=False)
+        self.safety_tree.column("recovery", width=75, stretch=False)
+        self.safety_tree.grid(row=0, column=0, sticky="nsew")
+        ttk.Scrollbar(frame, orient="vertical", command=self.safety_tree.yview).grid(row=0, column=1, sticky="ns")
+
+        actions = ttk.Frame(page)
+        actions.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(actions, text="Reveal in Finder", command=self._reveal_safety_selected).pack(side="left")
+        ttk.Button(actions, text="Restore related run…", command=self._restore_safety_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Open in Dedupe", command=self._dedupe_safety_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Move to Trash…", command=self._trash_safety_selected).pack(side="right")
+
+    def _sync_safety_root_from_context(self) -> None:
+        if self.safety_root_var.get().strip():
+            return
+        current = self.path_var.get().strip()
+        if current:
+            self.safety_root_var.set(current)
+        elif self.schedule_panel.cfg.folders:
+            self.safety_root_var.set(self.schedule_panel.cfg.folders[0].path)
+
+    def _refresh_safety_center(self) -> None:
+        for row in self.safety_tree.get_children():
+            self.safety_tree.delete(row)
+        raw = self.safety_root_var.get().strip()
+        if raw:
+            roots = [normalize_folder_input(raw)]
+        else:
+            roots = [normalize_folder_input(job.path) for job in self.schedule_panel.cfg.folders]
+        self._safety_items = scan_safety_items(roots)
+        total_files = sum(item.files for item in self._safety_items)
+        total_size = sum(item.size_bytes for item in self._safety_items)
+        for index, item in enumerate(self._safety_items):
+            recovery = "Available" if manifest_for_item(item) else "Not found"
+            self.safety_tree.insert(
+                "",
+                "end",
+                iid=f"safety-{index}",
+                values=(
+                    item.container,
+                    item.path.name,
+                    _short_path(str(item.base), 38),
+                    item.files,
+                    _human_size(item.size_bytes),
+                    item.display_modified,
+                    recovery,
+                ),
+            )
+        self.safety_status_var.set(
+            f"{len(self._safety_items)} held item{'s' if len(self._safety_items) != 1 else ''} · {total_files} file{'s' if total_files != 1 else ''} · {_human_size(total_size)}"
+        )
+
+    def _selected_safety_item(self) -> Optional[SafetyItem]:
+        selection = self.safety_tree.selection()
+        if not selection:
+            messagebox.showwarning("Safety center", "Select an item first.")
+            return None
+        try:
+            return self._safety_items[int(selection[0].split("-")[-1])]
+        except (ValueError, IndexError):
+            return None
+
+    def _reveal_safety_selected(self) -> None:
+        item = self._selected_safety_item()
+        if item is not None and not reveal_in_file_manager(item.path):
+            messagebox.showerror("Safety center", "The selected item could not be revealed.")
+
+    def _restore_safety_selected(self) -> None:
+        item = self._selected_safety_item()
+        if item is None:
+            return
+        manifest = manifest_for_item(item)
+        if manifest is None:
+            messagebox.showinfo("Recovery unavailable", "No recovery manifest was found for this item.")
+            return
+        if not messagebox.askyesno(
+            "Restore related run",
+            f"Restore the full run associated with:\n{item.path.name}\n\nBackup: {manifest.name}\n\nExisting files will not be overwritten.",
+        ):
+            return
+        ok, message = restore_item_run(item)
+        messagebox.showinfo("Restore complete" if ok else "Restore failed", message)
+        self._refresh_safety_center()
+
+    def _trash_safety_selected(self) -> None:
+        item = self._selected_safety_item()
+        if item is None:
+            return
+        if not messagebox.askyesno(
+            "Move to Trash",
+            f"Move this held item to the macOS Trash?\n\n{item.path}\n\nIt will not be permanently deleted.",
+        ):
+            return
+        ok, message = move_to_trash(item.path)
+        messagebox.showinfo("Moved to Trash" if ok else "Trash failed", message)
+        self._refresh_safety_center()
+
+    def _dedupe_safety_selected(self) -> None:
+        item = self._selected_safety_item()
+        if item is None:
+            return
+        self.safety_status_var.set("Opening Dedupe and handing off the selected item…")
+
+        def work() -> None:
+            ok, message = handoff_to_dedupe([item.path])
+            self.root.after(
+                0,
+                lambda: (
+                    self.safety_status_var.set(message),
+                    messagebox.showinfo("Dedupe" if ok else "Dedupe handoff failed", message),
+                ),
+            )
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Advanced settings and standalone rename
@@ -1033,6 +1658,16 @@ class CommandCenterApp:
         if selected:
             var.set(selected)
 
+    def _browse_file(
+        self,
+        var: tk.StringVar,
+        title: str,
+        filetypes: tuple[tuple[str, str], ...] = (("All files", "*"),),
+    ) -> None:
+        selected = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if selected:
+            var.set(selected)
+
     def _resolve_folder(self, var: tk.StringVar, title: str = "Folder") -> Path | None:
         raw = var.get().strip()
         if not raw:
@@ -1078,6 +1713,17 @@ class CommandCenterApp:
             cmd.append("--skip-randomly-renamed")
         if self.verbose_var.get():
             cmd.append("--verbose")
+        rules_file = self.rules_file_var.get().strip()
+        archive_root = self.archive_root_var.get().strip()
+        archive_mapping = self.archive_mapping_var.get().strip()
+        if rules_file:
+            cmd.extend(["--rules", rules_file])
+        if self.unmatched_mode_var.get() != FALLBACK_BUCKET:
+            cmd.extend(["--unmatched", self.unmatched_mode_var.get()])
+        if archive_root:
+            cmd.extend(["--archive-root", archive_root])
+            if archive_mapping:
+                cmd.extend(["--archive-mapping", archive_mapping])
         if dry_run:
             cmd.append("--dry-run")
         return cmd
@@ -1085,6 +1731,15 @@ class CommandCenterApp:
     def _run_organize(self, dry_run: bool) -> None:
         base = self._resolve_folder(self.path_var)
         if base is None:
+            return
+        rules_file = self.rules_file_var.get().strip()
+        archive_root = self.archive_root_var.get().strip()
+        archive_mapping = self.archive_mapping_var.get().strip()
+        if rules_file and archive_root:
+            messagebox.showerror("Routing settings", "Use either a rules file or the Downloader Archive root, not both.")
+            return
+        if archive_mapping and not archive_root:
+            messagebox.showerror("Routing settings", "Choose an Archive root before using an archive folder mapping.")
             return
         if not dry_run and self._last_preview_fingerprint != self._preview_fingerprint():
             messagebox.showwarning("Preview required", "Preview the current folder and settings before organizing.")
@@ -1149,6 +1804,10 @@ class CommandCenterApp:
             detect_duplicates=self.detect_duplicates_var.get(),
             duplicates_hardlink=self.duplicates_hardlink_var.get(),
             date_buckets=self.date_buckets_var.get(),
+            rules_file=self.rules_file_var.get().strip() or None,
+            unmatched_mode=self.unmatched_mode_var.get(),
+            archive_root=self.archive_root_var.get().strip() or None,
+            archive_mapping=self.archive_mapping_var.get().strip() or None,
         )
         if added:
             self._show_page("watched")
@@ -1278,14 +1937,20 @@ class CommandCenterApp:
         normalized = sum(int((summary.get("normalization") or {}).get("items_moved_in_merges") or 0) for summary in clean)
         collisions = sum(int(summary.get("name_collisions_resolved") or 0) for summary in clean)
         categories: Counter[str] = Counter()
-        planned: list[tuple[str, str]] = []
+        planned: list[tuple[str, str, str]] = []
+        needs_review = 0
+        external_moves = 0
         for summary in clean:
             category_map = summary.get("moved_by_category")
             if isinstance(category_map, dict):
                 categories.update({str(k): int(v or 0) for k, v in category_map.items()})
             for move in summary.get("planned_moves") or []:
                 if isinstance(move, dict):
-                    planned.append((str(move.get("from", "")), str(move.get("to", ""))))
+                    planned.append((str(move.get("from", "")), str(move.get("to", "")), str(move.get("reason", ""))))
+            routing = summary.get("routing") or {}
+            if isinstance(routing, dict):
+                needs_review += int(routing.get("needs_review_files") or 0)
+                external_moves += int(routing.get("external_moves") or 0)
 
         self._preview_change_count = moved + empty_dirs + normalized
         self.preview_title_var.set(f"Ready to organize {moved} file{'s' if moved != 1 else ''}")
@@ -1300,14 +1965,18 @@ class CommandCenterApp:
             warnings.append(f"{collisions} name collision{'s' if collisions != 1 else ''} will be resolved without overwriting")
         if self.rename_after_organize_var.get() and moved:
             warnings.append(f"{moved} file{'s' if moved != 1 else ''} will receive random filenames")
+        if needs_review:
+            warnings.append(f"{needs_review} unmatched file{'s' if needs_review != 1 else ''} will be held in {NEEDS_REVIEW_DIR_NAME}")
+        if external_moves:
+            warnings.append(f"{external_moves} file{'s' if external_moves != 1 else ''} will move into the selected Archive root")
         self.preview_warning_var.set("   ·   ".join(warnings))
 
         for item in self.planned_tree.get_children():
             self.planned_tree.delete(item)
-        for source, destination in planned[:200]:
-            self.planned_tree.insert("", "end", values=(source, destination))
+        for source, destination, reason in planned[:200]:
+            self.planned_tree.insert("", "end", values=(source, destination, reason))
         if not planned:
-            self.planned_tree.insert("", "end", values=("No file moves needed", "Folder is already organized"))
+            self.planned_tree.insert("", "end", values=("No file moves needed", "Folder is already organized", ""))
 
         self._last_preview_fingerprint = self._preview_fingerprint()
         state = "normal" if self._preview_change_count > 0 else "disabled"
@@ -1343,6 +2012,9 @@ class CommandCenterApp:
                     "name_collisions_resolved": summary.get("name_collisions_resolved"),
                     "duplicates_moved": (summary.get("duplicates") or {}).get("files_moved"),
                     "empty_dirs_staged": (summary.get("empty_folder_collection") or {}).get("folders_moved"),
+                    "needs_review_files": (summary.get("routing") or {}).get("needs_review_files"),
+                    "external_moves": (summary.get("routing") or {}).get("external_moves"),
+                    "matched_by_rule": (summary.get("routing") or {}).get("matched_by_rule"),
                     "backup_manifest": summary.get("backup_manifest"),
                 }
             )
@@ -1391,11 +2063,13 @@ def main() -> None:
             app._show_page(sys.argv[sys.argv.index("--page") + 1])
         except (IndexError, KeyError):
             pass
-    if "--folder" in sys.argv:
-        try:
-            app.path_var.set(sys.argv[sys.argv.index("--folder") + 1])
-        except IndexError:
-            pass
+    for flag in ("--path", "--folder"):
+        if flag in sys.argv:
+            try:
+                app.path_var.set(sys.argv[sys.argv.index(flag) + 1])
+            except IndexError:
+                pass
+            break
     if "--preview" in sys.argv:
         root.after(250, lambda: app._run_organize(True))
     root.mainloop()

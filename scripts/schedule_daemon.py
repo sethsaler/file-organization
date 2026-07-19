@@ -29,6 +29,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import default_log_path, default_state_dir
+from org_watch_status import WatchStatus
 from schedule_config import (
     SCHEDULE_MODE_WATCH,
     FolderJob,
@@ -306,7 +307,9 @@ def _run_watch_loop(
     in_flight: set = set()
     last_reload = 0.0
     last_full_scan = 0.0
+    last_heartbeat = 0.0
     file_log_path = default_log_path()
+    status: Optional[WatchStatus] = None
 
     mp = max_parallel if max_parallel is not None else cfg.max_parallel
     max_workers = max(1, min(mp, 32)) if mp and mp > 0 else 32
@@ -320,15 +323,27 @@ def _run_watch_loop(
                 # organized; ignore them (baselines are reset after the run).
                 return
             dirty_since[path] = time.monotonic()
+            if status is not None:
+                status.update_folder(path, "dirty", quiet_seconds=cfg.watch_quiet_seconds)
 
     monitor = create_event_monitor(_mark_dirty)
     use_events = monitor is not None
     if use_events:
         monitor.set_watched_paths(job.path for job in cfg.folders if job.enabled)
 
+    backend = monitor.backend_name() if use_events else "polling"
+    status = WatchStatus(
+        backend=backend,
+        poll_seconds=WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds,
+        quiet_seconds=cfg.watch_quiet_seconds,
+        full_scan_seconds=WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS,
+        max_workers=max_workers,
+        folders=(job.path for job in cfg.folders if job.enabled),
+    )
+
     print(json.dumps({
         "watch": True,
-        "backend": monitor.backend_name() if use_events else "polling",
+        "backend": backend,
         "poll_seconds": WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds,
         "quiet_seconds": cfg.watch_quiet_seconds,
         "full_scan_seconds": WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS,
@@ -343,6 +358,8 @@ def _run_watch_loop(
 
     def _organize_path(path: str) -> None:
         sub_cfg: Optional[object] = None
+        summary: Optional[dict] = None
+        run_error: Optional[str] = None
         try:
             sub_cfg = load_config(config_path)
             summary = run_enabled_folders(
@@ -356,6 +373,8 @@ def _run_watch_loop(
             )
             if summary:
                 _notify_run(sub_cfg, summary, "watch")
+        except Exception as exc:
+            run_error = str(exc)
         finally:
             with state_lock:
                 in_flight.discard(path)
@@ -368,6 +387,17 @@ def _run_watch_loop(
                     else:
                         _update_both_signatures(path)
                 dirty_since.pop(path, None)
+                if run_error:
+                    status.update_folder(path, "error", error=run_error)
+                elif summary and summary.get("failed", 0):
+                    status.update_folder(
+                        path,
+                        "error",
+                        error=f"{summary.get('failed', 0)} folder run(s) failed",
+                        last_summary=summary,
+                    )
+                else:
+                    status.update_folder(path, "idle", error="", last_summary=summary or {})
 
     full_scan_interval = WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS
 
@@ -384,6 +414,7 @@ def _run_watch_loop(
                     monitor.set_watched_paths(
                         job.path for job in cfg.folders if job.enabled
                     )
+                status.reconcile(job.path for job in cfg.folders if job.enabled)
 
             do_full_scan = now - last_full_scan >= full_scan_interval
             if do_full_scan:
@@ -424,6 +455,7 @@ def _run_watch_loop(
 
                         if sig_changed:
                             dirty_since[path] = now
+                            status.update_folder(path, "dirty", quiet_seconds=cfg.watch_quiet_seconds)
                             continue
 
                         started = dirty_since.get(path)
@@ -431,9 +463,14 @@ def _run_watch_loop(
                             due_paths.add(path)
                             del dirty_since[path]
                             in_flight.add(path)
+                            status.update_folder(path, "running")
 
                 for path in due_paths:
                     executor.submit(_organize_path, path)
+
+            if now - last_heartbeat >= 5.0:
+                last_heartbeat = now
+                status.heartbeat()
 
             poll_seconds = WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds
             remaining = poll_seconds
@@ -444,6 +481,7 @@ def _run_watch_loop(
                 time.sleep(step)
                 remaining -= step
     finally:
+        status.stop("daemon stopped")
         if monitor is not None:
             monitor.stop()
         executor.shutdown(wait=True)

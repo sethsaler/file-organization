@@ -23,7 +23,7 @@ class ManifestEntry:
 
 @dataclass
 class Manifest:
-    version: int = 1
+    version: int = 2
     created_at: str = ""
     base_path: str = ""
     mode: str = ""
@@ -33,6 +33,7 @@ class Manifest:
     file_moves: List[ManifestEntry] = field(default_factory=list)
     empty_dir_moves: List[ManifestEntry] = field(default_factory=list)
     empty_dirs_removed: List[str] = field(default_factory=list)
+    external_destinations: bool = False
 
 
 def list_manifests(base: Path, limit: int = 20) -> List[Path]:
@@ -91,7 +92,9 @@ def write_manifest_files(
 
     backup_dir = base / ORGANIZER_DIR_NAME
     backup_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Microseconds prevent two quick manual/review actions from overwriting the
+    # same recovery manifest within one second.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     manifest_path = backup_dir / f"backup_{timestamp}.json"
 
     data = {
@@ -105,6 +108,7 @@ def write_manifest_files(
         "file_moves": [{"from": m.from_path, "to": m.to_path} for m in manifest.file_moves],
         "empty_dir_moves": [{"from": m.from_path, "to": m.to_path} for m in manifest.empty_dir_moves],
         "empty_dirs_removed": manifest.empty_dirs_removed,
+        "external_destinations": manifest.external_destinations,
     }
     manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -180,8 +184,32 @@ def restore_from_manifest(manifest_path: str) -> bool:
             return False
 
     restored_files = restored_dirs = collisions = 0
-    for entry in reversed(data.get("empty_dir_moves", [])):
-        src, dst = base / entry["to"], base / entry["from"]
+    allow_external = bool(data.get("external_destinations")) and int(data.get("version", 1)) >= 2
+
+    def manifest_path(value: str) -> Path:
+        candidate = Path(value).expanduser()
+        if candidate.is_absolute():
+            if not allow_external:
+                raise ValueError("Manifest contains an absolute path without external-destination metadata")
+            return candidate
+        if any(part == ".." for part in candidate.parts):
+            raise ValueError("Manifest path escapes its base folder")
+        return base / candidate
+
+    try:
+        resolved_empty_moves = [
+            (manifest_path(entry["to"]), manifest_path(entry["from"]))
+            for entry in reversed(data.get("empty_dir_moves", []))
+        ]
+        resolved_file_moves = [
+            (manifest_path(entry["to"]), manifest_path(entry["from"]))
+            for entry in reversed(data.get("file_moves", []))
+        ]
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, indent=2))
+        return False
+
+    for src, dst in resolved_empty_moves:
         if not src.exists():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -191,8 +219,7 @@ def restore_from_manifest(manifest_path: str) -> bool:
         shutil.move(str(src), str(dst))
         restored_dirs += 1
 
-    for entry in reversed(data.get("file_moves", [])):
-        src, dst = base / entry["to"], base / entry["from"]
+    for src, dst in resolved_file_moves:
         if not src.exists():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)

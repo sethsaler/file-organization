@@ -35,6 +35,13 @@ from org_manifest import (
     write_manifest_files,
 )
 from org_mime import sniff_bucket_from_file
+from org_rules import (
+    NEEDS_REVIEW_DIR_NAME,
+    ArchiveRecipe,
+    RouteDecision,
+    RuleSet,
+    build_rule_context,
+)
 
 EMPTY_DIR_SAMPLE_LIMIT = 20
 DUPLICATES_DIR_NAME = "Duplicates"
@@ -95,6 +102,14 @@ class DuplicateStats:
     sample_moves: List[Dict[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class RoutingStats:
+    matched_by_rule: Counter = field(default_factory=Counter)
+    needs_review_files: int = 0
+    left_in_place: int = 0
+    external_moves: int = 0
+
+
 class Organizer:
     def __init__(
         self,
@@ -121,6 +136,8 @@ class Organizer:
         detect_duplicates: bool = False,
         duplicates_hardlink: bool = False,
         date_buckets: bool = False,
+        rule_set: Optional[RuleSet] = None,
+        archive_recipe: Optional[ArchiveRecipe] = None,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -145,6 +162,10 @@ class Organizer:
         self.detect_duplicates = detect_duplicates
         self.duplicates_hardlink = duplicates_hardlink
         self.date_buckets = date_buckets
+        self.rule_set = rule_set
+        self.archive_recipe = archive_recipe
+        if self.archive_recipe is not None:
+            self.archive_recipe.validate_source_root(base)
         self._progress = progress_callback or (lambda _m: None)
         prof_key = profile_label if profile_label in ("standard", "extended") else "standard"
         if profile_buckets and len(profile_buckets) > 3:
@@ -165,6 +186,7 @@ class Organizer:
         self.normalize_stats = NormalizeStats()
         self.empty_dir_stats = EmptyDirStats()
         self.duplicate_stats = DuplicateStats()
+        self.routing_stats = RoutingStats()
         self.empty_dirs_removed = 0
         self.file_moves: List[ManifestEntry] = []
         self.empty_dir_moves: List[ManifestEntry] = []
@@ -188,6 +210,7 @@ class Organizer:
         # "Other" dirs observed during traversal, so cleanup does not need a
         # dedicated rglob() walk over the whole tree.
         self._seen_other_dirs: Set[Path] = set()
+        self._source_url_cache: Dict[Path, str] = {}
 
     def _visible_name(self, name: str) -> bool:
         return self.include_hidden or not name.startswith(".")
@@ -199,7 +222,10 @@ class Organizer:
         return name.casefold() == ORGANIZER_DIR_NAME.casefold()
 
     def _is_duplicates_dir(self, name: str) -> bool:
-        return self.detect_duplicates and name.casefold() == DUPLICATES_DIR_NAME.casefold()
+        return name.casefold() == DUPLICATES_DIR_NAME.casefold()
+
+    def _is_needs_review_dir(self, name: str) -> bool:
+        return name.casefold() == NEEDS_REVIEW_DIR_NAME.casefold()
 
     def _resolve_dir(self, directory: Path) -> Path:
         cached = self._resolved_dir_cache.get(directory)
@@ -229,6 +255,8 @@ class Organizer:
         if self._is_for_deletion_name(dir_name):
             return True
         if self._is_organizer_dir(dir_name):
+            return True
+        if self._is_needs_review_dir(dir_name):
             return True
         # Never re-organize files already staged as duplicates.
         if self._is_duplicates_dir(dir_name):
@@ -417,12 +445,62 @@ class Organizer:
             dest = dest / f"{mt.year:04d}" / f"{mt.month:02d}"
         return dest
 
+    def _source_url_for(self, src: Path) -> str:
+        """Return a nearby source-url sidecar value without repeatedly reading it."""
+        if src.name.casefold() == "source-url.txt":
+            sidecar = src
+        else:
+            sidecar = src.parent / "source-url.txt"
+        cached = self._source_url_cache.get(sidecar)
+        if cached is not None:
+            return cached
+        try:
+            value = sidecar.read_text(encoding="utf-8", errors="replace").strip()[:4096]
+        except OSError:
+            value = ""
+        self._source_url_cache[sidecar] = value
+        return value
+
+    def _route_file(self, src: Path, bucket_parent: Path, *, record_stats: bool = True) -> RouteDecision:
+        bucket = self._bucket_for_file(src.name, src)
+        if self.archive_recipe is not None:
+            return self.archive_recipe.decide(source_root=self.base, source=src, bucket=bucket)
+        if self.rule_set is not None:
+            context = build_rule_context(
+                base=self.base,
+                source=src,
+                bucket=bucket,
+                source_url=self._source_url_for(src),
+            )
+            decision = self.rule_set.decide(context)
+            if decision is not None:
+                if decision.destination is None:
+                    if record_stats:
+                        self.routing_stats.left_in_place += 1
+                return decision
+        return RouteDecision(
+            destination=self._bucket_dest_dir(bucket_parent, bucket, src),
+            category=bucket,
+            reason=f"File type: {bucket}",
+        )
+
+    def _record_path(self, path: Path) -> str:
+        """Manifest/preview path: relative under the source root, absolute otherwise."""
+        try:
+            return str(path.relative_to(self.base))
+        except ValueError:
+            return str(path)
+
     def _move_one_file(
         self,
         src: Path,
         dest_dir: Path,
         bucket_parent: Optional[Path] = None,
         bucket_name: Optional[str] = None,
+        *,
+        reason: str = "",
+        rule_id: Optional[str] = None,
+        external: bool = False,
     ) -> None:
         duplicate_of: Optional[Path] = None
         dup_size: Optional[int] = None
@@ -470,15 +548,13 @@ class Organizer:
         target = self._collision_safe_target(dest_dir, src.name)
 
         if len(self.planned_file_moves) < PLANNED_MOVE_SAMPLE_LIMIT:
-            try:
-                self.planned_file_moves.append(
-                    {
-                        "from": str(src.relative_to(self.base)),
-                        "to": str(target.relative_to(self.base)),
-                    }
-                )
-            except ValueError:
-                pass
+            self.planned_file_moves.append(
+                {
+                    "from": self._record_path(src),
+                    "to": self._record_path(target),
+                    "reason": reason or f"File type: {dest_dir_name}",
+                }
+            )
 
         hardlinked = False
         if not self.dry_run:
@@ -493,8 +569,8 @@ class Organizer:
                     hardlinked = False
             if not hardlinked:
                 self._fast_move(src, target)
-            rel_src = str(src.relative_to(self.base))
-            rel_dst = str(target.relative_to(self.base))
+            rel_src = self._record_path(src)
+            rel_dst = self._record_path(target)
             self.file_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
             if self._dup_index is not None and dup_size is not None and duplicate_of is None:
                 # The canonical copy just moved; keep the index pointing at it.
@@ -507,16 +583,20 @@ class Organizer:
         if duplicate_of is not None:
             self.duplicate_stats.files_moved += 1
             if len(self.duplicate_stats.sample_moves) < DUPLICATE_SAMPLE_LIMIT:
-                try:
-                    self.duplicate_stats.sample_moves.append(
-                        {
-                            "from": str(src.relative_to(self.base)),
-                            "to": str(target.relative_to(self.base)),
-                            "duplicate_of": str(duplicate_of.relative_to(self.base)),
-                        }
-                    )
-                except ValueError:
-                    pass
+                self.duplicate_stats.sample_moves.append(
+                    {
+                        "from": self._record_path(src),
+                        "to": self._record_path(target),
+                        "duplicate_of": self._record_path(duplicate_of),
+                    }
+                )
+
+        if rule_id:
+            self.routing_stats.matched_by_rule[reason.removeprefix("Rule: ") or rule_id] += 1
+        if bucket_name == NEEDS_REVIEW_DIR_NAME:
+            self.routing_stats.needs_review_files += 1
+        if external:
+            self.routing_stats.external_moves += 1
 
         self.move_stats.files_moved += 1
         if self.verbose and self.move_stats.files_moved % 100 == 0:
@@ -527,10 +607,16 @@ class Organizer:
         for p in list(self.base.iterdir()):
             if not p.is_file() or not self._visible_name(p.name):
                 continue
-            bucket = self._bucket_for_file(p.name, p)
+            decision = self._route_file(p, self.base)
+            if decision.destination is None:
+                continue
             self._move_one_file(
-                p, self._bucket_dest_dir(self.base, bucket, p),
-                bucket_parent=self.base, bucket_name=bucket,
+                p, decision.destination,
+                bucket_parent=self.archive_recipe.archive_root if decision.external and self.archive_recipe else self.base,
+                bucket_name=decision.category,
+                reason=decision.reason,
+                rule_id=decision.rule_id,
+                external=decision.external,
             )
             touched = True
         if touched:
@@ -551,10 +637,16 @@ class Organizer:
 
             for fn in files:
                 src = root_path / fn
-                bucket = self._bucket_for_file(fn, src)
+                decision = self._route_file(src, root_path)
+                if decision.destination is None:
+                    continue
                 self._move_one_file(
-                    src, self._bucket_dest_dir(root_path, bucket, src),
-                    bucket_parent=root_path, bucket_name=bucket,
+                    src, decision.destination,
+                    bucket_parent=self.archive_recipe.archive_root if decision.external and self.archive_recipe else (self.base if self.rule_set else root_path),
+                    bucket_name=decision.category,
+                    reason=decision.reason,
+                    rule_id=decision.rule_id,
+                    external=decision.external,
                 )
                 touched_dirs.add(root_path)
 
@@ -575,10 +667,16 @@ class Organizer:
 
             for fn in files:
                 src = root_path / fn
-                bucket = self._bucket_for_file(fn, src)
+                decision = self._route_file(src, self.base)
+                if decision.destination is None:
+                    continue
                 self._move_one_file(
-                    src, self._bucket_dest_dir(self.base, bucket, src),
-                    bucket_parent=self.base, bucket_name=bucket,
+                    src, decision.destination,
+                    bucket_parent=self.archive_recipe.archive_root if decision.external and self.archive_recipe else self.base,
+                    bucket_name=decision.category,
+                    reason=decision.reason,
+                    rule_id=decision.rule_id,
+                    external=decision.external,
                 )
                 touched_dirs.add(root_path)
 
@@ -744,6 +842,16 @@ class Organizer:
         node.subdirs[name] = child
         return child
 
+    def _sim_get_or_create_path(self, root: "_SimDir", destination: Path) -> Optional["_SimDir"]:
+        try:
+            relative = destination.relative_to(self.base)
+        except ValueError:
+            return None
+        node = root
+        for part in relative.parts:
+            node = self._sim_get_or_create_subdir(node, part)
+        return node
+
     def _sim_walk(self, root: "_SimDir") -> Iterator[Tuple["_SimDir", List[str]]]:
         """Topdown model walk with the same pruning as the organize walk."""
         stack = [root]
@@ -765,23 +873,32 @@ class Organizer:
             for fn in list(root.files):
                 if not self._visible_name(fn):
                     continue
-                bucket = self._bucket_for_file(fn, root.path / fn)
-                dest = self._sim_get_or_create_subdir(root, bucket)
+                decision = self._route_file(root.path / fn, self.base, record_stats=False)
+                if decision.destination is None:
+                    continue
+                dest = None if decision.external else self._sim_get_or_create_path(root, decision.destination)
                 del root.files[fn]
-                dest.files[fn] = False
+                if dest is not None:
+                    dest.files[fn] = False
             return
 
         for node, file_names in self._sim_walk(root):
             for fn in file_names:
-                bucket = self._bucket_for_file(fn, node.path / fn)
-                if self.strategy == "in-place":
-                    dest = self._sim_get_or_create_subdir(node, bucket)
-                else:
-                    dest = self._sim_get_or_create_subdir(root, bucket)
+                parent = node.path if self.strategy == "in-place" else self.base
+                decision = self._route_file(node.path / fn, parent, record_stats=False)
+                if decision.destination is None:
+                    continue
+                if decision.external:
+                    del node.files[fn]
+                    continue
+                dest = self._sim_get_or_create_path(root, decision.destination)
+                if dest is None:
+                    continue
                 if dest is node or self._resolve_dir(node.path) == self._resolve_dir(dest.path):
                     continue
                 del node.files[fn]
-                dest.files[fn] = False
+                if dest is not None:
+                    dest.files[fn] = False
 
     def _sim_inspect_empty_dir_tree(self, node: "_SimDir") -> Tuple[bool, List["_SimDir"]]:
         if path_excluded(node.path, self.base, self.exclude_patterns):
@@ -1193,15 +1310,32 @@ class Organizer:
             file_moves=self.file_moves,
             empty_dir_moves=self.empty_dir_moves,
             empty_dirs_removed=self.removed_dirs,
+            external_destinations=self.routing_stats.external_moves > 0,
         )
         helper = Path(__file__).resolve().parent / "organize_by_filetype.py"
-        return write_manifest_files(
+        info = write_manifest_files(
             self.base,
             manifest,
             helper_script=helper,
             dry_run=self.dry_run,
             create_backup=self.create_backup,
         )
+        if (
+            info
+            and self.archive_recipe is not None
+            and self.routing_stats.external_moves > 0
+            and not self.dry_run
+        ):
+            archive_info = write_manifest_files(
+                self.archive_recipe.archive_root,
+                manifest,
+                helper_script=helper,
+                dry_run=False,
+                create_backup=self.create_backup,
+            )
+            if archive_info:
+                info["archive_manifest"] = archive_info["manifest"]
+        return info
 
 
     def _maybe_write_ocr_index(self) -> Optional[str]:
@@ -1249,6 +1383,7 @@ class Organizer:
                 self._is_organizer_dir(root_path.name)
                 or self._is_for_deletion_name(root_path.name)
                 or self._is_duplicates_dir(root_path.name)
+                or self._is_needs_review_dir(root_path.name)
             ):
                 dirs[:] = []
                 continue
@@ -1335,6 +1470,8 @@ class Organizer:
         manifest_info = self.save_manifest()
         if manifest_info and not self.dry_run:
             cleanup_old_manifests(self.base, days_to_keep=7)
+            if self.archive_recipe is not None:
+                cleanup_old_manifests(self.archive_recipe.archive_root, days_to_keep=7)
         ocr_path = self._maybe_write_ocr_index()
 
         if self.profile_buckets:
@@ -1380,6 +1517,15 @@ class Organizer:
                 "sample_moves": self.duplicate_stats.sample_moves,
             },
             "date_buckets": self.date_buckets,
+            "routing": {
+                "rules_file": str(self.rule_set.source_path) if self.rule_set and self.rule_set.source_path else None,
+                "unmatched": self.rule_set.unmatched if self.rule_set else None,
+                "matched_by_rule": dict(sorted(self.routing_stats.matched_by_rule.items())),
+                "needs_review_files": self.routing_stats.needs_review_files,
+                "left_in_place": self.routing_stats.left_in_place,
+                "archive_root": str(self.archive_recipe.archive_root) if self.archive_recipe else None,
+                "external_moves": self.routing_stats.external_moves,
+            },
             "planned_moves": self.planned_file_moves,
             "planned_moves_truncated": self.move_stats.files_moved > len(self.planned_file_moves),
             "rename_after_organize": {
@@ -1390,6 +1536,7 @@ class Organizer:
             },
             "verification": self._verify(),
             "backup_manifest": manifest_info.get("manifest") if manifest_info else None,
+            "archive_backup_manifest": manifest_info.get("archive_manifest") if manifest_info else None,
             "restore_script": manifest_info.get("restore_script") if manifest_info else None,
             "restore_sh": manifest_info.get("restore_sh") if manifest_info else None,
             "restore_cli": manifest_info.get("restore_cli") if manifest_info else None,

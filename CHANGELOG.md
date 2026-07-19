@@ -10,18 +10,29 @@ This project tracks changes using the Hermes skill version as its public version
 
 - Native command-center GUI with Overview, preview-first one-time organization, compact watched-folder management, recoverable run history, and advanced tools.
 - Human-readable dry-run move previews and macOS File/View menus with Command-number navigation.
+- Ordered deterministic routing rules with explainable preview reasons, source-URL sidecar matching, safe destination templates, and `bucket` / `needs-review` / `leave` fallback modes.
+- Rules & Review page for validating starter rules, approving held files, and remembering an approval as an Extension, Filename, or Parent-folder rule.
+- Downloader-to-Archive recipe with exact `Recents` category paths, explicit creator-folder mappings, unknown-folder quarantine, and recovery manifests at both roots.
+- Safety Center for `Needs Review`, `For Deletion`, and `Duplicates`, including Finder reveal, related-run restore, explicit Move to Trash, and local Dedupe scan handoff.
+- Atomic watch-health snapshots and Overview status for backend, pending changes, running folders, events, and errors.
+- Optional native macOS `FO` menu-bar helper plus Finder Quick Action installer.
 
 ### Changed
 
 - Random filename generation is opt-in across the CLI, one-time organization, and new scheduled-folder defaults.
 - Scheduler timing and per-folder options now open on demand instead of occupying the primary watched-folder view.
 - Project metadata now installs cleanly as a scripts-only distribution, so `uv run --with pytest pytest` works from a fresh checkout.
+- The former Downloader preset now uses stable filenames and explicit Archive routing instead of enabling random names.
+- Schedule schema version 6 carries rules, review fallback, Archive root, and creator mapping per watched folder.
 
 ### Fixed
 
 - Hidden-only folders are preserved when hidden files are excluded.
 - Existing `Other` contents are never removed by empty-bucket cleanup.
 - A watched folder is marked preview-verified only after a successful dry run.
+- Recovery manifests use microsecond timestamps so rapid review actions cannot overwrite one another.
+- External Archive paths are marked explicitly in version-2 manifests and rejected by older/unmarked manifests during restore.
+- Downloader source and Archive roots cannot overlap, and Archive destinations are rejected if a pre-existing symlink would escape the configured root.
 
 ## [1.8.0] - 2026-05-23
 

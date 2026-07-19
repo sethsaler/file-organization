@@ -19,13 +19,14 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_buckets import bucket_names_for_profile
+from org_rules import FALLBACK_BUCKET, VALID_FALLBACKS
 
 # Protects the read-modify-write of schedule.json when multiple threads run folders in parallel.
 _config_lock = threading.Lock()
 from org_paths import normalize_folder_input
 
 
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 
 SCHEDULE_MODE_INTERVAL = "interval"
 SCHEDULE_MODE_DAILY = "daily"
@@ -82,6 +83,10 @@ class FolderJob:
     detect_duplicates: bool = False
     duplicates_hardlink: bool = False
     date_buckets: bool = False
+    rules_file: Optional[str] = None
+    unmatched_mode: str = "bucket"
+    archive_root: Optional[str] = None
+    archive_mapping: Optional[str] = None
     timeout_minutes: int = 60  # 0 = no timeout
 
 
@@ -325,6 +330,14 @@ class ScheduleConfig:
                     detect_duplicates=bool(item.get("detect_duplicates", False)),
                     duplicates_hardlink=bool(item.get("duplicates_hardlink", False)),
                     date_buckets=bool(item.get("date_buckets", False)),
+                    rules_file=str(item.get("rules_file") or "").strip() or None,
+                    unmatched_mode=(
+                        str(item.get("unmatched_mode", FALLBACK_BUCKET)).strip().casefold()
+                        if str(item.get("unmatched_mode", FALLBACK_BUCKET)).strip().casefold() in VALID_FALLBACKS
+                        else FALLBACK_BUCKET
+                    ),
+                    archive_root=str(item.get("archive_root") or "").strip() or None,
+                    archive_mapping=str(item.get("archive_mapping") or "").strip() or None,
                     timeout_minutes=max(0, min(1440, int(item.get("timeout_minutes", 60)))),
                 )
             )
@@ -429,6 +442,14 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
             cmd.append("--duplicates-hardlink")
     if job.date_buckets:
         cmd.append("--date-buckets")
+    if job.rules_file and not job.archive_root:
+        cmd.extend(["--rules", job.rules_file])
+    if job.unmatched_mode and job.unmatched_mode != "bucket":
+        cmd.extend(["--unmatched", job.unmatched_mode])
+    if job.archive_root:
+        cmd.extend(["--archive-root", job.archive_root])
+        if job.archive_mapping:
+            cmd.extend(["--archive-mapping", job.archive_mapping])
     cmd.append("--backup")
     if dry_run:
         cmd.append("--dry-run")
@@ -486,13 +507,20 @@ def expand_subfolders(job: FolderJob) -> List[FolderJob]:
                 skip_randomly_renamed=job.skip_randomly_renamed,
                 min_unsorted_threshold=job.min_unsorted_threshold,
                 detect_duplicates=job.detect_duplicates,
+                duplicates_hardlink=job.duplicates_hardlink,
+                date_buckets=job.date_buckets,
+                rules_file=job.rules_file,
+                unmatched_mode=job.unmatched_mode,
+                archive_root=job.archive_root,
+                archive_mapping=job.archive_mapping,
+                timeout_minutes=job.timeout_minutes,
             )
             subfolders.append(sub_job)
 
     return subfolders if subfolders else [job]
 
 
-_ALWAYS_SKIP_DIRS: Set[str] = {".organizer", "For Deletion"}
+_ALWAYS_SKIP_DIRS: Set[str] = {".organizer", "For Deletion", "Duplicates", "Needs Review"}
 
 
 def count_unsorted_files(job: FolderJob, *, stop_at: int = 0) -> int:
@@ -520,7 +548,7 @@ def count_unsorted_files(job: FolderJob, *, stop_at: int = 0) -> int:
 
     skip_dirs = bucket_names | {d.casefold() for d in _ALWAYS_SKIP_DIRS}
 
-    if job.strategy == "in-place" and job.recursive:
+    if (job.strategy == "in-place" and job.recursive) or job.rules_file or job.archive_root:
         count = 0
         for root, dirs, files in os.walk(base):
             dirs[:] = [d for d in dirs if d.casefold() not in skip_dirs]
@@ -722,4 +750,9 @@ def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: st
             efc = summary.get("empty_folder_collection")
             if isinstance(efc, dict) and efc.get("folders_moved"):
                 rec["empty_dirs_staged"] = efc.get("folders_moved")
+            routing = summary.get("routing")
+            if isinstance(routing, dict):
+                rec["needs_review_files"] = routing.get("needs_review_files")
+                rec["external_moves"] = routing.get("external_moves")
+                rec["matched_by_rule"] = routing.get("matched_by_rule")
     return rec

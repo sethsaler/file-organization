@@ -1,7 +1,7 @@
 ---
 name: organize-folder-by-filetype
-description: Organize files into Images, Videos, GIFs, and Other via one Python helper — non-recursive/recursive, optional normalization, dry-run, collision-safe moves, automatic empty-folder collection into For Deletion.
-version: 1.8.0
+description: Preview and organize files with category buckets, explainable routing rules, Needs Review, Downloader-to-Archive recipes, duplicate review, watch automation, and recoverable manifests.
+version: 1.9.0
 metadata:
   hermes:
     tags: [filesystem, organization, cleanup, file-management, optimization]
@@ -12,7 +12,7 @@ metadata:
 
 ## When to use
 
-Use this skill when a user wants a folder or folder tree reorganized into **Images**, **Videos**, **GIFs**, and **Other** at the target path (flatten-root pulls files from all subfolders into those four root folders by default).
+Use this skill when a user wants a folder or folder tree previewed, organized, routed into **Images**, **Videos**, **GIFs**, and **Other**, held safely for review, or moved from a Downloader tree into an explicit Archive destination. Use it as well for watched-folder health, recovery, and local Dedupe handoff.
 
 ## Canonical source
 
@@ -24,8 +24,9 @@ Keep changes synchronized across:
 - `SKILL.md`
 - `README.md`
 - `launchers/Organize Files by Type.command` when launcher behavior is affected
-- `scripts/tinker_gui.py` when CLI flags or GUI options should stay aligned
+- `scripts/command_center.py` when CLI flags or GUI options should stay aligned
 - `scripts/schedule_config.py`, `scripts/schedule_gui.py`, and `scripts/schedule_daemon.py` when schedule JSON or runner behavior changes
+- `scripts/org_rules.py`, `scripts/org_safety.py`, and `scripts/org_watch_status.py` when routing, quarantine, or live watch behavior changes
 
 Use `README.md` for repository-facing documentation and `SKILL.md` for agent-facing operating instructions.
 
@@ -38,6 +39,11 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 - Optional `--detect-duplicates`: identical-content copies (size + BLAKE2 hash, hashed lazily only on size collisions) are staged into a root-level `Duplicates` folder instead of their bucket. Nothing is deleted; moves are in the backup manifest and `Duplicates` is skipped on later runs. Files already in root bucket folders count as the canonical copies. Cloud-placeholder files with no local data (undownloaded iCloud items) are never hashed, so runs cannot trigger downloads.
 - Optional `--duplicates-hardlink` (with `--detect-duplicates`): duplicates stay in their bucket as hardlinks to the canonical copy (zero extra disk space) instead of moving to `Duplicates`; falls back to a plain move if the filesystem cannot hardlink.
 - Optional `--date-buckets`: files land under `Bucket/YYYY/MM` (by modification time) in every mode.
+- Optional `--rules FILE`: apply ordered, deterministic rules that can match extension, filename/path/parent globs, source URL, and file size. Every planned move includes a human-readable reason. Destinations are confined to the chosen root.
+- Rule fallbacks are `bucket`, `needs-review`, or `leave`. Use `needs-review` when uncertain content should be held in root-level **Needs Review** instead of guessed or deleted.
+- Optional Archive recipe (`--archive-root PATH --archive-mapping FILE`) routes known creator folders to explicit Archive-relative paths, loose media to exact `Recents/Images`, `Recents/Videos`, `Recents/GIFs`, or `Recents/Other` paths, and unknown creator folders to Archive **Needs Review**.
+- External Archive runs write recovery manifests at both the source and Archive roots. Absolute restore paths are allowed only for explicit version-2 external manifests.
+- **Needs Review**, **For Deletion**, and **Duplicates** are quarantine/review surfaces. Repeated organization runs skip them.
 
 ## Modes
 
@@ -71,15 +77,23 @@ Performance characteristics:
 ## Project structure
 
 - `scripts/organize_by_filetype.py` — main helper
-- `scripts/tinker_gui.py` — main Tk UI (Organize + Schedule tabs; built-in scheduler while open)
+- `scripts/command_center.py` — main Tk Command Center (Overview, Organize, Rules & Review, Safety Center, watched folders, history, and advanced tools)
+- `scripts/tinker_gui.py` — legacy compact Tk UI
+- `scripts/org_rules.py` — ordered routing rules, validation, learned approvals, and Archive recipe
+- `scripts/org_safety.py` — quarantine inventory, Finder reveal, OS Trash, recovery, approval, and Dedupe handoff
+- `scripts/org_watch_status.py` — atomic live watch-health snapshot used by the daemon and Overview
 - `scripts/schedule_panel.py` — shared Schedule tab / panel (folder list, timing, worker)
 - `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
 - `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
 - `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop reacts to native FS events via the optional `watchdog` package (near-instant, any depth; falls back to mtime polling without it) and organizes once a folder stays quiet
 - `scripts/schedule_watch.py` — native filesystem-event monitor for watch mode (watchdog/FSEvents/inotify wrapper with polling fallback)
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
+- `scripts/quick_controls.py` — status, pause/resume, run-all, undo-latest, and open-folder commands for native macOS controls
+- `scripts/install_macos_integrations.py` — builds/installs the native menu-bar app and Finder Quick Action
+- `macos/FileOrganizerMenuBar.swift` — native `FO` menu-bar application source
 - **Background scheduling:** enabling automatic runs in the Schedule tab installs a LaunchAgent (macOS) or systemd user unit (Linux) so `schedule_daemon.py` keeps running after the app closes. See `scripts/schedule_service.py`.
 - `launchers/Organize by File Type (Tinker).command` — macOS double-click for the Tk UI
+- `launchers/File Organizer macOS Controls.command` — installs and launches the optional menu-bar helper and Finder Quick Action
 - `launchers/Organize Desktop by File Type.command` — one-click `~/Desktop` run (recursive flatten-root, standard normalization, `For Deletion` staging by default)
 - `launchers/Organize Files by Type.command` — prompts for a folder, then flatten-root + standard normalization + `For Deletion` staging (dry-run preview, then confirm)
 - `README.md` — repository-facing documentation
@@ -91,6 +105,7 @@ Performance characteristics:
 
 - target path
 - For CLI/Tinker: recursive vs non-recursive, strategy, normalization, hidden, empty-folder handling, dry-run as needed
+- optional rules file and unmatched fallback, or an explicit Archive root plus creator mapping (rules and Archive mode are mutually exclusive)
 - For `Organize Files by Type.command`: only the folder path (behavior is fixed: recursive flatten-root, standard normalization, `For Deletion` staging, dry-run then confirm)
 
 2. Run helper script
@@ -112,12 +127,17 @@ Always report:
 - folders touched
 - normalization stats
 - empty-folder collection / removal stats
+- routing stats, including matched rules, unmatched count, Needs Review count, and external moves
 - verification summary (root remaining files, noncanonical bucket dirs)
 
 ## Required safety rules
 
 - Never delete user files.
 - Never overwrite files.
+- Preview before live organization, especially for rules or Archive routing.
+- Treat `Needs Review`, `For Deletion`, and `Duplicates` as review queues. Reveal or restore first; moving a held file to the macOS Trash must be an explicit user action and must never unlink it directly.
+- Never infer an Archive creator destination. Require an explicit mapping; unmatched creator folders go to Archive `Needs Review`.
+- For external Archive moves, keep both recovery manifests and validate the destination root before running live.
 - Flatten-root is the default mode; files consolidate into root-level buckets. Collectable empty trees go to `For Deletion` by default, then leftover empties are removed.
 - Preserve hierarchy in recursive in-place mode.
 - Empty-folder collection is on by default and must move folders into `For Deletion`, not delete them outright, before the final empty-dir trim.
