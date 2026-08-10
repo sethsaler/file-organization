@@ -144,7 +144,7 @@ class WatchEventMonitor:
                 # the OS reports fully resolved (e.g. /var -> /private/var on
                 # macOS).
                 desired[str(normalize_folder_input(job_path).resolve())] = job_path
-            except Exception:
+            except (OSError, ValueError):
                 continue
 
         with self._lock:

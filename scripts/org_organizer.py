@@ -308,7 +308,7 @@ class Organizer:
             if directory.exists():
                 try:
                     existing = {p.name for p in directory.iterdir()}
-                except Exception:
+                except OSError:
                     existing = set()
             self.reserved_names[directory] = existing
 
@@ -729,7 +729,7 @@ class Organizer:
                 if dst.exists():
                     try:
                         same_inode = os.path.samefile(child, dst)
-                    except Exception:
+                    except OSError:
                         same_inode = False
 
                 if same_casefold or same_inode:
@@ -780,7 +780,7 @@ class Organizer:
                         if not any(child.iterdir()):
                             child.rmdir()
                             self.normalize_stats.source_folders_removed += 1
-                    except Exception:
+                    except OSError:
                         pass
 
     def _simulate_empty_dir_collection(self) -> Optional[EmptyDirStats]:

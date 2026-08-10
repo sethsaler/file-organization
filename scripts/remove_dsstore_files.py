@@ -32,7 +32,7 @@ def remove_dsstore_files(root: Path, dry_run: bool = True) -> dict:
                     header = f.read(8)
                 if len(header) >= 8 and header == b'\x00\x00\x00\x01Bud1':
                     is_dsstore = True
-            except Exception:
+            except OSError:
                 pass
         
         if is_dsstore:
