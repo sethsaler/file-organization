@@ -151,12 +151,6 @@ class RandomRenamer:
             return None
 
         from org_manifest import ORGANIZER_DIR_NAME
-        from dataclasses import dataclass
-
-        @dataclass
-        class RenameEntry:
-            from_path: str
-            to_path: str
 
         manifest = {
             "created_at": datetime.now().isoformat(),
