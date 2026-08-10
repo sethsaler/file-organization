@@ -523,7 +523,7 @@ def test_count_unsorted_files_missing_path():
 
 
 def test_threshold_skip_below(tmp_path: Path):
-    from schedule_config import FolderJob, ScheduleConfig, count_unsorted_files
+    from schedule_config import FolderJob, count_unsorted_files
 
     (tmp_path / "a.jpg").write_bytes(b"x")
     (tmp_path / "b.png").write_bytes(b"x")

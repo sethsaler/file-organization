@@ -6,7 +6,7 @@ from __future__ import annotations
 import fnmatch
 import os
 from pathlib import Path
-from typing import List, Optional, Sequence, Set
+from typing import List, Sequence, Set
 
 DEFAULT_DIR_EXCLUDES: Set[str] = {
     ".git", "node_modules", "venv", ".venv", "__pycache__",

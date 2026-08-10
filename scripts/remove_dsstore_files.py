@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Remove all .DS_Store files (both randomly named and with extensions)."""
 
-import os
 from pathlib import Path
 
 

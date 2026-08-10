@@ -150,7 +150,7 @@ class RandomRenamer:
         if self.dry_run:
             return None
 
-        from org_manifest import ORGANIZER_DIR_NAME, write_manifest_files
+        from org_manifest import ORGANIZER_DIR_NAME
         from dataclasses import dataclass
 
         @dataclass
