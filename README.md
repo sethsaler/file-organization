@@ -375,7 +375,7 @@ python3 scripts/install_macos_integrations.py --all --launch
 
 - Python 3.9+
 - The Tesseract OCR engine on your PATH (for example `apt install tesseract-ocr` on Debian/Ubuntu, or `brew install tesseract` on macOS)
-- Python packages: `pip install -r requirements-ocr.txt` (or install `pytesseract`, `Pillow`, and `openpyxl` yourself)
+- Python packages: `pip install ".[ocr]"` from the repository root (installs `pytesseract`, `Pillow`, and `openpyxl`)
 
 ### Examples
 
@@ -412,7 +412,6 @@ Optional `--lang eng+deu` passes Tesseract language packs. Use `--include-errors
 - `macos/FileOrganizerMenuBar.swift` — native status-item source
 - `install/systemd/`, `install/launchd/` — example service files
 - `scripts/install.sh` — curl-friendly installer (clone-less download from GitHub)
-- `requirements-ocr.txt` — optional dependencies for the OCR script
 - `launchers/Organize by File Type (Tinker).command` — double-click GUI launcher (macOS)
 - `launchers/Organize Desktop by File Type.command` — one-click Desktop organizer (macOS)
 - `launchers/Organize Files by Type.command` — optional macOS quick launcher for any folder
