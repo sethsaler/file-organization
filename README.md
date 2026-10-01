@@ -445,6 +445,44 @@ If behavior changes, keep the following in sync:
 - `scripts/schedule_config.py`, `scripts/schedule_gui.py`, `scripts/schedule_daemon.py` when schedule JSON or runner behavior changes
 - `launchers/Organize Files by Type.command` when relevant
 
+## Verification and CI cost
+
+After creating/activating a Python 3.9+ virtual environment, install verification
+dependencies once:
+
+```bash
+python3 -m pip install ".[dev,watch]" pyflakes
+```
+
+Run the complete lint and test suite for that interpreter with one command:
+
+```bash
+python3 scripts/verify.py
+```
+
+The command requires watchdog so filesystem-event tests are not silently omitted.
+Configuration and state created by tests are isolated in a temporary directory.
+The existing iCloud integration test still requires an available macOS iCloud
+Drive and reports a skip elsewhere. This command does not install services, run
+the organizer against personal folders, or compile the optional macOS UI.
+
+Automatic PR/main checks run pyflakes and the entire test suite on Python 3.13.
+The workflow always starts; only proven documentation-only changes skip those
+jobs. Source, dependency, workflow and unknown file changes run normally. There
+are no workflow-level path filters that would leave a required check pending.
+
+For the full supported-version matrix, select **Actions → Test → Run workflow**
+after repository Actions is enabled. It runs the same checks on Python 3.9, 3.11
+and 3.13. To reproduce that matrix locally, create an environment for each of
+those interpreters, install the dependencies above, and run the same one-command
+check in each. Manual GitHub-hosted runs still consume Actions minutes. Run the
+matrix before releases or changes affecting Python compatibility.
+
+No automatic cancellation is configured: new commits do not supersede running
+or queued checks. If branch protection is added later, require the automatic
+`changes`, `test (3.13)` and `lint` checks, not the manual compatibility jobs.
+Repository-wide Actions settings are managed separately from this workflow.
+
 ## Changelog
 
 See `CHANGELOG.md` for notable project history.
@@ -452,3 +490,4 @@ See `CHANGELOG.md` for notable project history.
 ## License
 
 MIT. See `LICENSE`.
+
