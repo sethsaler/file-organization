@@ -37,7 +37,7 @@ jobs:
   test:
     name: test (3.13)
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
 
   lint:
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
