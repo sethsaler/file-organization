@@ -83,6 +83,11 @@ class _DirtyHandler(FileSystemEventHandler):  # type: ignore[misc]
         self._monitor = monitor
 
     def on_any_event(self, event) -> None:  # noqa: ANN001 - watchdog event type
+        # Reading a file (including duplicate hashing) does not change it.
+        # Inotify reports these events too; treating them as writes causes
+        # unnecessary organizer runs and can keep resetting the quiet timer.
+        if event.event_type in {"opened", "closed_no_write"}:
+            return
         # Directory-modified events fire for every contained file change; the
         # file-level events already cover those, and pure directory mtime churn
         # (e.g. Finder metadata) should not trigger runs on its own.

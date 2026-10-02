@@ -2,10 +2,12 @@ import Cocoa
 import Foundation
 
 @main
-final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate {
+final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var refreshTimer: Timer?
     private var latestStatus: [String: Any] = [:]
+    private var statusRefreshInFlight = false
+    private var statusRefreshPending = false
 
     private var projectRoot: String {
         if let configured = ProcessInfo.processInfo.environment["FILE_ORGANIZER_ROOT"], !configured.isEmpty {
@@ -36,13 +38,26 @@ final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate {
         }
         rebuildMenu()
         refreshStatus()
-        refreshTimer = Timer.scheduledTimer(
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshStatus()
+        refreshTimer?.invalidate()
+        let timer = Timer(
             timeInterval: 3.0,
             target: self,
             selector: #selector(refreshStatus),
             userInfo: nil,
             repeats: true
         )
+        // Menu tracking uses a different run-loop mode from normal app work.
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -50,22 +65,41 @@ final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshStatus() {
+        guard !statusRefreshInFlight else {
+            statusRefreshPending = true
+            return
+        }
+        statusRefreshInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let result = self.runQuickControl("status")
-            guard result.exitCode == 0,
-                  let data = result.output.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return }
+            let result = self.runQuickControl("menu-status")
             DispatchQueue.main.async {
-                self.latestStatus = object
-                self.rebuildMenu()
+                self.statusRefreshInFlight = false
+                if result.exitCode == 0,
+                   let data = result.output.data(using: .utf8),
+                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let displayedKeys: Set<String> = [
+                        "scheduler_enabled", "enabled_folders", "pending",
+                        "running", "backend", "folders"
+                    ]
+                    let displayedStatus = object.filter { displayedKeys.contains($0.key) }
+                    if !NSDictionary(dictionary: self.latestStatus).isEqual(to: displayedStatus) {
+                        self.latestStatus = displayedStatus
+                        self.rebuildMenu()
+                    }
+                }
+                if self.statusRefreshPending {
+                    self.statusRefreshPending = false
+                    self.refreshStatus()
+                }
             }
         }
     }
 
     private func rebuildMenu() {
-        let menu = NSMenu()
+        let menu = statusItem.menu ?? NSMenu()
+        menu.delegate = self
+        menu.removeAllItems()
         let enabled = latestStatus["scheduler_enabled"] as? Bool ?? false
         let folderCount = latestStatus["enabled_folders"] as? Int ?? 0
         let pending = latestStatus["pending"] as? Int ?? 0
@@ -181,8 +215,8 @@ final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate {
         process.standardError = pipe
         do {
             try process.run()
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
         } catch {
             return (1, error.localizedDescription)

@@ -735,7 +735,8 @@ class CommandCenterApp:
         ttk.Button(activity_actions, text="Organize a folder…", style="Primary.TButton", command=lambda: self._show_page("organize")).pack(side="right")
 
     def _refresh_overview(self) -> None:
-        self._refresh_overview_once()
+        if self._current_page == "overview":
+            self._refresh_overview_once()
         try:
             if self.root.winfo_exists():
                 self.root.after(1500, self._refresh_overview)

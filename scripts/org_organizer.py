@@ -1298,6 +1298,14 @@ class Organizer:
         }
 
     def save_manifest(self) -> Optional[Dict[str, str]]:
+        # A run that recorded no moves, staging, or removals has nothing to
+        # restore. Skip the manifest entirely: watched folders must stay
+        # byte-identical after a no-op run so the organizer's own bookkeeping
+        # (and any cloud-sync reaction to it) cannot re-trigger the watcher.
+        if self.create_backup and not (
+            self.file_moves or self.empty_dir_moves or self.removed_dirs
+        ):
+            return None
         manifest = Manifest(
             created_at=datetime.now().isoformat(),
             base_path=str(self.base),

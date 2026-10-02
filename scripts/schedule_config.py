@@ -19,6 +19,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_buckets import bucket_names_for_profile
+from org_manifest import ORGANIZER_DIR_NAME
 from org_rules import FALLBACK_BUCKET, VALID_FALLBACKS
 
 # Protects the read-modify-write of schedule.json when multiple threads run folders in parallel.
@@ -154,6 +155,10 @@ def watch_signature(job: FolderJob) -> Tuple[float, ...]:
 
     A new/removed/modified file changes the mtime of its immediate parent directory,
     so this catches changes anywhere inside the watched tree.
+
+    The organizer's own ``.organizer`` backup directory is excluded (at any
+    depth) so manifests written during a run never look like user changes —
+    matching the event backend's noise filter in schedule_watch.is_noise_path.
     """
     base = normalize_folder_input(job.path)
     try:
@@ -164,6 +169,7 @@ def watch_signature(job: FolderJob) -> Tuple[float, ...]:
     base_str = str(base)
     entries: List[Tuple[str, float]] = [(base_str, base_stat.st_mtime)]
     stack = [base_str]
+    organizer_name = ORGANIZER_DIR_NAME.casefold()
 
     while stack:
         current = stack.pop()
@@ -172,6 +178,8 @@ def watch_signature(job: FolderJob) -> Tuple[float, ...]:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
+                            if entry.name.casefold() == organizer_name:
+                                continue
                             st = entry.stat(follow_symlinks=False)
                             entries.append((entry.path, st.st_mtime))
                             stack.append(entry.path)
@@ -192,6 +200,9 @@ def watch_signature_fast(job: FolderJob) -> Tuple[float, ...]:
     the folder root or one level deep change those mtimes, so this catches the
     common case with dramatically less work than the recursive signature. Deep
     changes are still caught by the periodic full scan in the watch loop.
+
+    Like watch_signature, the organizer's ``.organizer`` backup directory is
+    excluded so a run's own manifest writes never look like user changes.
     """
     base = normalize_folder_input(job.path)
     try:
@@ -201,11 +212,14 @@ def watch_signature_fast(job: FolderJob) -> Tuple[float, ...]:
 
     base_str = str(base)
     entries: List[Tuple[str, float]] = [(base_str, base_stat.st_mtime)]
+    organizer_name = ORGANIZER_DIR_NAME.casefold()
     try:
         with os.scandir(base_str) as it:
             for entry in it:
                 try:
                     if entry.is_dir(follow_symlinks=False):
+                        if entry.name.casefold() == organizer_name:
+                            continue
                         st = entry.stat(follow_symlinks=False)
                         entries.append((entry.path, st.st_mtime))
                 except OSError:

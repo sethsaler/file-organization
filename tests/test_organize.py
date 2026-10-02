@@ -903,6 +903,83 @@ def test_watch_signature_fast_is_lightweight_but_shallow(tmp_path: Path):
     assert full3 != full4, "full signature should catch deep changes"
 
 
+def test_watch_signature_ignores_organizer_dir(tmp_path: Path):
+    """Manifest writes under .organizer must never look like folder changes.
+
+    The event backend filters .organizer as noise (schedule_watch.is_noise_path);
+    the polling/safety-scan signatures must agree, or a no-op run's own backup
+    manifest re-triggers the watcher every cycle (seen on iCloud Drive, where
+    sync bookkeeping also bumps the watched root after each manifest write).
+    """
+    from schedule_config import FolderJob, watch_signature, watch_signature_fast
+
+    (tmp_path / "Images").mkdir()
+    (tmp_path / ".organizer").mkdir()
+    (tmp_path / ".organizer" / "backup_20260923_000000_000000.json").write_text("{}")
+    job = FolderJob(path=str(tmp_path))
+
+    full1 = watch_signature(job)
+    fast1 = watch_signature_fast(job)
+
+    # A new manifest from a later run changes nothing the signatures can see.
+    (tmp_path / ".organizer" / "backup_20260923_010101_000001.json").write_text("{}")
+    assert watch_signature(job) == full1
+    assert watch_signature_fast(job) == fast1
+
+    # A nested .organizer (e.g. inside a deep tree) is filtered at any depth.
+    deep = tmp_path / "Images" / "2026" / "09"
+    deep.mkdir(parents=True)
+    (deep / ".organizer").mkdir()
+    (deep / ".organizer" / "backup_20260923_020202_000002.json").write_text("{}")
+    full2 = watch_signature(job)
+    assert full2 != full1  # the new "2026/09" dirs are visible
+    (deep / ".organizer" / "backup_20260923_030303_000003.json").write_text("{}")
+    assert watch_signature(job) == full2
+
+    # Real user files are still detected by both signatures.
+    (tmp_path / "new.jpg").write_bytes(b"x")
+    assert watch_signature(job) != full2
+    assert watch_signature_fast(job) != fast1
+
+
+def test_noop_run_writes_no_manifest(tmp_path: Path):
+    """A run with nothing to move must not write a backup manifest.
+
+    Manifests live inside the watched tree, so a no-op run that still writes
+    one mutates the folder it just organized and re-arms the watch loop.
+    """
+    (tmp_path / "a.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    org = Organizer(
+        base=tmp_path,
+        recursive=False,
+        strategy="flatten-root",
+        include_hidden=True,
+        normalize="none",
+        collect_empty_dirs=False,
+        dry_run=False,
+        create_backup=True,
+    )
+    first = org.run()
+    assert first["files_moved"] == 1
+    assert first["backup_manifest"]
+    backup_dir = tmp_path / ".organizer"
+    assert len(list(backup_dir.glob("backup_*.json"))) == 1
+
+    second = Organizer(
+        base=tmp_path,
+        recursive=False,
+        strategy="flatten-root",
+        include_hidden=True,
+        normalize="none",
+        collect_empty_dirs=False,
+        dry_run=False,
+        create_backup=True,
+    ).run()
+    assert second["files_moved"] == 0
+    assert second["backup_manifest"] is None
+    assert len(list(backup_dir.glob("backup_*.json"))) == 1
+
+
 def test_wait_seconds_watch_mode_is_poll_interval():
     from schedule_config import SCHEDULE_MODE_WATCH, WATCH_POLL_SECONDS, ScheduleConfig, wait_seconds_after_run
 
@@ -1123,6 +1200,12 @@ def test_watch_loop_runs_folders_concurrently(tmp_path: Path, monkeypatch):
     import schedule_daemon
     from schedule_config import FolderJob, ScheduleConfig
 
+    # This test drives polling signatures, so native events must not select
+    # a different backend just because watchdog is installed on the host.
+    monkeypatch.setattr(schedule_daemon, "create_event_monitor", lambda callback: None)
+    monkeypatch.setattr(schedule_daemon, "_notify_run", lambda *args: None)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
     fa, fb = tmp_path / "A", tmp_path / "B"
     fa.mkdir()
     fb.mkdir()
@@ -1169,11 +1252,12 @@ def test_watch_loop_runs_folders_concurrently(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(schedule_daemon, "run_enabled_folders", mock_run_enabled_folders)
 
+    deadline = time.monotonic() + 10
     schedule_daemon._run_watch_loop(
         config_path,
         force=False,
         max_parallel=0,
-        should_stop=stop.is_set,
+        should_stop=lambda: stop.is_set() or time.monotonic() >= deadline,
     )
 
     assert len(records) == 2, records
