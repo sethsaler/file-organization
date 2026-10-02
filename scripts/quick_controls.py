@@ -23,19 +23,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Quick controls for File Organizer")
     parser.add_argument(
         "command",
-        choices=("status", "pause", "resume", "toggle", "run-all", "undo-latest", "open", "open-folder"),
+        choices=("status", "menu-status", "pause", "resume", "toggle", "run-all", "undo-latest", "open", "open-folder"),
     )
     parser.add_argument("path", nargs="?", help="Folder for open-folder")
     return parser.parse_args()
 
 
-def status_payload() -> dict:
+def status_payload(*, include_service: bool = True) -> dict:
     cfg = load_config(default_config_path())
     watch = read_watch_status()
     enabled = [job for job in cfg.folders if job.enabled]
-    return {
+    payload = {
         "scheduler_enabled": cfg.scheduler_enabled,
-        "service_running": is_service_running(),
         "schedule_mode": cfg.schedule_mode,
         "enabled_folders": len(enabled),
         "total_folders": len(cfg.folders),
@@ -45,6 +44,9 @@ def status_payload() -> dict:
         "watch_updated_at": watch.get("updated_at"),
         "folders": [job.path for job in enabled],
     }
+    if include_service:
+        payload["service_running"] = is_service_running()
+    return payload
 
 
 def set_enabled(enabled: bool) -> tuple[bool, str]:
@@ -69,8 +71,8 @@ def open_app(path: str | None = None) -> tuple[bool, str]:
 
 def main() -> None:
     args = parse_args()
-    if args.command == "status":
-        print(json.dumps(status_payload(), indent=2))
+    if args.command in {"status", "menu-status"}:
+        print(json.dumps(status_payload(include_service=args.command == "status"), indent=2))
         return
 
     if args.command == "pause":

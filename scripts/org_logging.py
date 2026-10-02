@@ -53,23 +53,40 @@ def append_history_entry(entry: dict) -> None:
         pass
 
 
+def _reverse_lines(stream):
+    """Read complete UTF-8 lines backwards without loading the whole log."""
+    stream.seek(0, os.SEEK_END)
+    position = stream.tell()
+    remainder = b""
+    while position:
+        size = min(position, 8192)
+        position -= size
+        stream.seek(position)
+        lines = (stream.read(size) + remainder).split(b"\n")
+        remainder = lines[0]
+        yield from reversed(lines[1:])
+    if remainder:
+        yield remainder
+
+
 def read_history(limit: int = 100) -> list:
     """Most-recent-first history records; unparseable lines are skipped."""
     import json
 
-    path = default_history_path()
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    if limit <= 0:
         return []
     out = []
-    for line in reversed(lines):
-        if len(out) >= limit:
-            break
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(rec, dict):
-            out.append(rec)
+    try:
+        with default_history_path().open("rb") as stream:
+            for line in _reverse_lines(stream):
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+                    if len(out) >= limit:
+                        break
+    except OSError:
+        return []
     return out

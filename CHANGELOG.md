@@ -33,6 +33,7 @@ This project tracks changes using the Hermes skill version as its public version
 - Recovery manifests use microsecond timestamps so rapid review actions cannot overwrite one another.
 - External Archive paths are marked explicitly in version-2 manifests and rejected by older/unmarked manifests during restore.
 - Downloader source and Archive roots cannot overlap, and Archive destinations are rejected if a pre-existing symlink would escape the configured root.
+- Watch mode no longer re-runs folders that have nothing to organize. A run that moves, stages, or removes nothing writes no backup manifest, and both change-detection backends (native events and mtime signatures) ignore the organizer's `.organizer` bookkeeping — closing a self-retrigger loop that fired a 0-move run every 60 s, most visibly on iCloud Drive folders where sync bookkeeping reacts to each new manifest.
 
 ## [1.8.0] - 2026-05-23
 

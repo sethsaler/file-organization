@@ -28,6 +28,34 @@ import quick_controls
 from schedule_config import FolderJob, ScheduleConfig, build_organize_cmd
 
 
+def test_menu_status_skips_service_probe(monkeypatch):
+    cfg = ScheduleConfig(
+        scheduler_enabled=True,
+        folders=[FolderJob(path="/watched"), FolderJob(path="/paused", enabled=False)],
+    )
+    monkeypatch.setattr(quick_controls, "load_config", lambda path: cfg)
+    monkeypatch.setattr(quick_controls, "read_watch_status", lambda: {
+        "pending_count": 2, "running_count": 1, "backend": "fsevents",
+    })
+    probes = []
+
+    def probe():
+        probes.append(True)
+        return True
+
+    monkeypatch.setattr(quick_controls, "is_service_running", probe)
+    light = quick_controls.status_payload(include_service=False)
+    assert probes == []
+    assert light["folders"] == ["/watched"]
+    assert light["pending"] == 2
+    assert light["running"] == 1
+    assert light["scheduler_enabled"] is True
+    full = quick_controls.status_payload()
+    assert probes == [True]
+    assert full.pop("service_running") is True
+    assert full == light
+
+
 def organizer(base: Path, **overrides) -> Organizer:
     options = {
         "base": base,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,18 @@ from schedule_watch import (
     is_noise_path,
     resolve_watch_root,
 )
+
+
+@pytest.mark.parametrize("event_type", ["opened", "closed_no_write", "modified", "closed", "created", "moved", "deleted"])
+def test_handler_only_dispatches_content_changes(event_type):
+    hits = []
+    monitor = SimpleNamespace(_dispatch=lambda path, **kwargs: hits.append(path))
+    handler = schedule_watch._DirtyHandler(monitor)
+    handler.on_any_event(SimpleNamespace(
+        event_type=event_type, is_directory=False,
+        src_path="/watched/file.txt", dest_path=None,
+    ))
+    assert hits == ([] if event_type in {"opened", "closed_no_write"} else ["/watched/file.txt"])
 
 
 def test_is_noise_path_filters_metadata_and_organizer_dir():

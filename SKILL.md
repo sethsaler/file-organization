@@ -43,6 +43,7 @@ Use `README.md` for repository-facing documentation and `SKILL.md` for agent-fac
 - Rule fallbacks are `bucket`, `needs-review`, or `leave`. Use `needs-review` when uncertain content should be held in root-level **Needs Review** instead of guessed or deleted.
 - Optional Archive recipe (`--archive-root PATH --archive-mapping FILE`) routes known creator folders to explicit Archive-relative paths, loose media to exact `Recents/Images`, `Recents/Videos`, `Recents/GIFs`, or `Recents/Other` paths, and unknown creator folders to Archive **Needs Review**.
 - External Archive runs write recovery manifests at both the source and Archive roots. Absolute restore paths are allowed only for explicit version-2 external manifests.
+- A run that moves, stages, or removes nothing writes no backup manifest (nothing to restore), so repeated no-op runs never modify the organized tree.
 - **Needs Review**, **For Deletion**, and **Duplicates** are quarantine/review surfaces. Repeated organization runs skip them.
 
 ## Modes
@@ -85,7 +86,7 @@ Performance characteristics:
 - `scripts/schedule_panel.py` — shared Schedule tab / panel (folder list, timing, worker)
 - `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
 - `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
-- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop reacts to native FS events via the optional `watchdog` package (near-instant, any depth; falls back to mtime polling without it) and organizes once a folder stays quiet
+- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop reacts to native FS events via the optional `watchdog` package (near-instant, any depth; falls back to mtime polling without it) and organizes once a folder stays quiet; both detection paths ignore `.organizer` bookkeeping so the organizer never re-triggers itself (including on iCloud Drive, where sync daemons react to each run)
 - `scripts/schedule_watch.py` — native filesystem-event monitor for watch mode (watchdog/FSEvents/inotify wrapper with polling fallback)
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
 - `scripts/quick_controls.py` — status, pause/resume, run-all, undo-latest, and open-folder commands for native macOS controls
