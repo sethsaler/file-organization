@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(collect_empty_dirs=True)
     empty_dir_group.add_argument("--collect-empty-dirs", dest="collect_empty_dirs", action="store_true", help="Stage empty folders to For Deletion (default)")
     empty_dir_group.add_argument("--no-collect-empty-dirs", dest="collect_empty_dirs", action="store_false", help="Skip empty-folder staging")
+    parser.add_argument(
+        "--empty-dir-min-age",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Leave empty folders alone until they are untouched for at least SECONDS (protects newly created folders; 0 = disabled)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing")
     backup_group = parser.add_mutually_exclusive_group()
     parser.set_defaults(create_backup=True)
@@ -201,6 +208,7 @@ def main() -> None:
         date_buckets=args.date_buckets,
         rule_set=rule_set,
         archive_recipe=archive_recipe,
+        empty_dir_min_age=args.empty_dir_min_age,
     )
     result = org.run()
     out = json.dumps(result, indent=2)

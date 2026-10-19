@@ -89,6 +89,7 @@ class FolderJob:
     archive_root: Optional[str] = None
     archive_mapping: Optional[str] = None
     timeout_minutes: int = 60  # 0 = no timeout
+    empty_dir_min_age: float = 0.0  # seconds an empty folder must stay untouched before staging/removal
 
 
 def parse_daily_time(value: str) -> Tuple[int, int]:
@@ -353,6 +354,7 @@ class ScheduleConfig:
                     archive_root=str(item.get("archive_root") or "").strip() or None,
                     archive_mapping=str(item.get("archive_mapping") or "").strip() or None,
                     timeout_minutes=max(0, min(1440, int(item.get("timeout_minutes", 60)))),
+                    empty_dir_min_age=max(0.0, float(item.get("empty_dir_min_age", 0) or 0)),
                 )
             )
         max_parallel = max(0, min(128, int(data.get("max_parallel", 0))))
@@ -441,6 +443,8 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
         cmd.append("--collect-empty-dirs")
     else:
         cmd.append("--no-collect-empty-dirs")
+    if job.empty_dir_min_age > 0:
+        cmd.extend(["--empty-dir-min-age", f"{job.empty_dir_min_age:g}"])
     if job.exclude_defaults:
         cmd.append("--exclude-defaults")
     for pat in job.exclude:
@@ -528,6 +532,7 @@ def expand_subfolders(job: FolderJob) -> List[FolderJob]:
                 archive_root=job.archive_root,
                 archive_mapping=job.archive_mapping,
                 timeout_minutes=job.timeout_minutes,
+                empty_dir_min_age=job.empty_dir_min_age,
             )
             subfolders.append(sub_job)
 

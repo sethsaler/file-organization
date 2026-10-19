@@ -452,6 +452,7 @@ class CommandCenterApp:
         self.profile_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
+        self.empty_dir_min_age_var = tk.StringVar(value="0")
         self.exclude_defaults_var = tk.BooleanVar(value=True)
         self.verbose_var = tk.BooleanVar(value=False)
         self.mime_var = tk.BooleanVar(value=False)
@@ -914,6 +915,10 @@ class CommandCenterApp:
         ttk.Checkbutton(left, text="Include subfolders", variable=self.recursive_var).pack(anchor="w")
         ttk.Checkbutton(left, text="Include hidden files and folders", variable=self.hidden_var).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(left, text="Collect empty folders into For Deletion", variable=self.collect_empty_var).pack(anchor="w", pady=(4, 0))
+        age_row = ttk.Frame(left)
+        age_row.pack(anchor="w", padx=(18, 0), pady=(4, 0))
+        ttk.Label(age_row, text="Protect folders newer than (sec):").pack(side="left")
+        ttk.Entry(age_row, width=8, textvariable=self.empty_dir_min_age_var).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(left, text="Exclude project and dependency folders", variable=self.exclude_defaults_var).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(left, text="Organize each immediate subfolder separately", variable=self.expand_subfolders_var).pack(anchor="w", pady=(4, 0))
 
@@ -976,6 +981,7 @@ class CommandCenterApp:
             self.profile_var,
             self.hidden_var,
             self.collect_empty_var,
+            self.empty_dir_min_age_var,
             self.exclude_defaults_var,
             self.mime_var,
             self.detect_duplicates_var,
@@ -1045,6 +1051,7 @@ class CommandCenterApp:
             self.profile_var.get(),
             self.hidden_var.get(),
             self.collect_empty_var.get(),
+            self._empty_dir_min_age(),
             self.exclude_defaults_var.get(),
             self.mime_var.get(),
             self.detect_duplicates_var.get(),
@@ -1681,6 +1688,12 @@ class CommandCenterApp:
         var.set(str(path))
         return path
 
+    def _empty_dir_min_age(self) -> float:
+        try:
+            return max(0.0, float(self.empty_dir_min_age_var.get() or 0))
+        except ValueError:
+            return 0.0
+
     def _build_organize_cmd(self, dry_run: bool, base: Path) -> list[str]:
         cmd = [
             sys.executable,
@@ -1698,6 +1711,9 @@ class CommandCenterApp:
             "--collect-empty-dirs" if self.collect_empty_var.get() else "--no-collect-empty-dirs",
             "--backup",
         ]
+        min_age = self._empty_dir_min_age()
+        if min_age > 0:
+            cmd.extend(["--empty-dir-min-age", f"{min_age:g}"])
         if self.exclude_defaults_var.get():
             cmd.append("--exclude-defaults")
         if self.mime_var.get():
@@ -1797,6 +1813,7 @@ class CommandCenterApp:
             normalize=self.normalize_var.get(),
             include_hidden=self.hidden_var.get(),
             collect_empty_dirs=self.collect_empty_var.get(),
+            empty_dir_min_age=self._empty_dir_min_age(),
             profile=self.profile_var.get(),
             exclude_defaults=self.exclude_defaults_var.get(),
             expand_subfolders=self.expand_subfolders_var.get(),

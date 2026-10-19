@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -736,6 +737,91 @@ def test_dry_run_empty_dir_preview_collision(tmp_path: Path):
     assert dry["empty_folder_collection"]["folders_moved"] == real["empty_folder_collection"]["folders_moved"] == 1
     assert dry["empty_folder_collection"]["name_collisions_resolved"] == 1
     assert (real_base / "For Deletion" / "dupe_1").is_dir()
+
+
+# ---- empty-folder min-age (grace period for new folders) ----
+
+
+def _age_dir(path: Path, seconds: float) -> None:
+    ts = time.time() - seconds
+    os.utime(path, (ts, ts))
+
+
+def test_empty_dir_min_age_protects_new_folders(tmp_path: Path):
+    new_dir = tmp_path / "NewFolder"
+    new_dir.mkdir()
+    old_dir = tmp_path / "OldFolder"
+    old_dir.mkdir()
+    _age_dir(old_dir, 7200)
+
+    result = _make_organizer(
+        tmp_path, collect_empty_dirs=True, empty_dir_min_age=3600
+    ).run()
+
+    assert new_dir.is_dir()
+    assert not old_dir.exists()
+    assert (tmp_path / "For Deletion" / "OldFolder").is_dir()
+    assert result["empty_folder_collection"]["folders_moved"] == 1
+    assert result["empty_folder_collection"]["min_age_seconds"] == 3600
+
+
+def test_empty_dir_min_age_protects_new_folders_without_staging(tmp_path: Path):
+    """The final empty-dir trim respects the grace window even with staging off."""
+    new_dir = tmp_path / "NewFolder"
+    new_dir.mkdir()
+
+    _make_organizer(tmp_path, collect_empty_dirs=False, empty_dir_min_age=3600).run()
+
+    assert new_dir.is_dir()
+
+
+def test_empty_dir_min_age_shields_nested_old_dirs(tmp_path: Path):
+    """A too-new parent shields everything inside it, even a stale empty child."""
+    parent = tmp_path / "NewParent"
+    stale_child = parent / "OldEmpty"
+    stale_child.mkdir(parents=True)
+    _age_dir(stale_child, 7200)
+
+    _make_organizer(tmp_path, collect_empty_dirs=True, empty_dir_min_age=3600).run()
+
+    assert stale_child.is_dir()
+
+
+def test_dry_run_empty_dir_preview_respects_min_age(tmp_path: Path):
+    dry_base = tmp_path / "dry"
+    real_base = tmp_path / "real"
+    for base in (dry_base, real_base):
+        base.mkdir()
+        (base / "newdir").mkdir()
+        (base / "olddir").mkdir()
+        _age_dir(base / "olddir", 7200)
+
+    dry = _make_organizer(
+        dry_base, collect_empty_dirs=True, dry_run=True, empty_dir_min_age=3600
+    ).run()
+    real = _make_organizer(
+        real_base, collect_empty_dirs=True, dry_run=False, empty_dir_min_age=3600
+    ).run()
+
+    assert dry["empty_folder_collection"]["folders_moved"] == 1
+    assert real["empty_folder_collection"]["folders_moved"] == 1
+    assert (dry_base / "newdir").is_dir()
+    assert (dry_base / "olddir").is_dir()
+    assert (real_base / "newdir").is_dir()
+    assert (real_base / "For Deletion" / "olddir").is_dir()
+
+
+def test_empty_dir_min_age_zero_keeps_existing_behavior(tmp_path: Path):
+    new_dir = tmp_path / "NewFolder"
+    new_dir.mkdir()
+
+    result = _make_organizer(
+        tmp_path, collect_empty_dirs=True, empty_dir_min_age=0
+    ).run()
+
+    assert not new_dir.exists()
+    assert (tmp_path / "For Deletion" / "NewFolder").is_dir()
+    assert result["empty_folder_collection"]["folders_moved"] == 1
 
 
 # ---- .DS_Store cleanup ----

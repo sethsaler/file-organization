@@ -296,6 +296,7 @@ class SchedulePanel(ttk.Frame):
         self.random_names_after_organize_var = tk.BooleanVar(value=False)
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.min_unsorted_threshold_var = tk.IntVar(value=0)
+        self.empty_dir_min_age_var = tk.StringVar(value="0")
         self.detect_duplicates_var = tk.BooleanVar(value=False)
         self.duplicates_hardlink_var = tk.BooleanVar(value=False)
         self.date_buckets_var = tk.BooleanVar(value=False)
@@ -335,6 +336,16 @@ class SchedulePanel(ttk.Frame):
             variable=self.collect_empty_var,
             command=self._push_detail_to_job,
         ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
+        dr += 1
+
+        age_frame = ttk.Frame(detail)
+        age_frame.grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(age_frame, text="Protect folders newer than (seconds):").pack(side="left")
+        age_entry = ttk.Entry(age_frame, width=9, textvariable=self.empty_dir_min_age_var)
+        age_entry.pack(side="left", padx=(6, 0))
+        ttk.Label(age_frame, text="(0 = off)").pack(side="left", padx=(6, 0))
+        age_entry.bind("<FocusOut>", lambda _e: self._push_detail_to_job())
+        age_entry.bind("<Return>", lambda _e: self._push_detail_to_job())
         dr += 1
 
         # Random rename section
@@ -681,6 +692,7 @@ class SchedulePanel(ttk.Frame):
         self.random_names_after_organize_var.set(job.random_names_after_organize)
         self.skip_randomly_renamed_var.set(job.skip_randomly_renamed)
         self.min_unsorted_threshold_var.set(job.min_unsorted_threshold)
+        self.empty_dir_min_age_var.set(f"{job.empty_dir_min_age:g}")
         self.detect_duplicates_var.set(job.detect_duplicates)
         self.duplicates_hardlink_var.set(job.duplicates_hardlink)
         self.date_buckets_var.set(job.date_buckets)
@@ -719,6 +731,10 @@ class SchedulePanel(ttk.Frame):
             job.min_unsorted_threshold = max(0, int(self.min_unsorted_threshold_var.get()))
         except (tk.TclError, ValueError):
             job.min_unsorted_threshold = 0
+        try:
+            job.empty_dir_min_age = max(0.0, float(self.empty_dir_min_age_var.get()))
+        except (tk.TclError, ValueError):
+            job.empty_dir_min_age = 0.0
         self._refresh_tree_row(idx)
 
     def _show_history(self) -> None:
@@ -945,6 +961,7 @@ class SchedulePanel(ttk.Frame):
         unmatched_mode: str = "bucket",
         archive_root: Optional[str] = None,
         archive_mapping: Optional[str] = None,
+        empty_dir_min_age: float = 0.0,
         select: bool = True,
     ) -> bool:
         """Add a folder to the schedule list (or select it if already present)."""
@@ -984,6 +1001,7 @@ class SchedulePanel(ttk.Frame):
             unmatched_mode=unmatched_mode,
             archive_root=archive_root,
             archive_mapping=archive_mapping,
+            empty_dir_min_age=empty_dir_min_age,
         )
         ok, preview = run_dry_run_preview(job)
         if not ok:

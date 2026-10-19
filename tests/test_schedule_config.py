@@ -84,6 +84,7 @@ def test_folder_job_defaults():
     assert job.archive_root is None
     assert job.archive_mapping is None
     assert job.timeout_minutes == 60
+    assert job.empty_dir_min_age == 0.0
 
 
 def test_normalize_schedule_mode():
@@ -353,6 +354,7 @@ def test_expand_subfolders(tmp_path: Path):
         recursive=False,
         profile="extended",
         dry_run_verified=True,
+        empty_dir_min_age=300.0,
     )
     expanded = expand_subfolders(job)
     assert len(expanded) == 2
@@ -363,6 +365,7 @@ def test_expand_subfolders(tmp_path: Path):
         assert sub.recursive is False
         assert sub.profile == "extended"
         assert sub.dry_run_verified is True
+        assert sub.empty_dir_min_age == 300.0
 
     # Disabled: returned unchanged.
     assert expand_subfolders(FolderJob(path=str(tmp_path))) == [FolderJob(path=str(tmp_path))]
@@ -433,6 +436,7 @@ def test_build_organize_cmd_defaults_and_dry_run(tmp_path: Path):
     assert cmd[cmd.index("--normalize") + 1] == "standard"
     assert cmd[cmd.index("--profile") + 1] == "standard"
     assert "--backup" in cmd
+    assert "--empty-dir-min-age" not in cmd
     assert "--dry-run" not in cmd
     assert "--dry-run" in build_organize_cmd(job, dry_run=True)
 
@@ -450,6 +454,7 @@ def test_build_organize_cmd_optional_flags(tmp_path: Path):
         duplicates_hardlink=True,
         date_buckets=True,
         unmatched_mode="needs-review",
+        empty_dir_min_age=600.0,
     )
     cmd = build_organize_cmd(job)
     assert "--no-recursive" in cmd
@@ -463,6 +468,7 @@ def test_build_organize_cmd_optional_flags(tmp_path: Path):
     assert "--duplicates-hardlink" in cmd
     assert "--date-buckets" in cmd
     assert cmd[cmd.index("--unmatched") + 1] == "needs-review"
+    assert cmd[cmd.index("--empty-dir-min-age") + 1] == "600"
 
 
 def test_build_organize_cmd_rules_and_archive(tmp_path: Path):

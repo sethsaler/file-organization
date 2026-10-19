@@ -16,6 +16,7 @@ This project tracks changes using the Hermes skill version as its public version
 - Safety Center for `Needs Review`, `For Deletion`, and `Duplicates`, including Finder reveal, related-run restore, explicit Move to Trash, and local Dedupe scan handoff.
 - Atomic watch-health snapshots and Overview status for backend, pending changes, running folders, events, and errors.
 - Optional native macOS `FO` menu-bar helper plus Finder Quick Action installer.
+- `--empty-dir-min-age SECONDS` (per-folder `empty_dir_min_age` in `schedule.json`): empty folders stay untouched until they have been quiet for the grace window, so folders created moments before a watched run are never swept into `For Deletion` or removed in place. A too-new folder also shields everything nested inside it.
 
 ### Changed
 
