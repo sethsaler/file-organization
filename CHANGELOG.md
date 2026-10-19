@@ -28,6 +28,11 @@ This project tracks changes using the Hermes skill version as its public version
 
 ### Fixed
 
+- A folder switched off by the scheduler after repeated failures is now visible everywhere the daemon looks healthy: the watch-health snapshot keeps it as `disabled`, the Overview shows “Off after failures” plus a notice, the scheduler status line and menu-bar payload (`auto_disabled_folders`) report it, and the macOS run notification says so.
+- Re-enabling a folder now also clears its failure streak, so one more hiccup can no longer switch it straight back off.
+- An organizer process that crashes before producing any output (for example a transient filesystem error while importing) is retried once before it counts toward `max_failures_before_disable`.
+- Parallel watch runs no longer overwrite each other's `last_run` / `last_error` when they finish at the same time; each run writes back only the folders it ran.
+
 - Hidden-only folders are preserved when hidden files are excluded.
 - Existing `Other` contents are never removed by empty-bucket cleanup.
 - A watched folder is marked preview-verified only after a successful dry run.

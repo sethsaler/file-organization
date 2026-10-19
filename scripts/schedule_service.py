@@ -19,6 +19,7 @@ from schedule_config import (
     SCHEDULE_MODE_DAILY,
     SCHEDULE_MODE_INTERVAL,
     SCHEDULE_MODE_WATCH,
+    auto_disabled_jobs,
     default_config_path,
     load_config,
     normalize_schedule_mode,
@@ -402,10 +403,20 @@ def restart_service() -> Tuple[bool, str]:
 
 def service_status_line() -> str:
     if is_service_running():
-        return "Background scheduler: running"
-    if is_service_installed():
-        return "Background scheduler: installed but not running"
-    return "Background scheduler: not installed"
+        line = "Background scheduler: running"
+    elif is_service_installed():
+        line = "Background scheduler: installed but not running"
+    else:
+        line = "Background scheduler: not installed"
+    # A running daemon with every folder switched off looks healthy but does nothing;
+    # say so wherever the service status is shown.
+    try:
+        off = auto_disabled_jobs(load_config(default_config_path()))
+    except Exception:
+        off = []
+    if off:
+        line += f" · {len(off)} folder{'s' if len(off) != 1 else ''} switched off after repeated failures"
+    return line
 
 
 def service_log_path() -> Path:

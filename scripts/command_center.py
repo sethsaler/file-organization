@@ -49,7 +49,13 @@ from org_safety import (
     scan_safety_items,
 )
 from org_watch_status import read_watch_status, watch_status_path
-from schedule_config import SCHEDULE_MODE_WATCH, default_config_path, normalize_schedule_mode
+from schedule_config import (
+    SCHEDULE_MODE_WATCH,
+    auto_disabled_jobs,
+    default_config_path,
+    is_auto_disabled,
+    normalize_schedule_mode,
+)
 from schedule_panel import SchedulePanel
 from schedule_service import service_log_path
 
@@ -766,13 +772,19 @@ class CommandCenterApp:
             backend = str(watch_health.get("backend") or "unknown backend")
             pending = int(watch_health.get("pending_count", 0) or 0)
             running = int(watch_health.get("running_count", 0) or 0)
-            self.overview_health_var.set(
-                f"Watcher: {backend} · {running} running · {pending} waiting · health updated {_display_time(watch_health.get('updated_at'))}"
-            )
+            health = f"Watcher: {backend} · {running} running · {pending} waiting · health updated {_display_time(watch_health.get('updated_at'))}"
         elif watching:
-            self.overview_health_var.set(f"Waiting for watcher health at {watch_status_path()}")
+            health = f"Waiting for watcher health at {watch_status_path()}"
         else:
-            self.overview_health_var.set("")
+            health = ""
+        auto_off = auto_disabled_jobs(cfg)
+        if auto_off:
+            notice = (
+                f"{len(auto_off)} folder{'s' if len(auto_off) != 1 else ''} switched off after repeated failures"
+                " — fix the cause, then re-enable under Watched folders"
+            )
+            health = f"{health} · {notice}" if health else notice
+        self.overview_health_var.set(health)
         random_name_count = sum(bool(job.random_names_after_organize) for job in cfg.folders)
         self.overview_warning_var.set(
             f"Random filenames are enabled for {random_name_count} watched folder{'s' if random_name_count != 1 else ''}."
@@ -787,7 +799,7 @@ class CommandCenterApp:
             if not job.dry_run_verified:
                 status = "Needs preview"
             elif not job.enabled:
-                status = "Paused"
+                status = "Off after failures" if is_auto_disabled(cfg, job) else "Paused"
             elif watching:
                 detail = folder_health.get(job.path) if isinstance(folder_health, dict) else None
                 state = str((detail or {}).get("state") or "idle") if isinstance(detail, dict) else "idle"

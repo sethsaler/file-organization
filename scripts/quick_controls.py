@@ -12,7 +12,7 @@ from pathlib import Path
 from org_logging import default_log_path, read_history
 from org_manifest import restore_from_manifest
 from org_watch_status import read_watch_status
-from schedule_config import default_config_path, load_config, run_enabled_folders, save_config
+from schedule_config import auto_disabled_jobs, default_config_path, load_config, run_enabled_folders, save_config
 from schedule_service import is_service_running, sync_service_enabled
 
 
@@ -43,6 +43,7 @@ def status_payload(*, include_service: bool = True) -> dict:
         "backend": watch.get("backend"),
         "watch_updated_at": watch.get("updated_at"),
         "folders": [job.path for job in enabled],
+        "auto_disabled_folders": [job.path for job in auto_disabled_jobs(cfg)],
     }
     if include_service:
         payload["service_running"] = is_service_running()

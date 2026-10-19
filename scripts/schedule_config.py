@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,13 @@ from org_rules import FALLBACK_BUCKET, VALID_FALLBACKS
 
 # Protects the read-modify-write of schedule.json when multiple threads run folders in parallel.
 _config_lock = threading.Lock()
+
+# An organizer process that exits non-zero without printing anything crashed before it did
+# any work (for example a transient filesystem error while Python imported the helper's own
+# modules). One retry after a short pause keeps such blips from counting toward
+# max_failures_before_disable.
+TRANSIENT_FAILURE_RETRIES = 1
+TRANSIENT_FAILURE_RETRY_SECONDS = 2.0
 from org_paths import normalize_folder_input
 
 
@@ -403,11 +411,16 @@ def save_config(path: Path, cfg: ScheduleConfig) -> None:
     tmp.replace(path)
 
 
-def _merge_and_save_config(cfg: ScheduleConfig, config_path: Path) -> None:
-    """Merge per-run updates back into the latest on-disk config without overwriting concurrent runs."""
+def _merge_and_save_config(cfg: ScheduleConfig, config_path: Path, only_paths: Optional[Set[str]] = None) -> None:
+    """Merge per-run updates back into the latest on-disk config without overwriting concurrent runs.
+
+    Only folders named in only_paths (default: every folder in cfg) are written back, so a run
+    that touched one folder never clobbers the fresh last_run / last_error that a parallel run
+    of another folder saved a moment earlier.
+    """
     with _config_lock:
         fresh = load_config(config_path)
-        updated = {j.path: j for j in cfg.folders}
+        updated = {j.path: j for j in cfg.folders if only_paths is None or j.path in only_paths}
         for job in fresh.folders:
             if job.path in updated:
                 u = updated[job.path]
@@ -416,6 +429,27 @@ def _merge_and_save_config(cfg: ScheduleConfig, config_path: Path) -> None:
                 job.consecutive_failures = u.consecutive_failures
                 job.enabled = u.enabled
         save_config(config_path, fresh)
+
+
+def is_auto_disabled(cfg: ScheduleConfig, job: FolderJob) -> bool:
+    """True when the scheduler switched this folder off after repeated failures (not a user pause)."""
+    cap = cfg.max_failures_before_disable
+    return (not job.enabled) and cap > 0 and job.consecutive_failures >= cap
+
+
+def auto_disabled_jobs(cfg: ScheduleConfig) -> List[FolderJob]:
+    return [job for job in cfg.folders if is_auto_disabled(cfg, job)]
+
+
+def reenable_job(job: FolderJob) -> None:
+    """Turn a folder back on and clear the failure streak that may have switched it off.
+
+    Without the reset, a folder re-enabled after an auto-disable would be switched off again
+    by its very next failure because the counter would still sit at the cap.
+    """
+    job.enabled = True
+    job.consecutive_failures = 0
+    job.last_error = None
 
 
 def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, *, dry_run: bool = False) -> List[str]:
@@ -615,16 +649,25 @@ def _run_single_job(args: Tuple[int, FolderJob, List[str]]) -> Tuple[int, str, O
         ts = datetime.now(timezone.utc).isoformat()
         return idx, ts, "path missing or not a directory", "", "", 1
     timeout_sec = job.timeout_minutes * 60 if job.timeout_minutes > 0 else None
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-    except subprocess.TimeoutExpired:
-        ts = datetime.now(timezone.utc).isoformat()
-        return idx, ts, f"timed out after {job.timeout_minutes} minute(s)", "", "", 1
-    except OSError as e:
-        ts = datetime.now(timezone.utc).isoformat()
-        return idx, ts, str(e), "", "", 1
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    attempts = 0
+    while True:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            ts = datetime.now(timezone.utc).isoformat()
+            return idx, ts, f"timed out after {job.timeout_minutes} minute(s)", "", "", 1
+        except OSError as e:
+            ts = datetime.now(timezone.utc).isoformat()
+            return idx, ts, str(e), "", "", 1
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode != 0 and not out and attempts < TRANSIENT_FAILURE_RETRIES:
+            # Crashed before producing a summary: most likely a startup blip, not a real
+            # problem with the folder. Try once more before counting it as a failure.
+            attempts += 1
+            time.sleep(TRANSIENT_FAILURE_RETRY_SECONDS)
+            continue
+        break
     ts = datetime.now(timezone.utc).isoformat()
     if proc.returncode != 0:
         return idx, ts, err or f"exit {proc.returncode}", out, err, proc.returncode
@@ -641,10 +684,14 @@ def run_enabled_folders(
     file_log_path: Optional[Path] = None,
     only_paths: Optional[Set[str]] = None,
 ) -> Dict[str, int]:
-    """Run all runnable enabled folders; returns {"ran", "failed", "skipped"} counts."""
+    """Run all runnable enabled folders; returns {"ran", "failed", "skipped", "disabled"} counts.
+
+    "disabled" counts folders this call switched off after reaching max_failures_before_disable.
+    """
     from org_logging import append_history_entry, append_log_line
 
-    result = {"ran": 0, "failed": 0, "skipped": 0}
+    result = {"ran": 0, "failed": 0, "skipped": 0, "disabled": 0}
+    touched: Set[str] = set()
 
     conflicts = find_path_conflicts(cfg)
     if conflicts and log:
@@ -715,6 +762,7 @@ def run_enabled_folders(
             append_history_entry(_history_record(task_job, label, last_err, out))
             if 0 <= idx < len(cfg.folders):
                 job = cfg.folders[idx]
+                touched.add(job.path)
                 job.last_run = ts
                 job.last_error = last_err
                 if last_err:
@@ -723,6 +771,15 @@ def run_enabled_folders(
                     if cap > 0 and job.consecutive_failures >= cap:
                         job.enabled = False
                         job.last_error = f"{last_err} (disabled after {job.consecutive_failures} failures)"
+                        result["disabled"] += 1
+                        notice = (
+                            f"{job.path}: switched off after {job.consecutive_failures} consecutive failures; "
+                            "re-enable it under Watched folders once the cause is fixed"
+                        )
+                        if log:
+                            log(f"\n[{notice}]\n")
+                        if file_log_path:
+                            append_log_line(file_log_path, notice)
                 else:
                     job.consecutive_failures = 0
             if log:
@@ -741,7 +798,7 @@ def run_enabled_folders(
                 append_log_line(file_log_path, f"{path_log}: {status}")
 
     try:
-        _merge_and_save_config(cfg, config_path)
+        _merge_and_save_config(cfg, config_path, only_paths=touched)
     except OSError:
         pass
     return result

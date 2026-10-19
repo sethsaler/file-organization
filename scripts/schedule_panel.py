@@ -35,6 +35,7 @@ from schedule_config import (
     default_config_path,
     estimate_seconds_until_next_run,
     load_config,
+    reenable_job,
     normalize_daily_time,
     normalize_schedule_mode,
     organizer_script_path,
@@ -709,7 +710,11 @@ class SchedulePanel(ttk.Frame):
         if idx is None or not (0 <= idx < len(self.cfg.folders)):
             return
         job = self.cfg.folders[idx]
-        job.enabled = bool(self.enabled_var.get())
+        want_enabled = bool(self.enabled_var.get())
+        if want_enabled and not job.enabled:
+            reenable_job(job)  # also clears the failure streak that may have switched it off
+        else:
+            job.enabled = want_enabled
         job.recursive = bool(self.recursive_var.get())
         job.strategy = self.strategy_var.get()
         r = job.recursive

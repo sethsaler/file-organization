@@ -22,7 +22,7 @@ It supports recursive modes, dry-run previews, deterministic routing rules, a hu
 - Unmatched files can use normal type buckets, remain in place, or move into a recoverable `Needs Review` queue
 - The Downloader Archive recipe routes loose media into exact `Recents/Images`, `Recents/Videos`, or `Recents/GIFs` destinations and sends unknown creator folders to review rather than guessing
 - Scheduled folders can run daily, on an interval, or in **watch** mode (organize shortly after files change)
-- The watch daemon publishes live backend, pending, running, event, and error health for the command center and menu-bar helper
+- The watch daemon publishes live backend, pending, running, event, and error health for the command center and menu-bar helper, including folders it switched off after repeated failures (re-enable them under **Watched folders** once the cause is fixed)
 - Emits structured JSON output for scripting and automation
 
 ## Requirements
