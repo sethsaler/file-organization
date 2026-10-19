@@ -16,6 +16,7 @@ This project tracks changes using the Hermes skill version as its public version
 - Safety Center for `Needs Review`, `For Deletion`, and `Duplicates`, including Finder reveal, related-run restore, explicit Move to Trash, and local Dedupe scan handoff.
 - Atomic watch-health snapshots and Overview status for backend, pending changes, running folders, events, and errors.
 - Optional native macOS `FO` menu-bar helper plus Finder Quick Action installer.
+- `--empty-dir-min-age SECONDS` (per-folder `empty_dir_min_age` in `schedule.json`): empty folders stay untouched until they have been quiet for the grace window, so folders created moments before a watched run are never swept into `For Deletion` or removed in place. A too-new folder also shields everything nested inside it.
 
 ### Changed
 
@@ -26,6 +27,11 @@ This project tracks changes using the Hermes skill version as its public version
 - Schedule schema version 6 carries rules, review fallback, Archive root, and creator mapping per watched folder.
 
 ### Fixed
+
+- A folder switched off by the scheduler after repeated failures is now visible everywhere the daemon looks healthy: the watch-health snapshot keeps it as `disabled`, the Overview shows “Off after failures” plus a notice, the scheduler status line and menu-bar payload (`auto_disabled_folders`) report it, and the macOS run notification says so.
+- Re-enabling a folder now also clears its failure streak, so one more hiccup can no longer switch it straight back off.
+- An organizer process that crashes before producing any output (for example a transient filesystem error while importing) is retried once before it counts toward `max_failures_before_disable`.
+- Parallel watch runs no longer overwrite each other's `last_run` / `last_error` when they finish at the same time; each run writes back only the folders it ran.
 
 - Hidden-only folders are preserved when hidden files are excluded.
 - Existing `Other` contents are never removed by empty-bucket cleanup.

@@ -49,7 +49,13 @@ from org_safety import (
     scan_safety_items,
 )
 from org_watch_status import read_watch_status, watch_status_path
-from schedule_config import SCHEDULE_MODE_WATCH, default_config_path, normalize_schedule_mode
+from schedule_config import (
+    SCHEDULE_MODE_WATCH,
+    auto_disabled_jobs,
+    default_config_path,
+    is_auto_disabled,
+    normalize_schedule_mode,
+)
 from schedule_panel import SchedulePanel
 from schedule_service import service_log_path
 
@@ -452,6 +458,7 @@ class CommandCenterApp:
         self.profile_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
+        self.empty_dir_min_age_var = tk.StringVar(value="0")
         self.exclude_defaults_var = tk.BooleanVar(value=True)
         self.verbose_var = tk.BooleanVar(value=False)
         self.mime_var = tk.BooleanVar(value=False)
@@ -765,13 +772,19 @@ class CommandCenterApp:
             backend = str(watch_health.get("backend") or "unknown backend")
             pending = int(watch_health.get("pending_count", 0) or 0)
             running = int(watch_health.get("running_count", 0) or 0)
-            self.overview_health_var.set(
-                f"Watcher: {backend} · {running} running · {pending} waiting · health updated {_display_time(watch_health.get('updated_at'))}"
-            )
+            health = f"Watcher: {backend} · {running} running · {pending} waiting · health updated {_display_time(watch_health.get('updated_at'))}"
         elif watching:
-            self.overview_health_var.set(f"Waiting for watcher health at {watch_status_path()}")
+            health = f"Waiting for watcher health at {watch_status_path()}"
         else:
-            self.overview_health_var.set("")
+            health = ""
+        auto_off = auto_disabled_jobs(cfg)
+        if auto_off:
+            notice = (
+                f"{len(auto_off)} folder{'s' if len(auto_off) != 1 else ''} switched off after repeated failures"
+                " — fix the cause, then re-enable under Watched folders"
+            )
+            health = f"{health} · {notice}" if health else notice
+        self.overview_health_var.set(health)
         random_name_count = sum(bool(job.random_names_after_organize) for job in cfg.folders)
         self.overview_warning_var.set(
             f"Random filenames are enabled for {random_name_count} watched folder{'s' if random_name_count != 1 else ''}."
@@ -786,7 +799,7 @@ class CommandCenterApp:
             if not job.dry_run_verified:
                 status = "Needs preview"
             elif not job.enabled:
-                status = "Paused"
+                status = "Off after failures" if is_auto_disabled(cfg, job) else "Paused"
             elif watching:
                 detail = folder_health.get(job.path) if isinstance(folder_health, dict) else None
                 state = str((detail or {}).get("state") or "idle") if isinstance(detail, dict) else "idle"
@@ -914,6 +927,10 @@ class CommandCenterApp:
         ttk.Checkbutton(left, text="Include subfolders", variable=self.recursive_var).pack(anchor="w")
         ttk.Checkbutton(left, text="Include hidden files and folders", variable=self.hidden_var).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(left, text="Collect empty folders into For Deletion", variable=self.collect_empty_var).pack(anchor="w", pady=(4, 0))
+        age_row = ttk.Frame(left)
+        age_row.pack(anchor="w", padx=(18, 0), pady=(4, 0))
+        ttk.Label(age_row, text="Protect folders newer than (sec):").pack(side="left")
+        ttk.Entry(age_row, width=8, textvariable=self.empty_dir_min_age_var).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(left, text="Exclude project and dependency folders", variable=self.exclude_defaults_var).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(left, text="Organize each immediate subfolder separately", variable=self.expand_subfolders_var).pack(anchor="w", pady=(4, 0))
 
@@ -976,6 +993,7 @@ class CommandCenterApp:
             self.profile_var,
             self.hidden_var,
             self.collect_empty_var,
+            self.empty_dir_min_age_var,
             self.exclude_defaults_var,
             self.mime_var,
             self.detect_duplicates_var,
@@ -1045,6 +1063,7 @@ class CommandCenterApp:
             self.profile_var.get(),
             self.hidden_var.get(),
             self.collect_empty_var.get(),
+            self._empty_dir_min_age(),
             self.exclude_defaults_var.get(),
             self.mime_var.get(),
             self.detect_duplicates_var.get(),
@@ -1681,6 +1700,12 @@ class CommandCenterApp:
         var.set(str(path))
         return path
 
+    def _empty_dir_min_age(self) -> float:
+        try:
+            return max(0.0, float(self.empty_dir_min_age_var.get() or 0))
+        except ValueError:
+            return 0.0
+
     def _build_organize_cmd(self, dry_run: bool, base: Path) -> list[str]:
         cmd = [
             sys.executable,
@@ -1698,6 +1723,9 @@ class CommandCenterApp:
             "--collect-empty-dirs" if self.collect_empty_var.get() else "--no-collect-empty-dirs",
             "--backup",
         ]
+        min_age = self._empty_dir_min_age()
+        if min_age > 0:
+            cmd.extend(["--empty-dir-min-age", f"{min_age:g}"])
         if self.exclude_defaults_var.get():
             cmd.append("--exclude-defaults")
         if self.mime_var.get():
@@ -1797,6 +1825,7 @@ class CommandCenterApp:
             normalize=self.normalize_var.get(),
             include_hidden=self.hidden_var.get(),
             collect_empty_dirs=self.collect_empty_var.get(),
+            empty_dir_min_age=self._empty_dir_min_age(),
             profile=self.profile_var.get(),
             exclude_defaults=self.exclude_defaults_var.get(),
             expand_subfolders=self.expand_subfolders_var.get(),

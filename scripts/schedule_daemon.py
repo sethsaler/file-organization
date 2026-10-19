@@ -33,7 +33,9 @@ from org_watch_status import WatchStatus
 from schedule_config import (
     SCHEDULE_MODE_WATCH,
     FolderJob,
+    auto_disabled_jobs,
     default_config_path,
+    is_auto_disabled,
     load_config,
     normalize_schedule_mode,
     run_enabled_folders,
@@ -122,9 +124,12 @@ def _notify_run(cfg, summary: Optional[dict], label: str) -> None:
         return
     ran = summary.get("ran", 0)
     failed = summary.get("failed", 0)
+    disabled = summary.get("disabled", 0)
     msg = f"Organized {ran} folder(s)"
     if failed:
         msg += f", {failed} failed"
+    if disabled:
+        msg += f"; {disabled} switched off after repeated failures"
     script = (
         f'display notification "{msg}" '
         f'with title "File Organization" subtitle "{label} run"'
@@ -339,6 +344,7 @@ def _run_watch_loop(
         full_scan_seconds=WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS,
         max_workers=max_workers,
         folders=(job.path for job in cfg.folders if job.enabled),
+        disabled={job.path: job.last_error for job in auto_disabled_jobs(cfg)},
     )
 
     print(json.dumps({
@@ -387,7 +393,15 @@ def _run_watch_loop(
                     else:
                         _update_both_signatures(path)
                 dirty_since.pop(path, None)
-                if run_error:
+                disabled_job = None
+                if sub_cfg is not None:
+                    for job in sub_cfg.folders:
+                        if job.path == path and is_auto_disabled(sub_cfg, job):
+                            disabled_job = job
+                            break
+                if disabled_job is not None:
+                    status.update_folder(path, "disabled", error=disabled_job.last_error)
+                elif run_error:
                     status.update_folder(path, "error", error=run_error)
                 elif summary and summary.get("failed", 0):
                     status.update_folder(
@@ -414,7 +428,10 @@ def _run_watch_loop(
                     monitor.set_watched_paths(
                         job.path for job in cfg.folders if job.enabled
                     )
-                status.reconcile(job.path for job in cfg.folders if job.enabled)
+                status.reconcile(
+                    (job.path for job in cfg.folders if job.enabled),
+                    disabled={job.path: job.last_error for job in auto_disabled_jobs(cfg)},
+                )
 
             do_full_scan = now - last_full_scan >= full_scan_interval
             if do_full_scan:

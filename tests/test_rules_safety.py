@@ -268,3 +268,28 @@ def test_quick_control_opens_command_center(monkeypatch, tmp_path: Path) -> None
     assert isinstance(command, list)
     assert command[1].endswith("command_center.py")
     assert command[-4:] == ["--path", str(tmp_path), "--page", "organize"]
+
+
+def test_watch_status_keeps_auto_disabled_folders_visible(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    status = WatchStatus(
+        backend="polling",
+        poll_seconds=0.1,
+        quiet_seconds=0.3,
+        full_scan_seconds=60.0,
+        max_workers=4,
+        folders=["/tmp/a"],
+        disabled={"/tmp/b": "boom (disabled after 5 failures)"},
+    )
+    snapshot = read_watch_status()
+    assert snapshot["folders"]["/tmp/b"] == {"state": "disabled", "error": "boom (disabled after 5 failures)"}
+    assert snapshot["disabled_count"] == 1
+
+    # Reconcile drops folders that are neither active nor disabled, and a re-enabled folder returns to idle.
+    status.reconcile(["/tmp/a", "/tmp/b"], disabled={})
+    snapshot = read_watch_status()
+    assert snapshot["folders"]["/tmp/b"] == {"state": "idle"}
+    assert snapshot["disabled_count"] == 0
+
+    status.reconcile(["/tmp/a"], disabled={"/tmp/a": None})
+    assert read_watch_status()["folders"]["/tmp/a"]["state"] == "disabled"

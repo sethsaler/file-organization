@@ -9,6 +9,7 @@ import re
 import shutil
 import stat as stat_module
 import string
+import time
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -60,14 +61,15 @@ _MIME_SNIFF_STANDARD_EXTRA_BUCKETS = frozenset({"Documents", "Archives", "Audio"
 class _SimDir:
     """In-memory directory node used to preview empty-folder collection in dry runs."""
 
-    __slots__ = ("path", "parent", "is_symlink", "subdirs", "files")
+    __slots__ = ("path", "parent", "is_symlink", "subdirs", "files", "mtime")
 
-    def __init__(self, path: Path, parent: Optional["_SimDir"], is_symlink: bool) -> None:
+    def __init__(self, path: Path, parent: Optional["_SimDir"], is_symlink: bool, mtime: float = 0.0) -> None:
         self.path = path
         self.parent = parent
         self.is_symlink = is_symlink
         self.subdirs: Dict[str, "_SimDir"] = {}
         self.files: Dict[str, bool] = {}
+        self.mtime = mtime
 
 
 @dataclass
@@ -136,6 +138,7 @@ class Organizer:
         date_buckets: bool = False,
         rule_set: Optional[RuleSet] = None,
         archive_recipe: Optional[ArchiveRecipe] = None,
+        empty_dir_min_age: float = 0.0,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -162,6 +165,7 @@ class Organizer:
         self.date_buckets = date_buckets
         self.rule_set = rule_set
         self.archive_recipe = archive_recipe
+        self.empty_dir_min_age = max(0.0, float(empty_dir_min_age))
         if self.archive_recipe is not None:
             self.archive_recipe.validate_source_root(base)
         self._progress = progress_callback or (lambda _m: None)
@@ -212,6 +216,24 @@ class Organizer:
 
     def _visible_name(self, name: str) -> bool:
         return self.include_hidden or not name.startswith(".")
+
+    def _too_new_mtime(self, mtime: float) -> bool:
+        """True when empty-dir min-age protection is on and the directory changed too recently.
+
+        Directory mtime bumps on creation and whenever entries are added or removed,
+        so a freshly created folder — or one this run just emptied — is protected for
+        the grace window and becomes collectable on a later run once it stays quiet.
+        """
+        return self.empty_dir_min_age > 0 and mtime > time.time() - self.empty_dir_min_age
+
+    def _dir_is_too_new(self, directory: Path) -> bool:
+        if self.empty_dir_min_age <= 0:
+            return False
+        try:
+            mtime = os.stat(directory, follow_symlinks=False).st_mtime
+        except OSError:
+            return False
+        return self._too_new_mtime(mtime)
 
     def _is_for_deletion_name(self, name: str) -> bool:
         return name.casefold() == FOR_DELETION_DIR_NAME.casefold()
@@ -809,6 +831,7 @@ class Organizer:
                 if key in visited:
                     return
                 visited.add(key)
+                node.mtime = st.st_mtime
             except OSError:
                 return
             try:
@@ -836,7 +859,9 @@ class Organizer:
         for existing_name, child in node.subdirs.items():
             if existing_name.casefold() == name.casefold():
                 return child
-        child = _SimDir(node.path / name, node, False)
+        # Simulated destination dirs stand in for folders the real run would have
+        # just created, so they carry a fresh mtime like their real counterparts.
+        child = _SimDir(node.path / name, node, False, mtime=time.time())
         node.subdirs[name] = child
         return child
 
@@ -902,6 +927,8 @@ class Organizer:
         if path_excluded(node.path, self.base, self.exclude_patterns):
             return False, []
         if node.is_symlink:
+            return False, []
+        if self._too_new_mtime(node.mtime):
             return False, []
         if not node.subdirs and not node.files:
             return True, []
@@ -1010,6 +1037,10 @@ class Organizer:
         if path_excluded(directory, self.base, self.exclude_patterns):
             return False, []
         if os.path.islink(directory):
+            return False, []
+        # A too-new directory is never collectable and shields everything inside
+        # it: newly created folders survive long enough to be filled.
+        if self._dir_is_too_new(directory):
             return False, []
 
         # scandir DirEntry answers is_dir/is_symlink from d_type without extra
@@ -1157,6 +1188,10 @@ class Organizer:
         for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
             root_path = Path(root)
             dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
+            # Too-new dirs are never removed and never descended into, so a fresh
+            # folder shields any stale empties nested inside it as well.
+            if self.empty_dir_min_age > 0:
+                dirs[:] = [d for d in dirs if not self._dir_is_too_new(root_path / d)]
             if self._is_for_deletion_name(root_path.name):
                 dirs[:] = []
                 continue
@@ -1169,6 +1204,8 @@ class Organizer:
 
         for root_path in sorted(candidates, key=lambda p: len(p.parts), reverse=True):
             if self._is_for_deletion_name(root_path.name):
+                continue
+            if self._dir_is_too_new(root_path):
                 continue
             try:
                 entries = list(root_path.iterdir())
@@ -1509,6 +1546,7 @@ class Organizer:
             },
             "empty_folder_collection": {
                 "enabled": self.collect_empty_dirs,
+                "min_age_seconds": self.empty_dir_min_age,
                 "destination": str(self.base / FOR_DELETION_DIR_NAME) if self.collect_empty_dirs else None,
                 "folders_moved": self.empty_dir_stats.folders_moved,
                 "name_collisions_resolved": self.empty_dir_stats.name_collisions_resolved,

@@ -84,6 +84,7 @@ def test_folder_job_defaults():
     assert job.archive_root is None
     assert job.archive_mapping is None
     assert job.timeout_minutes == 60
+    assert job.empty_dir_min_age == 0.0
 
 
 def test_normalize_schedule_mode():
@@ -353,6 +354,7 @@ def test_expand_subfolders(tmp_path: Path):
         recursive=False,
         profile="extended",
         dry_run_verified=True,
+        empty_dir_min_age=300.0,
     )
     expanded = expand_subfolders(job)
     assert len(expanded) == 2
@@ -363,6 +365,7 @@ def test_expand_subfolders(tmp_path: Path):
         assert sub.recursive is False
         assert sub.profile == "extended"
         assert sub.dry_run_verified is True
+        assert sub.empty_dir_min_age == 300.0
 
     # Disabled: returned unchanged.
     assert expand_subfolders(FolderJob(path=str(tmp_path))) == [FolderJob(path=str(tmp_path))]
@@ -433,6 +436,7 @@ def test_build_organize_cmd_defaults_and_dry_run(tmp_path: Path):
     assert cmd[cmd.index("--normalize") + 1] == "standard"
     assert cmd[cmd.index("--profile") + 1] == "standard"
     assert "--backup" in cmd
+    assert "--empty-dir-min-age" not in cmd
     assert "--dry-run" not in cmd
     assert "--dry-run" in build_organize_cmd(job, dry_run=True)
 
@@ -450,6 +454,7 @@ def test_build_organize_cmd_optional_flags(tmp_path: Path):
         duplicates_hardlink=True,
         date_buckets=True,
         unmatched_mode="needs-review",
+        empty_dir_min_age=600.0,
     )
     cmd = build_organize_cmd(job)
     assert "--no-recursive" in cmd
@@ -463,6 +468,7 @@ def test_build_organize_cmd_optional_flags(tmp_path: Path):
     assert "--duplicates-hardlink" in cmd
     assert "--date-buckets" in cmd
     assert cmd[cmd.index("--unmatched") + 1] == "needs-review"
+    assert cmd[cmd.index("--empty-dir-min-age") + 1] == "600"
 
 
 def test_build_organize_cmd_rules_and_archive(tmp_path: Path):
@@ -501,3 +507,110 @@ def test_saved_json_is_valid_and_versioned(tmp_path: Path):
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["version"] == CONFIG_VERSION
     assert data["folders"] == []
+
+
+# --- failure handling, auto-disable visibility, and concurrent save merging ---
+
+
+class _FakeProc:
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _runnable_cfg(tmp_path: Path, names, **cfg_kwargs):
+    import schedule_config
+
+    jobs = []
+    for name in names:
+        folder = tmp_path / name
+        folder.mkdir(exist_ok=True)
+        jobs.append(schedule_config.FolderJob(path=str(folder), dry_run_verified=True))
+    cfg = schedule_config.ScheduleConfig(folders=jobs, **cfg_kwargs)
+    config_path = tmp_path / "schedule.json"
+    schedule_config.save_config(config_path, cfg)
+    return cfg, config_path
+
+
+def test_run_merge_only_writes_back_folders_that_ran(monkeypatch, tmp_path: Path) -> None:
+    """A run of folder A must not clobber folder B's fresher on-disk state from a parallel run."""
+    import schedule_config
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cfg_a, config_path = _runnable_cfg(tmp_path, ["A", "B"])
+    path_b = cfg_a.folders[1].path
+
+    # Simulate a concurrent run of B that finished first and saved its result.
+    cfg_b = schedule_config.load_config(config_path)
+    cfg_b.folders[1].last_run = "2026-10-19T12:42:55+00:00"
+    cfg_b.folders[1].consecutive_failures = 0
+    schedule_config._merge_and_save_config(cfg_b, config_path, only_paths={path_b})
+
+    monkeypatch.setattr(schedule_config.subprocess, "run", lambda *a, **k: _FakeProc(0, "{}"))
+    summary = schedule_config.run_enabled_folders(
+        cfg_a, config_path, only_paths={cfg_a.folders[0].path}, file_log_path=tmp_path / "run.log"
+    )
+    assert summary == {"ran": 1, "failed": 0, "skipped": 0, "disabled": 0}
+
+    on_disk = schedule_config.load_config(config_path)
+    assert on_disk.folders[0].last_run is not None
+    assert on_disk.folders[1].last_run == "2026-10-19T12:42:55+00:00"
+
+
+def test_startup_crash_is_retried_once_before_counting(monkeypatch, tmp_path: Path) -> None:
+    import schedule_config
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(schedule_config, "TRANSIENT_FAILURE_RETRY_SECONDS", 0.0)
+    cfg, config_path = _runnable_cfg(tmp_path, ["A"])
+
+    calls = []
+
+    def flaky_run(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return _FakeProc(1, "", "OSError: [Errno 11] Resource deadlock avoided")
+        return _FakeProc(0, "{}")
+
+    monkeypatch.setattr(schedule_config.subprocess, "run", flaky_run)
+    summary = schedule_config.run_enabled_folders(cfg, config_path, file_log_path=tmp_path / "run.log")
+    assert len(calls) == 2
+    assert summary["failed"] == 0
+    assert cfg.folders[0].consecutive_failures == 0
+    assert cfg.folders[0].last_error is None
+
+    # A failure that produced output is a real organizer failure: no retry.
+    calls.clear()
+    monkeypatch.setattr(schedule_config.subprocess, "run", lambda *a, **k: (calls.append(1), _FakeProc(1, "{\"error\": 1}", "boom"))[1])
+    summary = schedule_config.run_enabled_folders(cfg, config_path, file_log_path=tmp_path / "run.log")
+    assert len(calls) == 1
+    assert summary["failed"] == 1
+    assert cfg.folders[0].consecutive_failures == 1
+
+
+def test_auto_disable_is_reported_logged_and_reversible(monkeypatch, tmp_path: Path) -> None:
+    import schedule_config
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cfg, config_path = _runnable_cfg(tmp_path, ["A"], max_failures_before_disable=2)
+    cfg.folders[0].consecutive_failures = 1
+    monkeypatch.setattr(schedule_config.subprocess, "run", lambda *a, **k: _FakeProc(1, "partial output", "boom"))
+
+    log_path = tmp_path / "run.log"
+    summary = schedule_config.run_enabled_folders(cfg, config_path, file_log_path=log_path)
+    job = cfg.folders[0]
+    assert summary["disabled"] == 1
+    assert job.enabled is False
+    assert "disabled after 2 failures" in (job.last_error or "")
+    assert "switched off after 2 consecutive failures" in log_path.read_text(encoding="utf-8")
+    assert schedule_config.is_auto_disabled(cfg, job) is True
+    assert [j.path for j in schedule_config.auto_disabled_jobs(cfg)] == [job.path]
+
+    # A folder the user paused by hand is not "auto-disabled".
+    paused = schedule_config.FolderJob(path=str(tmp_path / "B"), enabled=False)
+    assert schedule_config.is_auto_disabled(cfg, paused) is False
+
+    schedule_config.reenable_job(job)
+    assert (job.enabled, job.consecutive_failures, job.last_error) == (True, 0, None)
+    assert schedule_config.auto_disabled_jobs(cfg) == []

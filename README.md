@@ -22,7 +22,7 @@ It supports recursive modes, dry-run previews, deterministic routing rules, a hu
 - Unmatched files can use normal type buckets, remain in place, or move into a recoverable `Needs Review` queue
 - The Downloader Archive recipe routes loose media into exact `Recents/Images`, `Recents/Videos`, or `Recents/GIFs` destinations and sends unknown creator folders to review rather than guessing
 - Scheduled folders can run daily, on an interval, or in **watch** mode (organize shortly after files change)
-- The watch daemon publishes live backend, pending, running, event, and error health for the command center and menu-bar helper
+- The watch daemon publishes live backend, pending, running, event, and error health for the command center and menu-bar helper, including folders it switched off after repeated failures (re-enable them under **Watched folders** once the cause is fixed)
 - Emits structured JSON output for scripting and automation
 
 ## Requirements
@@ -310,6 +310,7 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--verbose` — progress on stderr during large runs
 - `--ocr-index` — after organizing, OCR PNG/JPEG under `Images/` into `.organizer/ocr_index.csv` (needs OCR deps)
 - `--collect-empty-dirs` / `--no-collect-empty-dirs` — empty-folder staging (default: on)
+- `--empty-dir-min-age SECONDS` — leave empty folders alone until they have been untouched for at least SECONDS (a folder's mtime bumps on creation and when entries change, so newly created folders survive the grace window; `0` disables the check)
 - `--dry-run` — preview changes without writing
 - `--restore MANIFEST` — undo a run from `.organizer/backup_*.json` (a run with nothing to move, stage, or remove writes no manifest)
 - `--json-out FILE` — write JSON summary to a file
@@ -332,6 +333,7 @@ python3 scripts/restore_from_backup.py --list /path/to/folder
 - When `--no-collect-empty-dirs` is set, empty folders are removed in place only (nothing moved to `For Deletion`)
 - In non-recursive and in-place modes, behavior matches: stage collectable trees to `For Deletion` by default, then trim leftover empties
 - Use `--no-collect-empty-dirs` to disable staging entirely
+- `--empty-dir-min-age SECONDS` protects recently changed folders from both staging and the in-place empty-dir trim; a too-new folder also shields everything nested inside it. Useful for watched folders where a new directory must survive long enough to be filled
 - `Needs Review`, `For Deletion`, `Duplicates`, and `.organizer` are quarantine/recovery areas and are never recursively reorganized
 - Rule destinations remain inside the organizer root; only the explicit `--archive-root` recipe can move files across roots
 - Cross-root archive moves use version-2 recovery manifests and can be restored from either root

@@ -7,7 +7,7 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 from org_logging import default_state_dir
 
@@ -58,6 +58,7 @@ class WatchStatus:
         full_scan_seconds: float,
         max_workers: int,
         folders: Iterable[str],
+        disabled: Optional[Mapping[str, Optional[str]]] = None,
     ) -> None:
         self._last_flush = 0.0
         self.data: Dict[str, Any] = {
@@ -70,16 +71,39 @@ class WatchStatus:
             "started_at": utc_now(),
             "folders": {path: {"state": "idle"} for path in folders},
         }
+        self.reconcile(list(self.data["folders"]), disabled=disabled)
         self.flush(force=True)
 
-    def reconcile(self, paths: Iterable[str]) -> None:
+    def reconcile(
+        self,
+        paths: Iterable[str],
+        disabled: Optional[Mapping[str, Optional[str]]] = None,
+    ) -> None:
+        """Keep exactly the active folders plus any folders the scheduler switched off.
+
+        Folders in `disabled` (path -> last error) stay visible in the snapshot with state
+        "disabled" so the command center and menu-bar helper can show that the daemon is up
+        but no longer organizing them, instead of silently dropping them.
+        """
         folders = self.data.setdefault("folders", {})
-        wanted = set(paths)
+        before = json.dumps(folders, sort_keys=True)
+        active = set(paths)
+        off = dict(disabled or {})
         for path in list(folders):
-            if path not in wanted:
+            if path not in active and path not in off:
                 del folders[path]
-        for path in wanted:
-            folders.setdefault(path, {"state": "idle"})
+        for path in active:
+            record = folders.setdefault(path, {"state": "idle"})
+            if record.get("state") == "disabled":
+                record["state"] = "idle"
+                record.pop("error", None)
+        for path, error in off.items():
+            record = folders.setdefault(path, {})
+            record["state"] = "disabled"
+            if error:
+                record["error"] = error
+        if json.dumps(folders, sort_keys=True) != before:
+            self.flush(force=True)
 
     def update_folder(self, path: str, state: str, **details: Any) -> None:
         folders = self.data.setdefault("folders", {})
@@ -113,6 +137,9 @@ class WatchStatus:
         )
         self.data["running_count"] = sum(
             1 for record in folders.values() if record.get("state") == "running"
+        )
+        self.data["disabled_count"] = sum(
+            1 for record in folders.values() if record.get("state") == "disabled"
         )
         write_watch_status(self.data)
         self._last_flush = now

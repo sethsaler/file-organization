@@ -79,6 +79,7 @@ class TinkerApp:
         self.profile_var = tk.StringVar(value="standard")
         self.hidden_var = tk.BooleanVar(value=True)
         self.collect_empty_var = tk.BooleanVar(value=True)
+        self.empty_dir_min_age_var = tk.StringVar(value="0")
         self.exclude_defaults_var = tk.BooleanVar(value=True)
         self.verbose_var = tk.BooleanVar(value=False)
         self.mime_var = tk.BooleanVar(value=False)
@@ -225,6 +226,11 @@ class TinkerApp:
         group = self._make_label_frame(advanced, "File handling")
         self._make_check(group, "Include hidden files and folders", self.hidden_var)
         self._make_check(group, "Collect empty folders into “For Deletion”", self.collect_empty_var)
+        age_row = ttk.Frame(group)
+        age_row.pack(anchor="w", padx=(18, 0), pady=(2, 0))
+        ttk.Label(age_row, text="Protect folders newer than (sec):").pack(side="left")
+        ttk.Entry(age_row, width=8, textvariable=self.empty_dir_min_age_var).pack(side="left", padx=(6, 0))
+        ttk.Label(age_row, text="(0 = off)").pack(side="left", padx=(6, 0))
         self._make_check(group, "Exclude .git, node_modules, venv, …", self.exclude_defaults_var)
         self._make_check(group, "Detect duplicates (identical content) into “Duplicates”", self.detect_duplicates_var)
         self._make_check(group, "…keep duplicates in place as hardlinks (no extra disk space)", self.duplicates_hardlink_var, padx=(18, 0))
@@ -461,6 +467,7 @@ class TinkerApp:
             normalize=self._effective_normalize(),
             include_hidden=self.hidden_var.get(),
             collect_empty_dirs=self.collect_empty_var.get(),
+            empty_dir_min_age=self._empty_dir_min_age(),
             profile=self.profile_var.get(),
             exclude_defaults=self.exclude_defaults_var.get(),
             expand_subfolders=self.expand_subfolders_var.get(),
@@ -471,6 +478,12 @@ class TinkerApp:
             date_buckets=self.date_buckets_var.get(),
         )
         self.notebook.select(1)
+
+    def _empty_dir_min_age(self) -> float:
+        try:
+            return max(0.0, float(self.empty_dir_min_age_var.get() or 0))
+        except ValueError:
+            return 0.0
 
     def _build_organize_cmd(self, dry_run: bool, *, base: Path | None = None) -> list[str]:
         folder = base or self._resolve_path(self.path_var) or Path()
@@ -492,6 +505,9 @@ class TinkerApp:
         cmd.extend(self._flag(self.recursive_var, "--recursive", "--no-recursive"))
         cmd.extend(self._flag(self.hidden_var, "--include-hidden", "--no-include-hidden"))
         cmd.extend(self._flag(self.collect_empty_var, "--collect-empty-dirs", "--no-collect-empty-dirs"))
+        min_age = self._empty_dir_min_age()
+        if min_age > 0:
+            cmd.extend(["--empty-dir-min-age", f"{min_age:g}"])
         if self.exclude_defaults_var.get():
             cmd.append("--exclude-defaults")
         if self.verbose_var.get():
