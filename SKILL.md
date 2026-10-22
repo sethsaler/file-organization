@@ -73,7 +73,11 @@ Performance characteristics:
 - top-down walk skips only `For Deletion` / `.organizer` (and `Duplicates` when duplicate detection is on); follows directory symlinks with inode cycle guard
 - O(1) extension→bucket lookup via a precomputed map; per-directory `resolve()` caching on the move path
 - optional bottom-up normalization pass only when requested
-- structured JSON output for direct reporting
+- native file-event batches use incremental flatten-root moves after a successful full run; directory/overflow events and global routing/renaming options fall back to full reconciliation
+- events arriving during a run remain queued; post-run signature scans never hold the event-state lock
+- metadata cleanup and empty-directory trimming share their directory inventory; later collection rounds inspect only affected parents
+- duplicate hashes persist outside organized trees under the state directory; device/inode/size/mtime/ctime validation rejects stale entries, and dry runs never write the cache
+- structured JSON output includes execution scope, phase timings, and hash-cache hits/misses; incremental verification covers changed paths only
 - dry-run mode for fast planning and validation without writes; the empty-folder preview is simulated in memory (no temp-dir tree clone)
 
 ## Project structure
@@ -87,9 +91,10 @@ Performance characteristics:
 - `scripts/schedule_panel.py` — shared Schedule tab / panel (folder list, timing, worker)
 - `scripts/schedule_config.py` — shared `schedule.json` schema and parallel organizer runs
 - `scripts/schedule_gui.py` — schedule-only window (same panel as Tinker’s Schedule tab)
-- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop reacts to native FS events via the optional `watchdog` package (near-instant, any depth; falls back to mtime polling without it) and organizes once a folder stays quiet; both detection paths ignore `.organizer` bookkeeping so the organizer never re-triggers itself (including on iCloud Drive, where sync daemons react to each run)
+- `scripts/schedule_daemon.py` — background loop or `--once` for cron; runs enabled folders in parallel; in `watch` schedule mode the foreground loop reacts to native FS events via the optional `watchdog` package (near-instant, any depth; falls back to mtime polling without it) and organizes once a folder stays quiet; both detection paths ignore `.organizer` bookkeeping and retain in-flight file events for a follow-up pass; periodic full reconciliation covers cleanup after incremental work
 - `scripts/schedule_watch.py` — native filesystem-event monitor for watch mode (watchdog/FSEvents/inotify wrapper with polling fallback)
 - `scripts/install.sh` — one-line curl installer (GitHub tarball into a chosen directory)
+- `scripts/benchmark_organizer.py` — full/incremental and cold/cached-hash benchmarks using generated temporary files only
 - `scripts/quick_controls.py` — status, pause/resume, run-all, undo-latest, and open-folder commands for native macOS controls
 - `scripts/install_macos_integrations.py` — builds/installs the native menu-bar app and Finder Quick Action
 - `macos/FileOrganizerMenuBar.swift` — native `FO` menu-bar application source

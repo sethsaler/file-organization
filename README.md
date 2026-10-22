@@ -139,14 +139,32 @@ Set `"schedule_mode": "watch"` to organize a folder shortly after files land in 
 }
 ```
 
-- **Native FS events (recommended):** install the optional [`watchdog`](https://pypi.org/project/watchdog/) package (`python3 -m pip install --user watchdog`, or `pip install "organize-folder-by-filetype[watch]"`) and the watch daemon reacts to filesystem events (FSEvents on macOS, inotify on Linux) at **any depth** under each watched folder within milliseconds. A relaxed full recursive scan still runs every 60 s as a safety net in case an event is ever dropped. The `curl | bash` installer installs watchdog automatically (best-effort).
+- **Native FS events (recommended):** install the optional [`watchdog`](https://pypi.org/project/watchdog/) package (`python3 -m pip install --user watchdog`, or `pip install "organize-folder-by-filetype[watch]"`) and the watch daemon reacts to filesystem events (FSEvents on macOS, inotify on Linux) at **any depth** under each watched folder within milliseconds. A full recursive signature scan still runs every 60 s as a safety net. After incremental work, this also schedules a full organization/cleanup pass. The `curl | bash` installer installs watchdog automatically (best-effort).
 - **Polling fallback (no watchdog):** the daemon uses tiered polling. A fast signature (`stat` of the watched root and its immediate subdirectories) runs every `watch_poll_seconds` (default 0.25 s); a full recursive scan runs every 5 s to catch changes deeper than one level.
 - After a change is detected, the folder must stay quiet for `watch_quiet_seconds` (default 0.3 s) before organizing — in-progress copies keep resetting the timer, so large files finish before being moved. Each folder gets its own background worker, so a long-running folder does not block the watcher from organizing other folders. Timings are configurable in `schedule.json` (`watch_poll_seconds`, `watch_quiet_seconds`) or in the Schedule tab.
-- The organizer's own bookkeeping never re-triggers a run: both backends ignore changes under `.organizer`, and a run that moves, stages, or removes nothing writes no backup manifest at all (nothing to restore), so a quiet folder stays quiet — including on iCloud Drive, where sync daemons react to every new file a folder receives.
+- Both backends ignore bookkeeping under `.organizer`, and a run that moves, stages, or removes nothing writes no backup manifest. Native events arriving during a run are retained, so a concurrent download is not lost; the organizer’s own move events can cause a harmless follow-up pass. Hash caches live outside the organized tree, avoiding cloud-sync churn.
 - **macOS (LaunchAgent):** enabling automatic runs in watch mode installs a persistent agent running the watch daemon (`--foreground`, `RunAtLoad` + `KeepAlive`). Watched folders are read from `schedule.json` on the daemon's periodic config reload, so adding/removing folders needs no reinstall.
 - Combine with `min_unsorted_threshold` to only fire once enough files have accumulated.
 - The daemon logs the active backend at startup (`"backend": "fsevents" | "inotify" | "polling"`) in `~/.local/state/file-organization/schedule-daemon.log`.
 - Live watcher health is written atomically to `~/.local/state/file-organization/watch-status.json`; the Overview and native menu-bar helper show pending/running activity and the last health update.
+
+### Performance and verification
+
+Native watch mode uses file-event batches after a successful full run. Eligible flatten-root jobs process only those files and affected empty parent folders. Directory changes, batches larger than 512 distinct paths, changed settings, startup, failed runs, in-place mode, rules, Archive routing, and whole-tree renaming use full runs. Polling continues to use full runs. The periodic safety scan reconciles the whole tree after incremental work; global normalization and metadata cleanup happen there. Events received while a run is in progress remain queued.
+
+Full runs reuse the metadata-cleanup directory inventory for empty-directory trimming. Empty-folder collection scans the tree once, then checks only parents of folders just staged into `For Deletion` on subsequent rounds. Filesystem checks immediately before removal are retained.
+
+Duplicate detection persists validated hashes in `~/.local/state/file-organization/hashes/` (or under `XDG_STATE_HOME`). Cache entries require matching device, inode, size, and nanosecond modification/change times; files changing during hashing are not cached. Cloud placeholders are not hashed. Missing, corrupt, or unwritable caches fall back to ordinary hashing. Dry runs do not write the cache, and deleting it only makes the next duplicate scan slower. The canonical-file index is still rebuilt so removed files cannot become duplicate destinations.
+
+JSON results include `execution` (`full` or `incremental`), `phase_seconds`, and `hash_cache` hit/miss counts. Incremental `verification` explicitly reports `scope: changed-paths`; whole-tree verification is performed by full runs.
+
+Run a reproducible benchmark using generated temporary files:
+
+```bash
+python3 scripts/benchmark_organizer.py --files 3000 --repeats 3
+```
+
+This compares full and incremental single-file arrivals plus cold/cached hashing. It does not organize any user folder; results depend on the filesystem and hardware.
 
 ### Routing rules and Needs Review
 

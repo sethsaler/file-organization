@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import random
 import re
@@ -23,7 +24,8 @@ from org_buckets import (
     canonical_dir_map,
     extension_bucket_map,
 )
-from org_dupes import DuplicateIndex, stat_is_dataless
+from org_dupes import DuplicateIndex, HashCache, stat_is_dataless
+from org_logging import default_state_dir
 from org_exclude import path_excluded, should_skip_traverse_dir
 from org_manifest import (
     FOR_DELETION_DIR_NAME,
@@ -139,8 +141,13 @@ class Organizer:
         rule_set: Optional[RuleSet] = None,
         archive_recipe: Optional[ArchiveRecipe] = None,
         empty_dir_min_age: float = 0.0,
+        changed_paths: Optional[List[Path]] = None,
     ) -> None:
         self.base = base
+        self._input_base = Path(os.path.abspath(base))
+        self.changed_paths = changed_paths
+        self.phase_seconds: Dict[str, float] = {}
+        self._cleanup_directories: Optional[List[Path]] = None
         self.recursive = recursive
         self.strategy = strategy
         self.include_hidden = include_hidden
@@ -197,7 +204,9 @@ class Organizer:
 
         self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
         self.used_random_names: Set[str] = set()
-        self._dup_index: Optional[DuplicateIndex] = DuplicateIndex() if detect_duplicates else None
+        cache_key = hashlib.sha256(str(base.resolve()).encode()).hexdigest()
+        self._hash_cache = HashCache(default_state_dir() / "hashes" / f"{cache_key}.json") if detect_duplicates else None
+        self._dup_index: Optional[DuplicateIndex] = DuplicateIndex(self._hash_cache) if detect_duplicates else None
         self._resolved_dir_cache: Dict[Path, Path] = {}
         self._ensured_dirs: Set[Path] = set()
         self._created_dirs: Set[Path] = set()
@@ -1176,29 +1185,31 @@ class Organizer:
                 self.empty_dir_stats = simulated
                 return
 
-        max_rounds = 500
-        for _ in range(max_rounds):
-            candidates = self._find_empty_dir_candidates()
+        candidates = self._find_empty_dir_candidates()
+        for _ in range(500):
             if not candidates:
                 break
+            parents = {p.parent for p in candidates if p.parent != self.base}
             self._collect_empty_dirs_batch(candidates)
+            # Only parents of staged trees can have become newly empty. Avoid
+            # re-scanning every unaffected branch on every collection round.
+            candidates = [p for p in sorted(parents, key=str)
+                          if not self._should_skip_traversal_dir(p.parent, p.name)
+                          and self._inspect_empty_dir_tree(p)[0]]
 
     def _remove_empty_subdirs(self) -> None:
         candidates: List[Path] = []
-        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
-            root_path = Path(root)
-            dirs[:] = [d for d in dirs if not self._should_skip_traversal_dir(root_path, d)]
-            # Too-new dirs are never removed and never descended into, so a fresh
-            # folder shields any stale empties nested inside it as well.
-            if self.empty_dir_min_age > 0:
-                dirs[:] = [d for d in dirs if not self._dir_is_too_new(root_path / d)]
-            if self._is_for_deletion_name(root_path.name):
-                dirs[:] = []
+        if self._cleanup_directories is None:
+            directories = [Path(root) for root, _dirs, _files in os.walk(self.base, followlinks=False)]
+        else:
+            directories = self._cleanup_directories
+        for root_path in directories:
+            if root_path == self.base:
                 continue
-            if self._is_organizer_dir(root_path.name):
-                dirs[:] = []
-                continue
-            if self._at_organize_root(root_path):
+            chain = list(root_path.relative_to(self.base).parents)
+            ancestors = [self.base / part for part in reversed(chain)] + [root_path]
+            if any(self._should_skip_traversal_dir(path.parent, path.name)
+                   or self._dir_is_too_new(path) for path in ancestors if path != self.base):
                 continue
             candidates.append(root_path)
 
@@ -1232,7 +1243,9 @@ class Organizer:
         """Remove .DS_Store files (both named and randomly renamed)."""
         dsstore_files_removed = 0
 
+        self._cleanup_directories = []
         for root, _dirs, files in os.walk(self.base, followlinks=False):
+            self._cleanup_directories.append(Path(root))
             for name in files:
                 is_dsstore = False
                 if name == ".DS_Store" or name.endswith(".DS_Store"):
@@ -1478,44 +1491,115 @@ class Organizer:
         
         return rename_stats
 
+    def _incremental_supported(self) -> bool:
+        return (self.changed_paths is not None and not self.dry_run
+                and self.strategy == "flatten-root" and self.rule_set is None
+                and self.archive_recipe is None and not self.random_names_after_organize
+                and not self.ocr_index
+                and not any(Path(p).is_dir() for p in self.changed_paths))
+
+    def _run_changed_files(self) -> None:
+        """Use the ordinary collision-safe move path for validated event files."""
+        touched: Set[Path] = set()
+        parents: Set[Path] = set()
+        for raw in sorted(set(self.changed_paths or []), key=str):
+            source = Path(os.path.abspath(raw))
+            try:
+                relative = source.relative_to(self._input_base)
+            except ValueError:
+                try:
+                    relative = source.relative_to(self.base)
+                except ValueError:
+                    continue
+            source = self.base / relative
+            if not relative.parts or (not self.recursive and len(relative.parts) != 1):
+                continue
+            # Never use an event to traverse symlinks, exclusions or hidden dirs.
+            parent = self.base
+            allowed = True
+            for part in relative.parts[:-1]:
+                child = parent / part
+                if child.is_symlink() or self._should_skip_traversal_dir(parent, part) or not self._visible_name(part):
+                    allowed = False
+                    break
+                parent = child
+            if not allowed or not self._visible_name(source.name) or source.is_symlink() or not source.is_file():
+                continue
+            decision = self._route_file(source, self.base)
+            if decision.destination is not None:
+                self._move_one_file(source, decision.destination, bucket_parent=self.base,
+                                    bucket_name=decision.category, reason=decision.reason)
+                touched.add(source.parent)
+                parents.update(p for p in source.parents if p != self.base and self.base in p.parents)
+        self.move_stats.folders_touched = len(touched)
+        # Only inspect affected ancestors; unrelated library branches are untouched.
+        candidates = []
+        for parent in sorted(parents, key=lambda p: len(p.parts)):
+            if any(self._dir_is_too_new(p) for p in [parent, *parent.parents] if p in parents):
+                continue
+            if any(ancestor == parent or ancestor in parent.parents for ancestor in candidates):
+                continue
+            collectable, _ = self._inspect_empty_dir_tree(parent)
+            if collectable:
+                candidates.append(parent)
+        if self.collect_empty_dirs:
+            if candidates:
+                self._collect_empty_dirs_batch(candidates)
+        else:
+            for parent in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+                if any(self._dir_is_too_new(p) for p in [parent, *parent.parents] if p in parents):
+                    continue
+                try:
+                    parent.rmdir()
+                    self.removed_dirs.append(str(parent.relative_to(self.base)))
+                    self.empty_dirs_removed += 1
+                except OSError:
+                    pass
+
+    def _timed(self, phase: str, callback):
+        started = time.perf_counter()
+        try:
+            return callback()
+        finally:
+            self.phase_seconds[phase] = round(time.perf_counter() - started, 6)
+
     def run(self) -> Dict[str, object]:
+        started = time.perf_counter()
         try:
             self.base = self.base.resolve()
         except OSError:
             pass
 
-        self._seed_duplicate_index()
-
-        if self.recursive:
-            if self.strategy == "in-place":
-                self._run_recursive_in_place()
-            else:
-                self._run_recursive_flatten_root()
-                if not self.collect_empty_dirs:
-                    self._remove_empty_subdirs()
+        incremental = self._incremental_supported()
+        self._timed("duplicate_index", self._seed_duplicate_index)
+        if incremental:
+            self._timed("organize", self._run_changed_files)
         else:
-            self._run_non_recursive()
+            organize = (self._run_recursive_in_place if self.strategy == "in-place"
+                        else self._run_recursive_flatten_root) if self.recursive else self._run_non_recursive
+            self._timed("organize", organize)
+            self._timed("normalize", self._maybe_normalize)
+            # Inventory captured here is shared with empty-directory trimming.
+            self._timed("metadata_cleanup", self._cleanup_dsstore_files)
+            self._timed("empty_collection", self._maybe_collect_empty_dirs)
+            self._timed("empty_trim", self._remove_empty_subdirs)
+            self._timed("other_cleanup", self._cleanup_empty_other_bucket)
 
-        self._maybe_normalize()
-        # .DS_Store cleanup must precede the empty-dir passes: a folder holding
-        # only a .DS_Store is empty once the file is gone, and with
-        # include_hidden=True nothing else would ever purge it.
-        self._cleanup_dsstore_files()
-        self._maybe_collect_empty_dirs()
-        self._remove_empty_subdirs()
-        self._cleanup_empty_other_bucket()
-
-        # Rename all files after organization if requested
         rename_stats = {}
         if self.random_names_after_organize:
-            rename_stats = self._rename_all_files_after_organize()
+            rename_stats = self._timed("rename", self._rename_all_files_after_organize)
 
-        manifest_info = self.save_manifest()
+        manifest_info = self._timed("manifest", self.save_manifest)
         if manifest_info and not self.dry_run:
             cleanup_old_manifests(self.base, days_to_keep=7)
             if self.archive_recipe is not None:
                 cleanup_old_manifests(self.archive_recipe.archive_root, days_to_keep=7)
-        ocr_path = self._maybe_write_ocr_index()
+        ocr_path = self._timed("ocr", self._maybe_write_ocr_index)
+        if self._hash_cache is not None and not self.dry_run:
+            self._timed("hash_cache_save", self._hash_cache.save)
+        verification = ({"scope": "changed-paths", "requested_paths": len(self.changed_paths or [])}
+                        if incremental else self._timed("verification", self._verify))
+        self.phase_seconds["total"] = round(time.perf_counter() - started, 6)
 
         if self.profile_buckets:
             summary_buckets: List[str] = [name for name, _ in self.profile_buckets] + ["Other"]
@@ -1578,7 +1662,10 @@ class Organizer:
                 "files_skipped": rename_stats.get("files_skipped", 0),
                 "errors": rename_stats.get("errors", []),
             },
-            "verification": self._verify(),
+            "verification": verification,
+            "execution": "incremental" if incremental else "full",
+            "phase_seconds": self.phase_seconds,
+            "hash_cache": {"hits": self._hash_cache.hits, "misses": self._hash_cache.misses} if self._hash_cache else None,
             "backup_manifest": manifest_info.get("manifest") if manifest_info else None,
             "archive_backup_manifest": manifest_info.get("archive_manifest") if manifest_info else None,
             "restore_script": manifest_info.get("restore_script") if manifest_info else None,

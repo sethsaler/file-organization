@@ -40,6 +40,7 @@ from schedule_config import (
     normalize_schedule_mode,
     run_enabled_folders,
     wait_seconds_after_run,
+    build_organize_cmd,
     watch_signature,
     watch_signature_fast,
 )
@@ -310,6 +311,10 @@ def _run_watch_loop(
     signatures_full: dict = {}
     dirty_since: dict = {}
     in_flight: set = set()
+    reconciled: dict = {}
+    maintenance_due: set = set()
+    full_required: set = set()
+    incremental_batches: dict = {}
     last_reload = 0.0
     last_full_scan = 0.0
     last_heartbeat = 0.0
@@ -323,10 +328,8 @@ def _run_watch_loop(
     def _mark_dirty(path: str) -> None:
         """Native event callback (observer thread): mark a watched root dirty."""
         with state_lock:
-            if path in in_flight:
-                # The organizer's own moves fire events for the root being
-                # organized; ignore them (baselines are reset after the run).
-                return
+            # Retain events during a run, including user writes concurrent with
+            # organizer moves. Replaying an already-routed file is a cheap no-op.
             dirty_since[path] = time.monotonic()
             if status is not None:
                 status.update_folder(path, "dirty", quiet_seconds=cfg.watch_quiet_seconds)
@@ -356,12 +359,6 @@ def _run_watch_loop(
         "max_workers": max_workers,
     }, indent=2))
 
-    def _update_both_signatures(path: str, job: Optional[FolderJob] = None) -> None:
-        target = job if job is not None else FolderJob(path=path)
-        if not use_events:
-            signatures_fast[path] = watch_signature_fast(target)
-        signatures_full[path] = watch_signature(target)
-
     def _organize_path(path: str) -> None:
         sub_cfg: Optional[object] = None
         summary: Optional[dict] = None
@@ -376,23 +373,40 @@ def _run_watch_loop(
                 label="watch",
                 file_log_path=file_log_path,
                 only_paths={path},
+                **({"changed_paths": incremental_batches[path]} if path in incremental_batches else {}),
             )
             if summary:
                 _notify_run(sub_cfg, summary, "watch")
         except Exception as exc:
             run_error = str(exc)
         finally:
+            # Scan without holding the event-state lock. Other roots and event
+            # callbacks remain responsive even on slow network/cloud folders.
+            job = next((j for j in sub_cfg.folders if j.path == path), None) if sub_cfg else None
+            target = job if job is not None else FolderJob(path=path)
+            try:
+                full_signature = watch_signature(target)
+                fast_signature = watch_signature_fast(target) if not use_events else None
+            except OSError:
+                full_signature = None
+                fast_signature = None
             with state_lock:
-                in_flight.discard(path)
-                if sub_cfg is not None:
-                    # Update baselines so the organizer's own moves do not retrigger.
-                    for job in sub_cfg.folders:
-                        if job.path == path:
-                            _update_both_signatures(path, job)
-                            break
+                if full_signature is not None:
+                    signatures_full[path] = full_signature
+                if fast_signature is not None:
+                    signatures_fast[path] = fast_signature
+                batch = incremental_batches.pop(path, None)
+                succeeded = summary and summary.get("ran", 0) and not summary.get("failed", 0) and not run_error
+                if succeeded and job is not None:
+                    reconciled[path] = build_organize_cmd(job)
+                    if batch:
+                        maintenance_due.add(path)
                     else:
-                        _update_both_signatures(path)
-                dirty_since.pop(path, None)
+                        maintenance_due.discard(path)
+                        full_required.discard(path)
+                elif not succeeded:
+                    reconciled.pop(path, None)
+                in_flight.discard(path)
                 disabled_job = None
                 if sub_cfg is not None:
                     for job in sub_cfg.folders:
@@ -440,19 +454,22 @@ def _run_watch_loop(
             if force or cfg.scheduler_enabled:
                 due_paths = set()
                 enabled = [job for job in cfg.folders if job.enabled]
+                with state_lock:
+                    scan_jobs = [job for job in enabled if job.path not in in_flight]
+                scan_paths = {job.path for job in scan_jobs}
                 new_fast_sigs = (
-                    {job.path: watch_signature_fast(job) for job in enabled}
+                    {job.path: watch_signature_fast(job) for job in scan_jobs}
                     if not use_events else {}
                 )
                 new_full_sigs = (
-                    {job.path: watch_signature(job) for job in enabled}
+                    {job.path: watch_signature(job) for job in scan_jobs}
                     if do_full_scan else {}
                 )
 
                 with state_lock:
                     for job in enabled:
                         path = job.path
-                        if path in in_flight:
+                        if path in in_flight or path not in scan_paths:
                             continue
                         sig_changed = False
 
@@ -469,6 +486,10 @@ def _run_watch_loop(
                             signatures_full[path] = full_sig
                             if full_prev is not None and full_sig != full_prev:
                                 sig_changed = True
+                                full_required.add(path)
+                            if path in maintenance_due:
+                                sig_changed = True
+                                full_required.add(path)
 
                         if sig_changed:
                             dirty_since[path] = now
@@ -480,6 +501,15 @@ def _run_watch_loop(
                             due_paths.add(path)
                             del dirty_since[path]
                             in_flight.add(path)
+                            changes = monitor.take_changes(path) if use_events else None
+                            eligible = (changes and reconciled.get(path) == build_organize_cmd(job)
+                                        and path not in full_required
+                                        and not job.expand_subfolders
+                                        and not job.rules_file and not job.archive_root
+                                        and not job.random_names_after_organize
+                                        and job.strategy == "flatten-root")
+                            if eligible:
+                                incremental_batches[path] = {path: changes}
                             status.update_folder(path, "running")
 
                 for path in due_paths:

@@ -102,7 +102,6 @@ class _DirtyHandler(FileSystemEventHandler):  # type: ignore[misc]
             if is_noise_path(path):
                 continue
             self._monitor._dispatch(path, is_directory=is_directory)
-            return
 
 
 class WatchEventMonitor:
@@ -120,6 +119,7 @@ class WatchEventMonitor:
         self._on_dirty = on_dirty
         self._lock = threading.Lock()
         self._roots: Dict[str, str] = {}  # normalized root -> job path
+        self._changes: Dict[str, Optional[set]] = {}
         self._watches: Dict[str, object] = {}  # normalized root -> ObservedWatch
         self._handler = _DirtyHandler(self)
         self._observer = Observer()
@@ -159,7 +159,8 @@ class WatchEventMonitor:
                         self._observer.unschedule(self._watches.pop(root))
                     except Exception:
                         self._watches.pop(root, None)
-                    self._roots.pop(root, None)
+                    old_job = self._roots.pop(root, None)
+                    self._changes.pop(old_job, None)
             for root, job_path in desired.items():
                 self._roots[root] = job_path
                 if root in self._watches:
@@ -192,13 +193,25 @@ class WatchEventMonitor:
                 return
         job_path = resolve_watch_root(path, roots)
         if job_path is not None:
+            with self._lock:
+                changes = self._changes.setdefault(job_path, set())
+                if is_directory or (changes is not None and len(changes) >= 512):
+                    self._changes[job_path] = None
+                elif changes is not None:
+                    changes.add(path)
             self._on_dirty(job_path)
+
+    def take_changes(self, job_path: str) -> Optional[set]:
+        """Drain event paths; None requests full reconciliation (dirs/overflow)."""
+        with self._lock:
+            return self._changes.pop(job_path, None)
 
     def stop(self) -> None:
         with self._lock:
             watches = list(self._watches.values())
             self._watches.clear()
             self._roots.clear()
+            self._changes.clear()
         for watch in watches:
             try:
                 self._observer.unschedule(watch)

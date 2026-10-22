@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
             "(recursive modes, optional normalization, empty-folder staging)."
         )
     )
+    parser.add_argument("--changed-path", action="append", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--path", help="Target directory path")
     parser.add_argument("--recursive", action="store_true", default=True, help="Enable recursive organization (default)")
     parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="Disable recursive, root files only")
@@ -209,6 +210,7 @@ def main() -> None:
         rule_set=rule_set,
         archive_recipe=archive_recipe,
         empty_dir_min_age=args.empty_dir_min_age,
+        changed_paths=[Path(p) for p in args.changed_path] if args.changed_path else None,
     )
     result = org.run()
     out = json.dumps(result, indent=2)

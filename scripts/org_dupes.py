@@ -8,6 +8,9 @@ so trees with mostly unique sizes pay a single os.stat per file and nothing more
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import tempfile
 import stat as _stat
 from pathlib import Path
 from typing import Dict, Optional, Union
@@ -45,6 +48,96 @@ def hash_file(path: Path) -> Optional[str]:
     return h.hexdigest()
 
 
+class HashCache:
+    """Disposable content hashes, validated against identity and nanosecond times.
+
+    Stored outside organized trees. Corrupt/unwritable caches are harmless misses.
+    A before/after stat prevents caching files changed while they were read.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries = {}
+        self.dirty = False
+        self.hits = 0
+        self.misses = 0
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("version") == 1 and isinstance(data.get("entries"), dict):
+                self.entries = {
+                    key: entry for key, entry in data["entries"].items()
+                    if isinstance(entry, dict) and isinstance(entry.get("stat"), list)
+                    and len(entry["stat"]) == 5 and all(isinstance(n, int) for n in entry["stat"])
+                    and isinstance(entry.get("digest"), str) and len(entry["digest"]) == 64
+                    and all(c in "0123456789abcdef" for c in entry["digest"])
+                }
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    @staticmethod
+    def fingerprint(path: Path):
+        try:
+            st = path.lstat()
+            if not _stat.S_ISREG(st.st_mode) or stat_is_dataless(st):
+                return None
+            return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+        except OSError:
+            return None
+
+    def get(self, path: Path) -> Optional[str]:
+        before = self.fingerprint(path)
+        if before is None:
+            return None
+        key = str(path)
+        entry = self.entries.get(key)
+        if isinstance(entry, dict) and entry.get("stat") == before:
+            digest = entry.get("digest")
+            if isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+                self.hits += 1
+                return digest
+        self.misses += 1
+        digest = hash_file(path)
+        if digest is None or self.fingerprint(path) != before:
+            return None
+        self.entries[key] = {"stat": before, "digest": digest}
+        self.dirty = True
+        return digest
+
+    def moved(self, old: Path, new: Path) -> None:
+        entry = self.entries.pop(str(old), None)
+        if entry is None:
+            return
+        self.dirty = True
+        current = self.fingerprint(new)
+        if (current is not None and isinstance(entry, dict)
+                and isinstance(entry.get("stat"), list) and entry["stat"][:4] == current[:4]):
+            self.entries[str(new)] = {"stat": current, "digest": entry["digest"]}
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        temporary = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Prune disappeared or changed files; never read their contents here.
+            self.entries = {key: entry for key, entry in self.entries.items()
+                            if isinstance(entry, dict) and self.fingerprint(Path(key)) == entry.get("stat")}
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                             prefix=".hash-cache-", delete=False) as stream:
+                temporary = stream.name
+                json.dump({"version": 1, "entries": self.entries}, stream)
+            os.replace(temporary, self.path)
+            self.dirty = False
+        except OSError:
+            pass
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+
 class DuplicateIndex:
     """Registers files one at a time and reports which are duplicates of earlier ones.
 
@@ -54,7 +147,8 @@ class DuplicateIndex:
     intentional placeholders).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cache: Optional[HashCache] = None) -> None:
+        self.cache = cache
         # size -> Path (only one file of this size seen, not hashed yet)
         #      -> dict hash -> canonical Path (two or more files of this size)
         self._by_size: Dict[int, Union[Path, Dict[str, Path]]] = {}
@@ -75,7 +169,7 @@ class DuplicateIndex:
         if isinstance(slot, Path):
             if slot == path:
                 return None
-            first_hash = hash_file(slot)
+            first_hash = self.cache.get(slot) if self.cache else hash_file(slot)
             hashes: Dict[str, Path] = {}
             if first_hash is not None:
                 hashes[first_hash] = slot
@@ -86,7 +180,7 @@ class DuplicateIndex:
         if not isinstance(slot, dict):  # pragma: no cover - defensive
             return None
 
-        digest = hash_file(path)
+        digest = self.cache.get(path) if self.cache else hash_file(path)
         if digest is None:
             return None
         original = slot.get(digest)
@@ -100,6 +194,8 @@ class DuplicateIndex:
 
     def update_location(self, size: int, old: Path, new: Path) -> None:
         """Record that a registered file moved, so later lookups hash the right path."""
+        if self.cache is not None:
+            self.cache.moved(old, new)
         slot = self._by_size.get(size)
         if isinstance(slot, Path):
             if slot == old:

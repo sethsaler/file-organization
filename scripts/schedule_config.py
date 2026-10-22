@@ -683,6 +683,7 @@ def run_enabled_folders(
     label: str = "run",
     file_log_path: Optional[Path] = None,
     only_paths: Optional[Set[str]] = None,
+    changed_paths: Optional[Dict[str, Set[str]]] = None,
 ) -> Dict[str, int]:
     """Run all runnable enabled folders; returns {"ran", "failed", "skipped", "disabled"} counts.
 
@@ -739,6 +740,9 @@ def run_enabled_folders(
                     )
                 continue
         cmd = build_organize_cmd(job)
+        if changed_paths and job.path in changed_paths and not job.expand_subfolders:
+            for changed in sorted(changed_paths[job.path]):
+                cmd.extend(["--changed-path", changed])
         tasks.append((idx, job, cmd))
 
     if not tasks:
@@ -820,6 +824,9 @@ def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: st
             rec["moved_by_category"] = summary.get("moved_by_category")
             rec["name_collisions_resolved"] = summary.get("name_collisions_resolved")
             rec["backup_manifest"] = summary.get("backup_manifest")
+            for metric in ("execution", "phase_seconds", "hash_cache"):
+                if metric in summary:
+                    rec[metric] = summary[metric]
             dup = summary.get("duplicates")
             if isinstance(dup, dict) and dup.get("enabled"):
                 rec["duplicates_moved"] = dup.get("files_moved")
