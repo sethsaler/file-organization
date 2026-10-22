@@ -273,6 +273,8 @@ def default_dedupe_launcher() -> Optional[Path]:
     candidates = [Path(configured)] if configured else []
     candidates.extend(
         [
+            Path.home() / "Developer" / "GitHub" / "dedupe" / "Dedupe.command",
+            Path.home() / "Developer" / "GitHub" / "dedupe" / "launchers" / "Dedupe.command",
             Path.home() / "Documents" / "GitHub" / "dedupe" / "Dedupe.command",
             Path.home() / "Documents" / "GitHub" / "dedupe" / "launchers" / "Dedupe.command",
         ]
