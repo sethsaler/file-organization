@@ -824,6 +824,59 @@ def test_empty_dir_min_age_zero_keeps_existing_behavior(tmp_path: Path):
     assert result["empty_folder_collection"]["folders_moved"] == 1
 
 
+# ---- empty-dirs-only mode ----
+
+
+def test_empty_dirs_only_deletes_stale_empty_trees_and_keeps_files(tmp_path: Path):
+    (tmp_path / "loose.jpg").write_bytes(b"x")
+    stale = tmp_path / ".creator" / "nested" / "deeper"
+    stale.mkdir(parents=True)
+    (tmp_path / ".creator" / "nested" / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+    for d in (stale, stale.parent, stale.parent.parent):
+        _age_dir(d, 60)
+    busy = tmp_path / "busy"
+    busy.mkdir()
+    (busy / "download.mp4").write_bytes(b"x")
+    _age_dir(busy, 60)
+
+    result = _make_organizer(tmp_path, empty_dirs_only=True, empty_dir_min_age=15).run()
+
+    assert not (tmp_path / ".creator").exists()
+    assert (tmp_path / "loose.jpg").is_file()
+    assert (busy / "download.mp4").is_file()
+    assert not (tmp_path / "Images").exists()
+    assert not (tmp_path / "For Deletion").exists()
+    assert result["mode"] == "empty-dirs-only"
+    assert result["empty_dirs_removed"] == 3
+    assert result["empty_dirs_recheck_seconds"] is None
+
+
+def test_empty_dirs_only_waits_out_grace_window_and_reports_recheck(tmp_path: Path):
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _age_dir(fresh, 5)
+
+    result = _make_organizer(tmp_path, empty_dirs_only=True, empty_dir_min_age=15).run()
+
+    assert fresh.is_dir()
+    assert result["empty_dirs_removed"] == 0
+    assert 9 <= result["empty_dirs_recheck_seconds"] <= 10
+
+    _age_dir(fresh, 16)
+    result = _make_organizer(tmp_path, empty_dirs_only=True, empty_dir_min_age=15).run()
+    assert not fresh.exists()
+    assert result["empty_dirs_recheck_seconds"] is None
+
+
+def test_empty_dirs_only_dry_run_changes_nothing(tmp_path: Path):
+    (tmp_path / "a" / "b").mkdir(parents=True)
+
+    result = _make_organizer(tmp_path, empty_dirs_only=True, dry_run=True).run()
+
+    assert (tmp_path / "a" / "b").is_dir()
+    assert result["empty_dirs_removed"] == 2
+
+
 # ---- .DS_Store cleanup ----
 
 

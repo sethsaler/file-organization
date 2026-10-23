@@ -142,6 +142,7 @@ class Organizer:
         archive_recipe: Optional[ArchiveRecipe] = None,
         empty_dir_min_age: float = 0.0,
         changed_paths: Optional[List[Path]] = None,
+        empty_dirs_only: bool = False,
     ) -> None:
         self.base = base
         self._input_base = Path(os.path.abspath(base))
@@ -173,6 +174,10 @@ class Organizer:
         self.rule_set = rule_set
         self.archive_recipe = archive_recipe
         self.empty_dir_min_age = max(0.0, float(empty_dir_min_age))
+        self.empty_dirs_only = empty_dirs_only
+        # Earliest wall-clock time a folder skipped as too new leaves its grace
+        # window, so a watcher can come back exactly when it becomes removable.
+        self._empty_recheck_at: Optional[float] = None
         if self.archive_recipe is not None:
             self.archive_recipe.validate_source_root(base)
         self._progress = progress_callback or (lambda _m: None)
@@ -233,7 +238,14 @@ class Organizer:
         so a freshly created folder — or one this run just emptied — is protected for
         the grace window and becomes collectable on a later run once it stays quiet.
         """
-        return self.empty_dir_min_age > 0 and mtime > time.time() - self.empty_dir_min_age
+        if self.empty_dir_min_age <= 0:
+            return False
+        eligible_at = mtime + self.empty_dir_min_age
+        if eligible_at <= time.time():
+            return False
+        if self._empty_recheck_at is None or eligible_at < self._empty_recheck_at:
+            self._empty_recheck_at = eligible_at
+        return True
 
     def _dir_is_too_new(self, directory: Path) -> bool:
         if self.empty_dir_min_age <= 0:
@@ -1239,6 +1251,45 @@ class Organizer:
                     continue
             self.empty_dirs_removed += 1
 
+    def _delete_empty_dirs_only(self) -> None:
+        """Delete empty folders outright: no file moves and no For Deletion staging.
+
+        Grace-window checks use mtimes captured before anything is removed, so
+        deleting an empty child does not restart its parent's window and a whole
+        stale empty tree goes in one run. Folders holding only .DS_Store count as
+        empty; a too-new or skipped folder shields its parents from removal.
+        """
+        visited: List[Tuple[Path, List[str], List[str]]] = []
+        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
+            root_path = Path(root)
+            visited.append((root_path, list(dirs), files))
+            dirs[:] = [
+                d for d in dirs
+                if self._visible_name(d)
+                and not os.path.islink(os.path.join(root, d))
+                and not self._should_skip_traversal_dir(root_path, d)
+                and not self._dir_is_too_new(root_path / d)
+            ]
+
+        removable: Set[Path] = set()
+        for root_path, subdirs, files in reversed(visited):
+            if root_path == self.base:
+                continue
+            if any(name != ".DS_Store" for name in files):
+                continue
+            if any(root_path / d not in removable for d in subdirs):
+                continue
+            if not self.dry_run:
+                try:
+                    for name in files:
+                        os.unlink(root_path / name)
+                    root_path.rmdir()
+                except OSError:
+                    continue
+                self.removed_dirs.append(str(root_path.relative_to(self.base)))
+            removable.add(root_path)
+            self.empty_dirs_removed += 1
+
     def _cleanup_dsstore_files(self) -> None:
         """Remove .DS_Store files (both named and randomly renamed)."""
         dsstore_files_removed = 0
@@ -1556,6 +1607,11 @@ class Organizer:
                 except OSError:
                     pass
 
+    def _empty_recheck_seconds(self) -> Optional[float]:
+        if self._empty_recheck_at is None:
+            return None
+        return round(max(0.0, self._empty_recheck_at - time.time()), 3)
+
     def _timed(self, phase: str, callback):
         started = time.perf_counter()
         try:
@@ -1569,6 +1625,21 @@ class Organizer:
             self.base = self.base.resolve()
         except OSError:
             pass
+
+        if self.empty_dirs_only:
+            self._timed("empty_delete", self._delete_empty_dirs_only)
+            self.phase_seconds["total"] = round(time.perf_counter() - started, 6)
+            return {
+                "target": str(self.base),
+                "mode": "empty-dirs-only",
+                "dry_run": self.dry_run,
+                "files_moved": 0,
+                "empty_dirs_removed": self.empty_dirs_removed,
+                "removed_dirs": self.removed_dirs[:EMPTY_DIR_SAMPLE_LIMIT],
+                "empty_dir_min_age": self.empty_dir_min_age,
+                "empty_dirs_recheck_seconds": self._empty_recheck_seconds(),
+                "phase_seconds": self.phase_seconds,
+            }
 
         incremental = self._incremental_supported()
         self._timed("duplicate_index", self._seed_duplicate_index)
@@ -1621,6 +1692,7 @@ class Organizer:
             "name_collisions_resolved": self.move_stats.name_collisions_resolved,
             "folders_touched": self.move_stats.folders_touched,
             "empty_dirs_removed": self.empty_dirs_removed,
+            "empty_dirs_recheck_seconds": self._empty_recheck_seconds(),
             "normalization": {
                 "folders_case_renamed": self.normalize_stats.folders_case_renamed,
                 "folders_merged": self.normalize_stats.folders_merged,
