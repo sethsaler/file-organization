@@ -329,6 +329,7 @@ python3 scripts/organize_by_filetype.py --path /path/to/folder --no-include-hidd
 - `--ocr-index` — after organizing, OCR PNG/JPEG under `Images/` into `.organizer/ocr_index.csv` (needs OCR deps)
 - `--collect-empty-dirs` / `--no-collect-empty-dirs` — empty-folder staging (default: on)
 - `--empty-dir-min-age SECONDS` — leave empty folders alone until they have been untouched for at least SECONDS (a folder's mtime bumps on creation and when entries change, so newly created folders survive the grace window; `0` disables the check)
+- `--empty-dirs-only` — skip organizing entirely and just delete empty folders in place (no `For Deletion` staging; folders containing only `.DS_Store` count as empty). Combine with `--empty-dir-min-age`; in watch mode the daemon comes back as soon as a too-new empty folder becomes old enough, so e.g. `15` deletes empty folders about 15 seconds after they go quiet
 - `--dry-run` — preview changes without writing
 - `--restore MANIFEST` — undo a run from `.organizer/backup_*.json` (a run with nothing to move, stage, or remove writes no manifest)
 - `--json-out FILE` — write JSON summary to a file

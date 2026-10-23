@@ -85,6 +85,7 @@ def test_folder_job_defaults():
     assert job.archive_mapping is None
     assert job.timeout_minutes == 60
     assert job.empty_dir_min_age == 0.0
+    assert job.empty_dirs_only is False
 
 
 def test_normalize_schedule_mode():
@@ -355,6 +356,7 @@ def test_expand_subfolders(tmp_path: Path):
         profile="extended",
         dry_run_verified=True,
         empty_dir_min_age=300.0,
+        empty_dirs_only=True,
     )
     expanded = expand_subfolders(job)
     assert len(expanded) == 2
@@ -366,6 +368,7 @@ def test_expand_subfolders(tmp_path: Path):
         assert sub.profile == "extended"
         assert sub.dry_run_verified is True
         assert sub.empty_dir_min_age == 300.0
+        assert sub.empty_dirs_only is True
 
     # Disabled: returned unchanged.
     assert expand_subfolders(FolderJob(path=str(tmp_path))) == [FolderJob(path=str(tmp_path))]
@@ -469,6 +472,8 @@ def test_build_organize_cmd_optional_flags(tmp_path: Path):
     assert "--date-buckets" in cmd
     assert cmd[cmd.index("--unmatched") + 1] == "needs-review"
     assert cmd[cmd.index("--empty-dir-min-age") + 1] == "600"
+    assert "--empty-dirs-only" not in cmd
+    assert "--empty-dirs-only" in build_organize_cmd(FolderJob(path=str(tmp_path), empty_dirs_only=True))
 
 
 def test_build_organize_cmd_rules_and_archive(tmp_path: Path):
@@ -551,7 +556,7 @@ def test_run_merge_only_writes_back_folders_that_ran(monkeypatch, tmp_path: Path
     summary = schedule_config.run_enabled_folders(
         cfg_a, config_path, only_paths={cfg_a.folders[0].path}, file_log_path=tmp_path / "run.log"
     )
-    assert summary == {"ran": 1, "failed": 0, "skipped": 0, "disabled": 0}
+    assert summary == {"ran": 1, "failed": 0, "skipped": 0, "disabled": 0, "cleanup_only": 0}
 
     on_disk = schedule_config.load_config(config_path)
     assert on_disk.folders[0].last_run is not None
@@ -614,3 +619,20 @@ def test_auto_disable_is_reported_logged_and_reversible(monkeypatch, tmp_path: P
     schedule_config.reenable_job(job)
     assert (job.enabled, job.consecutive_failures, job.last_error) == (True, 0, None)
     assert schedule_config.auto_disabled_jobs(cfg) == []
+
+
+def test_cleanup_only_runs_report_recheck_and_skip_threshold(monkeypatch, tmp_path: Path) -> None:
+    import schedule_config
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    cfg, config_path = _runnable_cfg(tmp_path, ["A", "B"])
+    for job in cfg.folders:
+        job.empty_dirs_only = True
+        job.min_unsorted_threshold = 5  # no loose files, but cleanup-only jobs ignore it
+    outputs = iter(['{"empty_dirs_recheck_seconds": 9.5}', '{"empty_dirs_recheck_seconds": 3.25}'])
+    monkeypatch.setattr(schedule_config.subprocess, "run", lambda *a, **k: _FakeProc(0, next(outputs)))
+    summary = schedule_config.run_enabled_folders(cfg, config_path, max_parallel=1, file_log_path=tmp_path / "run.log")
+    assert summary["ran"] == 2
+    assert summary["cleanup_only"] == 2
+    assert summary["skipped"] == 0
+    assert summary["recheck_seconds"] == 3.25

@@ -61,6 +61,10 @@ WATCH_EVENT_TICK_SECONDS = 0.1
 # recursive mtime scan still runs occasionally to catch anything missed.
 WATCH_SAFETY_SCAN_SECONDS = 60.0
 
+# Extra wait past an empty folder's grace window before re-running, so the
+# re-run does not land a hair early and defer the folder again.
+EMPTY_RECHECK_SLACK_SECONDS = 0.5
+
 
 def _watch_state_path() -> Path:
     return default_state_dir() / "watch-signatures.json"
@@ -123,9 +127,12 @@ def _notify_run(cfg, summary: Optional[dict], label: str) -> None:
         return
     if not summary or summary.get("ran", 0) <= 0:
         return
-    ran = summary.get("ran", 0)
+    # Empty-folder cleanup runs can fire every few seconds; only announce real organizing.
+    ran = summary.get("ran", 0) - summary.get("cleanup_only", 0)
     failed = summary.get("failed", 0)
     disabled = summary.get("disabled", 0)
+    if ran <= 0 and not failed and not disabled:
+        return
     msg = f"Organized {ran} folder(s)"
     if failed:
         msg += f", {failed} failed"
@@ -315,6 +322,7 @@ def _run_watch_loop(
     maintenance_due: set = set()
     full_required: set = set()
     incremental_batches: dict = {}
+    primed_cleanup: set = set()
     last_reload = 0.0
     last_full_scan = 0.0
     last_heartbeat = 0.0
@@ -407,6 +415,12 @@ def _run_watch_loop(
                 elif not succeeded:
                     reconciled.pop(path, None)
                 in_flight.discard(path)
+                recheck = summary.get("recheck_seconds") if summary else None
+                if recheck is not None:
+                    # An empty folder is still inside its grace window and no further
+                    # event may arrive for it: come back once it becomes removable.
+                    due_at = time.monotonic() + recheck + EMPTY_RECHECK_SLACK_SECONDS - cfg.watch_quiet_seconds
+                    dirty_since[path] = min(dirty_since.get(path, due_at), due_at)
                 disabled_job = None
                 if sub_cfg is not None:
                     for job in sub_cfg.folders:
@@ -452,6 +466,13 @@ def _run_watch_loop(
                 last_full_scan = now
 
             if force or cfg.scheduler_enabled:
+                # Events only report changes, so empty folders that already exist when a
+                # cleanup-only folder starts being watched need one initial pass.
+                with state_lock:
+                    for job in cfg.folders:
+                        if job.enabled and job.empty_dirs_only and job.path not in primed_cleanup:
+                            primed_cleanup.add(job.path)
+                            dirty_since.setdefault(job.path, now)
                 due_paths = set()
                 enabled = [job for job in cfg.folders if job.enabled]
                 with state_lock:
@@ -507,6 +528,7 @@ def _run_watch_loop(
                                         and not job.expand_subfolders
                                         and not job.rules_file and not job.archive_root
                                         and not job.random_names_after_organize
+                                        and not job.empty_dirs_only
                                         and job.strategy == "flatten-root")
                             if eligible:
                                 incremental_batches[path] = {path: changes}

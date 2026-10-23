@@ -17,6 +17,7 @@ This project tracks changes using the Hermes skill version as its public version
 - Atomic watch-health snapshots and Overview status for backend, pending changes, running folders, events, and errors.
 - Optional native macOS `FO` menu-bar helper plus Finder Quick Action installer.
 - `--empty-dir-min-age SECONDS` (per-folder `empty_dir_min_age` in `schedule.json`): empty folders stay untouched until they have been quiet for the grace window, so folders created moments before a watched run are never swept into `For Deletion` or removed in place. A too-new folder also shields everything nested inside it.
+- `--empty-dirs-only` (per-folder `empty_dirs_only` in `schedule.json`, "Only delete empty folders" in Watched folders): a cleanup-only mode that permanently deletes empty folders (including ones holding only `.DS_Store`) once they pass `--empty-dir-min-age`, without moving or renaming any files. The watch daemon re-checks a folder as soon as its youngest empty folder leaves the grace window, and cleanup-only runs do not post notifications.
 
 ### Changed
 

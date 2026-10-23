@@ -298,6 +298,7 @@ class SchedulePanel(ttk.Frame):
         self.skip_randomly_renamed_var = tk.BooleanVar(value=True)
         self.min_unsorted_threshold_var = tk.IntVar(value=0)
         self.empty_dir_min_age_var = tk.StringVar(value="0")
+        self.empty_dirs_only_var = tk.BooleanVar(value=False)
         self.detect_duplicates_var = tk.BooleanVar(value=False)
         self.duplicates_hardlink_var = tk.BooleanVar(value=False)
         self.date_buckets_var = tk.BooleanVar(value=False)
@@ -347,6 +348,13 @@ class SchedulePanel(ttk.Frame):
         ttk.Label(age_frame, text="(0 = off)").pack(side="left", padx=(6, 0))
         age_entry.bind("<FocusOut>", lambda _e: self._push_detail_to_job())
         age_entry.bind("<Return>", lambda _e: self._push_detail_to_job())
+        dr += 1
+        ttk.Checkbutton(
+            detail,
+            text="Only delete empty folders (never move files)",
+            variable=self.empty_dirs_only_var,
+            command=self._push_detail_to_job,
+        ).grid(row=dr, column=0, columnspan=2, sticky="w", pady=2)
         dr += 1
 
         # Random rename section
@@ -694,6 +702,7 @@ class SchedulePanel(ttk.Frame):
         self.skip_randomly_renamed_var.set(job.skip_randomly_renamed)
         self.min_unsorted_threshold_var.set(job.min_unsorted_threshold)
         self.empty_dir_min_age_var.set(f"{job.empty_dir_min_age:g}")
+        self.empty_dirs_only_var.set(job.empty_dirs_only)
         self.detect_duplicates_var.set(job.detect_duplicates)
         self.duplicates_hardlink_var.set(job.duplicates_hardlink)
         self.date_buckets_var.set(job.date_buckets)
@@ -728,6 +737,7 @@ class SchedulePanel(ttk.Frame):
         job.detect_duplicates = bool(self.detect_duplicates_var.get())
         job.duplicates_hardlink = bool(self.duplicates_hardlink_var.get())
         job.date_buckets = bool(self.date_buckets_var.get())
+        job.empty_dirs_only = bool(self.empty_dirs_only_var.get())
         job.rules_file = self.rules_file_var.get().strip() or None
         job.unmatched_mode = self.unmatched_mode_var.get().strip() or "bucket"
         job.archive_root = self.archive_root_var.get().strip() or None

@@ -98,6 +98,7 @@ class FolderJob:
     archive_mapping: Optional[str] = None
     timeout_minutes: int = 60  # 0 = no timeout
     empty_dir_min_age: float = 0.0  # seconds an empty folder must stay untouched before staging/removal
+    empty_dirs_only: bool = False  # only delete empty folders; never move files
 
 
 def parse_daily_time(value: str) -> Tuple[int, int]:
@@ -363,6 +364,7 @@ class ScheduleConfig:
                     archive_mapping=str(item.get("archive_mapping") or "").strip() or None,
                     timeout_minutes=max(0, min(1440, int(item.get("timeout_minutes", 60)))),
                     empty_dir_min_age=max(0.0, float(item.get("empty_dir_min_age", 0) or 0)),
+                    empty_dirs_only=bool(item.get("empty_dirs_only", False)),
                 )
             )
         max_parallel = max(0, min(128, int(data.get("max_parallel", 0))))
@@ -479,6 +481,8 @@ def build_organize_cmd(job: FolderJob, python_executable: Optional[str] = None, 
         cmd.append("--no-collect-empty-dirs")
     if job.empty_dir_min_age > 0:
         cmd.extend(["--empty-dir-min-age", f"{job.empty_dir_min_age:g}"])
+    if job.empty_dirs_only:
+        cmd.append("--empty-dirs-only")
     if job.exclude_defaults:
         cmd.append("--exclude-defaults")
     for pat in job.exclude:
@@ -567,6 +571,7 @@ def expand_subfolders(job: FolderJob) -> List[FolderJob]:
                 archive_mapping=job.archive_mapping,
                 timeout_minutes=job.timeout_minutes,
                 empty_dir_min_age=job.empty_dir_min_age,
+                empty_dirs_only=job.empty_dirs_only,
             )
             subfolders.append(sub_job)
 
@@ -684,14 +689,17 @@ def run_enabled_folders(
     file_log_path: Optional[Path] = None,
     only_paths: Optional[Set[str]] = None,
     changed_paths: Optional[Dict[str, Set[str]]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Run all runnable enabled folders; returns {"ran", "failed", "skipped", "disabled"} counts.
 
     "disabled" counts folders this call switched off after reaching max_failures_before_disable.
+    "cleanup_only" counts runs of empty_dirs_only folders. "recheck_seconds" (present only when
+    some folder left an empty folder inside its grace window) is how long until the earliest
+    one becomes removable.
     """
     from org_logging import append_history_entry, append_log_line
 
-    result = {"ran": 0, "failed": 0, "skipped": 0, "disabled": 0}
+    result: Dict[str, Any] = {"ran": 0, "failed": 0, "skipped": 0, "disabled": 0, "cleanup_only": 0}
     touched: Set[str] = set()
 
     conflicts = find_path_conflicts(cfg)
@@ -724,7 +732,7 @@ def run_enabled_folders(
                 append_log_line(file_log_path, f"{job.path}: skipped (dry-run not verified)")
             result["skipped"] += 1
             continue
-        if job.min_unsorted_threshold > 0:
+        if job.min_unsorted_threshold > 0 and not job.empty_dirs_only:
             unsorted = count_unsorted_files(job, stop_at=job.min_unsorted_threshold)
             if unsorted < job.min_unsorted_threshold:
                 result["skipped"] += 1
@@ -761,8 +769,13 @@ def run_enabled_folders(
             idx, ts, last_err, out, err, rc = fut.result()
             task_job = futures[fut][1]
             result["ran"] += 1
+            if task_job.empty_dirs_only:
+                result["cleanup_only"] += 1
             if last_err:
                 result["failed"] += 1
+            recheck = _summary_recheck_seconds(out)
+            if recheck is not None:
+                result["recheck_seconds"] = min(recheck, result.get("recheck_seconds", recheck))
             append_history_entry(_history_record(task_job, label, last_err, out))
             if 0 <= idx < len(cfg.folders):
                 job = cfg.folders[idx]
@@ -808,6 +821,17 @@ def run_enabled_folders(
     return result
 
 
+def _summary_recheck_seconds(out: str) -> Optional[float]:
+    start = out.find("{")
+    if start == -1:
+        return None
+    try:
+        value = json.loads(out[start:]).get("empty_dirs_recheck_seconds")
+    except (ValueError, AttributeError):
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: str) -> Dict[str, Any]:
     """Compact per-run history entry; pulls key stats from the organizer's JSON summary."""
     rec: Dict[str, Any] = {"path": job.path, "label": label, "ok": not last_err}
@@ -821,6 +845,8 @@ def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: st
             return rec
         if isinstance(summary, dict):
             rec["files_moved"] = summary.get("files_moved")
+            if summary.get("mode") == "empty-dirs-only":
+                rec["empty_dirs_removed"] = summary.get("empty_dirs_removed")
             rec["moved_by_category"] = summary.get("moved_by_category")
             rec["name_collisions_resolved"] = summary.get("name_collisions_resolved")
             rec["backup_manifest"] = summary.get("backup_manifest")

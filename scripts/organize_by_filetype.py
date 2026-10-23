@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         metavar="SECONDS",
         help="Leave empty folders alone until they are untouched for at least SECONDS (protects newly created folders; 0 = disabled)",
     )
+    parser.add_argument(
+        "--empty-dirs-only",
+        action="store_true",
+        help="Only delete empty folders (permanently, honoring --empty-dir-min-age); never move or rename files",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing")
     backup_group = parser.add_mutually_exclusive_group()
     parser.set_defaults(create_backup=True)
@@ -211,6 +216,7 @@ def main() -> None:
         archive_recipe=archive_recipe,
         empty_dir_min_age=args.empty_dir_min_age,
         changed_paths=[Path(p) for p in args.changed_path] if args.changed_path else None,
+        empty_dirs_only=args.empty_dirs_only,
     )
     result = org.run()
     out = json.dumps(result, indent=2)
