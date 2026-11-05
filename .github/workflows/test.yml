@@ -65,6 +65,23 @@ jobs:
       - name: Run pyflakes
         run: python -m pyflakes scripts/ tests/
 
+  macos:
+    name: macOS filesystem and desktop checks
+    needs: changes
+    if: ${{ always() && !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.run != 'false') }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install verification dependencies
+        run: pip install ".[dev,watch]" pyflakes
+      - name: Run filesystem regressions and native FSEvents tests
+        run: python scripts/verify.py
+      - name: Typecheck native menu controls
+        run: swiftc -typecheck -parse-as-library macos/FileOrganizerMenuBar.swift
+
   compatibility:
     name: test (${{ matrix.python-version }})
     if: github.event_name == 'workflow_dispatch'

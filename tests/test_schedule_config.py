@@ -205,8 +205,8 @@ def test_save_load_round_trip(tmp_path: Path):
     path = tmp_path / "nested" / "schedule.json"
     save_config(path, cfg)
     assert path.is_file()
-    # Atomic write leaves no temp file behind.
-    assert list(path.parent.iterdir()) == [path]
+    # Only the persistent process lock accompanies the committed config.
+    assert set(path.parent.iterdir()) == {path, path.with_suffix(path.suffix + ".lock")}
 
     loaded = load_config(path)
     assert loaded.to_json_dict() == cfg.to_json_dict()

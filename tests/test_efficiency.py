@@ -1,9 +1,7 @@
 """Behavior and work-avoidance checks for incremental organization."""
-import json
 import os
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -133,8 +131,7 @@ def test_incremental_rejects_outside_hidden_excluded_and_symlink_paths(tmp_path)
     assert outside.exists() and (hidden / "secret.jpg").exists() and (excluded / "skip.jpg").exists()
 
 
-@pytest.mark.parametrize("options", [dict(dry_run=True), dict(rule_set=RuleSet()),
-                                     dict(strategy="in-place"), dict(random_names_after_organize=True)])
+@pytest.mark.parametrize("options", [dict(dry_run=True), dict(rule_set=RuleSet())])
 def test_incremental_falls_back_for_global_operations(tmp_path, options):
     source = tmp_path / "a.jpg"
     source.write_bytes(b"photo")

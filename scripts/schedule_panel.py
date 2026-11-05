@@ -9,7 +9,10 @@ When automatic runs are enabled, a LaunchAgent (macOS) or systemd user unit (Lin
 
 from __future__ import annotations
 
+import copy
 import queue
+import time
+from dataclasses import fields
 import subprocess
 import sys
 import threading
@@ -39,17 +42,13 @@ from schedule_config import (
     normalize_daily_time,
     normalize_schedule_mode,
     organizer_script_path,
-    run_dry_run_preview,
     run_enabled_folders,
-    save_config,
+    merge_config_edits,
 )
 from org_paths import normalize_folder_input
+from quick_controls import reconcile_background_service
 from schedule_service import (
     is_service_running,
-    restart_service,
-    service_log_path,
-    service_status_line,
-    sync_service_enabled,
 )
 
 
@@ -91,6 +90,15 @@ class SchedulePanel(ttk.Frame):
         self._embedded = embedded
         self.config_path = default_config_path()
         self.cfg = load_config(self.config_path)
+        self._config_baseline = copy.deepcopy(self.cfg)
+        self._ui_queue = queue.Queue()
+        self._closed = False
+        self.status_visible = not embedded
+        self._service_snapshot = {"running": None, "label": "Checking background service…"}
+        self._service_check_running = False
+        self._service_checked_at = 0.0
+        self._service_generation = 0
+        self._add_preview_cancel = None
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._cfg_lock = threading.Lock()
@@ -274,6 +282,11 @@ class SchedulePanel(ttk.Frame):
         ttk.Button(btn_row, text="Run selected now", command=self._run_selected_now).pack(side="left", padx=(0, 6))
         ttk.Button(btn_row, text="Run all enabled now", command=self._run_all_enabled_now).pack(side="left")
         ttk.Button(btn_row, text="History…", command=self._show_history).pack(side="left", padx=(6, 0))
+        self.add_preview_status = tk.StringVar()
+        preview_row = ttk.Frame(mid)
+        preview_row.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(preview_row, textvariable=self.add_preview_status).pack(side="left")
+        self.cancel_add_preview_button = ttk.Button(preview_row, text="Cancel preview", command=self._cancel_add_preview)
 
         row += 1
         collapsible = CollapsibleFrame(frm, "Selected folder options")
@@ -568,29 +581,26 @@ class SchedulePanel(ttk.Frame):
             self._append_log("Enabling automatic runs in the background…\n")
         else:
             self._append_log("Disabling automatic runs…\n")
+        self._save_quiet()
         self._sync_background_service()
         self._update_next_run_label()
-        self._save_quiet()
 
-    def _sync_background_service(self) -> None:
-        enabled = bool(self.scheduler_var.get())
+    def _sync_background_service(self, *, restart=False) -> None:
+        self._service_generation += 1
+        generation = self._service_generation
+        path = self.config_path
 
         def worker() -> None:
-            ok, msg = sync_service_enabled(enabled)
+            ok, msg = reconcile_background_service(path, restart=restart)
             self._log_queue.put(f"{msg}\n")
 
             def finish() -> None:
+                if generation != self._service_generation:
+                    return
+                # A failed start changes observed health, never the user's saved intent.
                 if not ok:
-                    if enabled:
-                        self.scheduler_var.set(False)
-                        self.cfg.scheduler_enabled = False
-                        try:
-                            save_config(self.config_path, self.cfg)
-                        except OSError:
-                            pass
-                        messagebox.showerror("Background scheduler", msg)
-                    else:
-                        messagebox.showwarning("Background scheduler", msg)
+                    messagebox.showwarning("Background scheduler", msg)
+                self._request_service_status(force=True)
                 self._update_next_run_label()
 
             self._queue_ui(finish)
@@ -616,19 +626,25 @@ class SchedulePanel(ttk.Frame):
         if not bool(self.scheduler_var.get()):
             return
 
-        def worker() -> None:
-            ok, msg = restart_service()
-            self._log_queue.put(f"{msg}\n")
-
-        threading.Thread(
-            target=worker, daemon=True, name="schedule-service-reinstall"
-        ).start()
+        self._sync_background_service(restart=True)
 
     def _queue_ui(self, fn: Any) -> None:
-        try:
-            self.root.after(0, fn)
-        except tk.TclError:
-            pass
+        self._ui_queue.put(fn)
+
+    def _persist_config(self) -> None:
+        self.cfg = merge_config_edits(self.config_path, self._config_baseline, self.cfg)
+        self._config_baseline = copy.deepcopy(self.cfg)
+        self._apply_global_values()
+
+    def _apply_global_values(self) -> None:
+        for field, variable in (
+            ("scheduler_enabled", self.scheduler_var), ("schedule_mode", self.schedule_mode_var),
+            ("daily_time", self.daily_time_var), ("interval_minutes", self.interval_var),
+            ("max_parallel", self.max_parallel_var), ("notify_on_run", self.notify_on_run_var),
+            ("watch_poll_seconds", self.watch_poll_var), ("watch_quiet_seconds", self.watch_quiet_var),
+        ):
+            if variable.get() != getattr(self.cfg, field):
+                variable.set(getattr(self.cfg, field))
 
     def _save_quiet(self) -> None:
         self._sync_schedule_timing_to_cfg()
@@ -637,13 +653,20 @@ class SchedulePanel(ttk.Frame):
         self._sync_notify_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
-            save_config(self.config_path, self.cfg)
+            self._persist_config()
         except OSError as e:
             self._append_log(f"Could not save config: {e}\n")
             return
         self._apply_schedule_change()
 
     def _poll_log_queue(self) -> None:
+        if self._closed:
+            return
+        try:
+            while True:
+                self._ui_queue.get_nowait()()
+        except queue.Empty:
+            pass
         try:
             while True:
                 msg = self._log_queue.get_nowait()
@@ -860,12 +883,12 @@ class SchedulePanel(ttk.Frame):
             messagebox.showerror("Missing script", f"Could not find:\n{helper}")
             return
 
-        def worker() -> None:
-            try:
-                mp = int(self.max_parallel_var.get())
-            except (tk.TclError, ValueError):
-                mp = None
+        try:
+            mp = int(self.max_parallel_var.get())
+        except (tk.TclError, ValueError):
+            mp = None
 
+        def worker() -> None:
             def log(msg: str) -> None:
                 self._log_queue.put(msg)
 
@@ -873,9 +896,7 @@ class SchedulePanel(ttk.Frame):
                 path = self.config_path
             cfg = load_config(path)
             run_enabled_folders(cfg, path, max_parallel=mp, log=log, label="manual all enabled")
-            with self._cfg_lock:
-                self.cfg = load_config(self.config_path)
-            self._queue_ui(self._refresh_tree)
+            self._queue_ui(self._reload_config_if_changed)
 
         self._append_log("\n--- Run all enabled (parallel) ---\n")
         threading.Thread(target=worker, daemon=True).start()
@@ -886,7 +907,7 @@ class SchedulePanel(ttk.Frame):
         self._sync_notify_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
-            save_config(self.config_path, self.cfg)
+            self._persist_config()
         except OSError as e:
             messagebox.showerror("Save", str(e))
             return
@@ -894,66 +915,107 @@ class SchedulePanel(ttk.Frame):
         self._apply_schedule_change()
 
     def shutdown(self) -> None:
-        """Persist config before destroying the root window (background scheduler keeps running)."""
+        """Persist only local edits; never undo an external pause while closing."""
+        self._cancel_add_preview()
+        self._closed = True
         self._sync_schedule_timing_to_cfg()
         self._sync_parallel_to_cfg()
         self._sync_notify_to_cfg()
         self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         try:
-            save_config(self.config_path, self.cfg)
+            self._persist_config()
         except OSError:
             pass
 
     def _schedule_status_tick(self) -> None:
+        if self._closed:
+            return
         try:
             if self.winfo_exists():
                 self._update_next_run_label()
-                self.root.after(1000, self._schedule_status_tick)
+                self.root.after(1000 if self.status_visible else 5000, self._schedule_status_tick)
         except tk.TclError:
             pass
 
     def _reload_config_if_changed(self) -> None:
+        """Merge external changes without discarding unsaved local edits."""
+        self._sync_schedule_timing_to_cfg()
+        self._sync_parallel_to_cfg()
+        self._sync_notify_to_cfg()
+        self.cfg.scheduler_enabled = bool(self.scheduler_var.get())
         disk = load_config(self.config_path)
-        changed = False
-        for disk_job in disk.folders:
-            for local in self.cfg.folders:
-                if local.path != disk_job.path:
-                    continue
-                if (
-                    local.last_run != disk_job.last_run
-                    or local.last_error != disk_job.last_error
-                    or local.enabled != disk_job.enabled
-                ):
-                    local.last_run = disk_job.last_run
-                    local.last_error = disk_job.last_error
-                    local.consecutive_failures = disk_job.consecutive_failures
-                    local.enabled = disk_job.enabled
-                    changed = True
-                self._last_seen_runs[disk_job.path] = disk_job.last_run
+        baseline = self._config_baseline
+        local = self.cfg
+        for field in fields(disk):
+            if field.name != "folders" and getattr(local, field.name) == getattr(baseline, field.name):
+                setattr(local, field.name, copy.deepcopy(getattr(disk, field.name)))
+        old_jobs = {job.path: job for job in baseline.folders}
+        current_jobs = {job.path: job for job in local.folders}
+        disk_jobs = {job.path: job for job in disk.folders}
+        merged = []
+        for path, job in current_jobs.items():
+            previous = old_jobs.get(path)
+            external = disk_jobs.get(path)
+            if previous is not None and external is None and job == previous:
+                continue
+            if previous is not None and external is not None:
+                for field in fields(job):
+                    if getattr(job, field.name) == getattr(previous, field.name):
+                        setattr(job, field.name, copy.deepcopy(getattr(external, field.name)))
+            merged.append(job)
+        for path, job in disk_jobs.items():
+            if path not in old_jobs and path not in current_jobs:
+                merged.append(copy.deepcopy(job))
+        changed = local.folders != merged or local != baseline
+        local.folders = merged
+        self._config_baseline = copy.deepcopy(disk)
+        self._apply_global_values()
         if changed:
             self._refresh_tree()
 
-    def _update_next_run_label(self) -> None:
-        if not bool(self.scheduler_var.get()):
-            self.next_run_var.set(f"Next run: — (automatic runs off) · {service_status_line()}")
+    def _request_service_status(self, *, force=False) -> None:
+        interval = 5.0 if self.status_visible else 30.0
+        if self._service_check_running or (not force and time.monotonic() - self._service_checked_at < interval):
             return
-        self._sync_schedule_timing_to_cfg()
+        self._service_check_running = True
+        def worker():
+            try:
+                running = is_service_running()
+                snapshot = {"running": running, "label": "Background service available" if running else "Background service unavailable"}
+            except (OSError, subprocess.SubprocessError) as exc:
+                snapshot = {"running": False, "label": f"Background service check failed: {exc}"}
+            def finish():
+                self._service_snapshot = snapshot
+                self._service_checked_at = time.monotonic()
+                self._service_check_running = False
+                self._update_next_run_label()
+            self._queue_ui(finish)
+        threading.Thread(target=worker, daemon=True, name="organizer-service-status").start()
+
+    def _update_next_run_label(self) -> None:
         self._reload_config_if_changed()
+        self._request_service_status()
+        status = self._service_snapshot["label"]
+        if not bool(self.scheduler_var.get()):
+            self.next_run_var.set(f"Automatic runs paused · {status}")
+            return
         mode = normalize_schedule_mode(self.cfg.schedule_mode)
-        status = service_status_line()
         if mode == SCHEDULE_MODE_WATCH:
-            label = f"Watching enabled folders — organizes shortly after files change · {status}"
-        else:
-            sec = estimate_seconds_until_next_run(self.cfg)
-            if mode == SCHEDULE_MODE_DAILY:
-                timing = f"daily at {normalize_daily_time(self.cfg.daily_time)} local"
-            else:
-                timing = f"every {self.cfg.interval_minutes} min"
-            label = f"Next run: in {_format_duration(sec)} ({timing}) · {status}"
-        if is_service_running():
-            log_path = service_log_path()
-            label += f" · log: {log_path}"
-        self.next_run_var.set(label)
+            from quick_controls import watch_health_summary
+            from org_watch_status import read_watch_status
+            label = watch_health_summary(self.cfg, read_watch_status(), self._service_snapshot["running"])["health_message"]
+            self.next_run_var.set(f"{label} · {status}")
+            return
+        sec = estimate_seconds_until_next_run(self.cfg)
+        timing = f"daily at {normalize_daily_time(self.cfg.daily_time)} local" if mode == SCHEDULE_MODE_DAILY else f"every {self.cfg.interval_minutes} min"
+        self.next_run_var.set(f"Next run: in {_format_duration(sec)} ({timing}) · {status}")
+
+    def _cancel_add_preview(self) -> None:
+        if self._add_preview_cancel is not None:
+            self._add_preview_cancel.set()
+            self._add_preview_cancel = None
+            self.add_preview_status.set("Preview cancelled; folder not added")
+            self.cancel_add_preview_button.pack_forget()
 
     def add_folder_path(
         self,
@@ -1018,20 +1080,56 @@ class SchedulePanel(ttk.Frame):
             archive_mapping=archive_mapping,
             empty_dir_min_age=empty_dir_min_age,
         )
-        ok, preview = run_dry_run_preview(job)
-        if not ok:
-            if not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd to schedule anyway?"):
-                return False
-        # Adding an unverified folder is allowed for later repair, but it must not
-        # bypass the scheduler's dry-run safety gate.
-        job.dry_run_verified = ok
-        with self._cfg_lock:
-            self.cfg.folders.append(job)
-        self._append_log(f"Added {raw} to schedule (dry-run preview: {ok})\n")
-        self._refresh_tree()
-        if select:
-            self._select_tree_index(len(self.cfg.folders) - 1)
-        self._save_quiet()
+        self._cancel_add_preview()
+        cancel = threading.Event()
+        self._add_preview_cancel = cancel
+        self.add_preview_status.set(f"Previewing {resolved.name}…")
+        self.cancel_add_preview_button.pack(side="right")
+        def worker():
+            try:
+                proc = subprocess.Popen(build_organize_cmd(job, dry_run=True), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                started = time.monotonic()
+                while True:
+                    if cancel.is_set() or time.monotonic() - started > 600:
+                        proc.terminate()
+                        try:
+                            proc.communicate(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.communicate()
+                        ok, preview = False, "Preview cancelled or timed out"
+                        break
+                    try:
+                        stdout, stderr = proc.communicate(timeout=0.2)
+                        ok, preview = proc.returncode == 0, (stderr or stdout)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except OSError as exc:
+                ok, preview = False, str(exc)
+            def finish():
+                if cancel.is_set() or self._add_preview_cancel is not cancel:
+                    return
+                self._add_preview_cancel = None
+                self.cancel_add_preview_button.pack_forget()
+                if not ok and not messagebox.askyesno("Dry run failed", f"{preview}\n\nAdd disabled for later repair?"):
+                    self.add_preview_status.set("Folder not added")
+                    return
+                self._reload_config_if_changed()
+                if any(Path(existing.path).expanduser().resolve() == resolved for existing in self.cfg.folders):
+                    self.add_preview_status.set("Folder already added")
+                    return
+                job.dry_run_verified = ok
+                job.enabled = ok
+                self.cfg.folders.append(job)
+                self._save_quiet()
+                self._refresh_tree()
+                if select:
+                    self._select_tree_index(len(self.cfg.folders) - 1)
+                self.add_preview_status.set(f"Added {resolved.name}" if ok else f"Added {resolved.name} disabled; preview required")
+                self._append_log(f"Added {raw} to schedule (dry-run preview: {ok})\n")
+            self._queue_ui(finish)
+        threading.Thread(target=worker, daemon=True, name="organizer-add-preview").start()
         return True
 
     def _select_tree_index(self, idx: int) -> None:

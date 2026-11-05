@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 import random
 import re
-import shutil
 import stat as stat_module
 import string
 import time
@@ -24,17 +24,20 @@ from org_buckets import (
     canonical_dir_map,
     extension_bucket_map,
 )
-from org_dupes import DuplicateIndex, HashCache, stat_is_dataless
+from org_dupes import DuplicateIndex, PersistentDuplicateIndex, SQLiteHashCache, files_match, stat_is_dataless
 from org_logging import default_state_dir
 from org_exclude import path_excluded, should_skip_traverse_dir
 from org_manifest import (
     FOR_DELETION_DIR_NAME,
     Manifest,
     ManifestEntry,
+    RecoveryJournal,
+    mutation_identity,
     ORGANIZER_DIR_NAME,
     cleanup_old_manifests,
     write_manifest_files,
 )
+from org_paths import move_to_available, name_key
 from org_mime import sniff_bucket_from_file
 from org_rules import (
     NEEDS_REVIEW_DIR_NAME,
@@ -112,6 +115,10 @@ class RoutingStats:
     external_moves: int = 0
 
 
+class OrganizerCancelled(RuntimeError):
+    """Raised between filesystem operations when cancellation was requested."""
+
+
 class Organizer:
     def __init__(
         self,
@@ -143,10 +150,20 @@ class Organizer:
         empty_dir_min_age: float = 0.0,
         changed_paths: Optional[List[Path]] = None,
         empty_dirs_only: bool = False,
+        deferred_paths: Optional[List[Path]] = None,
+        file_stable_seconds: float = 0.0,
     ) -> None:
         self.base = base
         self._input_base = Path(os.path.abspath(base))
         self.changed_paths = changed_paths
+        self.deferred_paths = {Path(p).absolute() for p in (deferred_paths or [])}
+        self.file_stable_seconds = max(0.0, file_stable_seconds)
+        self.deferred_files: Set[Path] = set()
+        self._renaming_candidates: Set[Path] = set()
+        self._journal: Optional[RecoveryJournal] = None
+        self._recovery_info = None
+        self._watch_mutations = {}
+        self.cancel_requested = False
         self.phase_seconds: Dict[str, float] = {}
         self._cleanup_directories: Optional[List[Path]] = None
         self.recursive = recursive
@@ -210,7 +227,8 @@ class Organizer:
         self.reserved_names: Dict[Path, Set[str]] = defaultdict(set)
         self.used_random_names: Set[str] = set()
         cache_key = hashlib.sha256(str(base.resolve()).encode()).hexdigest()
-        self._hash_cache = HashCache(default_state_dir() / "hashes" / f"{cache_key}.json") if detect_duplicates else None
+        self._hash_cache = SQLiteHashCache(default_state_dir() / "hashes" / f"{cache_key}.sqlite3",
+                                          read_only=dry_run) if detect_duplicates else None
         self._dup_index: Optional[DuplicateIndex] = DuplicateIndex(self._hash_cache) if detect_duplicates else None
         self._resolved_dir_cache: Dict[Path, Path] = {}
         self._ensured_dirs: Set[Path] = set()
@@ -306,7 +324,7 @@ class Organizer:
             return True
         # Skip bucket directories when using in-place strategy to prevent re-organizing
         # files that were just moved into bucket folders
-        if self.recursive and self.strategy == "in-place" and not self._at_organize_root(parent_path):
+        if self.recursive and self.strategy == "in-place":
             if dir_name.casefold() in self._category_canonical:
                 return True
         return False
@@ -350,7 +368,7 @@ class Organizer:
             existing = set()
             if directory.exists():
                 try:
-                    existing = {p.name for p in directory.iterdir()}
+                    existing = {name_key(p.name) for p in directory.iterdir()}
                 except OSError:
                     existing = set()
             self.reserved_names[directory] = existing
@@ -380,7 +398,7 @@ class Organizer:
         i = self._next_collision_suffix.get(key, 1)
         while True:
             candidate = f"{stem}_{i}{suffix}" if suffix else f"{original_name}_{i}"
-            if candidate not in reserved:
+            if name_key(candidate) not in reserved and not os.path.lexists(dest_dir / candidate):
                 self._next_collision_suffix[key] = i + 1
                 return candidate
             i += 1
@@ -393,25 +411,81 @@ class Organizer:
         if self.random_names:
             extension = os.path.splitext(original_name)[1]
             random_name = self._generate_random_name(extension)
-            reserved.add(random_name)
+            reserved.add(name_key(random_name))
             return dest_dir / random_name
 
-        if original_name not in reserved:
-            reserved.add(original_name)
+        if name_key(original_name) not in reserved and not os.path.lexists(dest_dir / original_name):
+            reserved.add(name_key(original_name))
             return dest_dir / original_name
 
         self._note_collision(collision_counter)
         candidate = self._probe_collision_name(reserved, dest_dir, original_name)
-        reserved.add(candidate)
+        reserved.add(name_key(candidate))
         return dest_dir / candidate
 
-    def _fast_move(self, src: Path, dst: Path) -> None:
-        """Move via a single rename syscall; fall back to shutil.move for
-        cross-device moves (or anything else rename cannot do)."""
-        try:
-            os.rename(src, dst)
-        except OSError:
-            shutil.move(str(src), str(dst))
+    def _check_cancelled(self) -> None:
+        if self.cancel_requested:
+            raise OrganizerCancelled("Organization cancelled; completed changes can be restored")
+
+    def _get_journal(self) -> Optional[RecoveryJournal]:
+        if self.dry_run or not self.create_backup:
+            return None
+        if self._journal is None:
+            self._journal = RecoveryJournal(self.base, mode="organize", strategy=self.strategy,
+                                            profile=self.profile_label, external=self.archive_recipe is not None)
+        return self._journal
+
+    def _fast_move(self, src: Path, dst: Path) -> Path:
+        self._check_cancelled()
+        journal = self._get_journal()
+        kind = "directory" if src.is_dir() else "file"
+        actual = journal.move(src, dst, kind=kind) if journal else move_to_available(src, dst)
+        if not journal:
+            self._watch_mutations[str(src.absolute())] = None
+            self._watch_mutations[str(actual.absolute())] = mutation_identity(actual)
+            for path in (src, actual):
+                for parent in path.absolute().parents:
+                    if parent in self.base.parents:
+                        break
+                    self._watch_mutations[str(parent)] = mutation_identity(parent)
+                    if parent == self.base:
+                        break
+        if actual != dst:
+            self._note_collision("files")
+        return actual
+
+    def _remove_dir(self, path: Path) -> None:
+        self._check_cancelled()
+        journal = self._get_journal()
+        if journal:
+            journal.remove_empty_dir(path)
+        else:
+            path.rmdir()
+            self._watch_mutations[str(path.absolute())] = None
+            self._watch_mutations[str(path.parent.absolute())] = mutation_identity(path.parent)
+
+    def _partial_download(self, path: Path) -> bool:
+        return any(p.suffix.casefold() in {".part", ".partial", ".crdownload", ".download", ".tmp", ".filepart"}
+                   for p in [path, *path.parents] if p != self.base and self.base in p.parents)
+
+    def _file_ready(self, path: Path) -> bool:
+        self._check_cancelled()
+        if path.absolute() in self.deferred_paths:
+            self.deferred_files.add(path)
+            return False
+        if self.file_stable_seconds:
+            if self._partial_download(path):
+                self.deferred_files.add(path)
+                return False
+            try:
+                info = path.stat()
+            except OSError:
+                return False
+            latest = info.st_mtime if path in self._renaming_candidates else max(info.st_mtime, info.st_ctime)
+            if time.time() - latest < self.file_stable_seconds:
+                self.deferred_files.add(path)
+                return False
+        return True
 
     def _allowed_bucket_names(self) -> Set[str]:
         cached = self._allowed_buckets_cache
@@ -448,6 +522,8 @@ class Organizer:
         staged into Duplicates. Skipped for in-place mode (per-directory semantics).
         """
         if self._dup_index is None:
+            return
+        if getattr(self._dup_index, "reused", False):
             return
         if self.recursive and self.strategy == "in-place":
             return
@@ -543,6 +619,8 @@ class Organizer:
         rule_id: Optional[str] = None,
         external: bool = False,
     ) -> None:
+        if not self._file_ready(src):
+            return
         duplicate_of: Optional[Path] = None
         dup_size: Optional[int] = None
         hardlink_dup = False
@@ -556,6 +634,8 @@ class Organizer:
             if st is not None and not stat_is_dataless(st):
                 dup_size = st.st_size
                 duplicate_of = self._dup_index.register(src, dup_size)
+                if duplicate_of is not None and not files_match(src, duplicate_of, self._hash_cache):
+                    duplicate_of = None
             if duplicate_of is not None:
                 if self.duplicates_hardlink:
                     # Keep the normal bucket destination; the move below becomes
@@ -601,15 +681,36 @@ class Organizer:
         if not self.dry_run:
             if hardlink_dup:
                 try:
-                    os.link(duplicate_of, target)
-                    os.unlink(src)
+                    journal = self._get_journal()
+                    if journal:
+                        target = journal.hardlink_move(src, duplicate_of, target)
+                    else:
+                        # Even opt-out runs validate both copies before unlinking.
+                        from org_dupes import hash_file
+                        before = src.stat()
+                        before_canonical = duplicate_of.stat()
+                        digest = hash_file(src)
+                        if digest is None or digest != hash_file(duplicate_of):
+                            raise ValueError("Duplicate changed before hardlinking")
+                        os.link(duplicate_of, target)
+                        current = src.stat()
+                        current_canonical = duplicate_of.stat()
+                        if ((before.st_ino, before.st_size, before.st_mtime_ns) != (current.st_ino, current.st_size, current.st_mtime_ns)
+                                or (before_canonical.st_ino, before_canonical.st_size, before_canonical.st_mtime_ns) != (current_canonical.st_ino, current_canonical.st_size, current_canonical.st_mtime_ns)):
+                            target.unlink()
+                            raise ValueError("Duplicate source changed before removing it")
+                        os.unlink(src)
                     hardlinked = True
-                except OSError:
+                except OSError as exc:
+                    import errno
+                    if exc.errno not in {errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                        raise
                     # Cross-volume or FS without hardlinks: keep the plain move,
                     # leaving the duplicate as a full copy in its bucket.
                     hardlinked = False
             if not hardlinked:
-                self._fast_move(src, target)
+                target = self._fast_move(src, target)
+            self._renaming_candidates.add(target)
             rel_src = self._record_path(src)
             rel_dst = self._record_path(target)
             self.file_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
@@ -767,7 +868,6 @@ class Organizer:
 
                 dst = parent / canonical
 
-                same_casefold = child.name.lower() == canonical.lower()
                 same_inode = False
                 if dst.exists():
                     try:
@@ -775,21 +875,22 @@ class Organizer:
                     except OSError:
                         same_inode = False
 
-                if same_casefold or same_inode:
+                if same_inode:
                     self.normalize_stats.folders_case_renamed += 1
                     if not self.dry_run:
                         rel_from = str(child.relative_to(self.base))
                         tmp = parent / f"__tmp_norm_{uuid.uuid4().hex[:8]}__"
-                        child.rename(tmp)
-                        tmp.rename(dst)
-                        self.file_moves.append(ManifestEntry(from_path=rel_from, to_path=str(dst.relative_to(self.base))))
+                        tmp = self._fast_move(child, tmp)
+                        self.file_moves.append(ManifestEntry(from_path=rel_from, to_path=str(tmp.relative_to(self.base))))
+                        dst = self._fast_move(tmp, dst)
+                        self.file_moves.append(ManifestEntry(from_path=str(tmp.relative_to(self.base)), to_path=str(dst.relative_to(self.base))))
                     continue
 
                 if not dst.exists():
                     self.normalize_stats.folders_case_renamed += 1
                     if not self.dry_run:
                         rel_from = str(child.relative_to(self.base))
-                        child.rename(dst)
+                        dst = self._fast_move(child, dst)
                         self.file_moves.append(ManifestEntry(from_path=rel_from, to_path=str(dst.relative_to(self.base))))
                     continue
 
@@ -802,15 +903,15 @@ class Organizer:
                         continue
 
                     target_name = item.name
-                    if target_name in reserved:
+                    if name_key(target_name) in reserved:
                         self.normalize_stats.merge_collisions_resolved += 1
                         target_name = self._probe_collision_name(reserved, dst, target_name)
 
-                    reserved.add(target_name)
+                    reserved.add(name_key(target_name))
                     self.normalize_stats.items_moved_in_merges += 1
                     if not self.dry_run:
                         dest_item = dst / target_name
-                        self._fast_move(item, dest_item)
+                        dest_item = self._fast_move(item, dest_item)
                         self.file_moves.append(
                             ManifestEntry(
                                 from_path=str(item.relative_to(self.base)),
@@ -821,7 +922,7 @@ class Organizer:
                 if not self.dry_run:
                     try:
                         if not any(child.iterdir()):
-                            child.rmdir()
+                            self._remove_dir(child)
                             self.normalize_stats.source_folders_removed += 1
                     except OSError:
                         pass
@@ -1180,7 +1281,7 @@ class Organizer:
                 )
 
             if not self.dry_run:
-                self._fast_move(src_dir, target)
+                target = self._fast_move(src_dir, target)
                 rel_src = str(src_dir.relative_to(self.base))
                 rel_dst = str(target.relative_to(self.base))
                 self.empty_dir_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
@@ -1246,7 +1347,7 @@ class Organizer:
                     if any(root_path.iterdir()):
                         continue
                     self.removed_dirs.append(str(root_path.relative_to(self.base)))
-                    root_path.rmdir()
+                    self._remove_dir(root_path)
                 except OSError:
                     continue
             self.empty_dirs_removed += 1
@@ -1283,7 +1384,7 @@ class Organizer:
                 try:
                     for name in files:
                         os.unlink(root_path / name)
-                    root_path.rmdir()
+                    self._remove_dir(root_path)
                 except OSError:
                     continue
                 self.removed_dirs.append(str(root_path.relative_to(self.base)))
@@ -1295,7 +1396,8 @@ class Organizer:
         dsstore_files_removed = 0
 
         self._cleanup_directories = []
-        for root, _dirs, files in os.walk(self.base, followlinks=False):
+        for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
+            dirs[:] = [d for d in dirs if self._path_allowed(Path(root) / d, allow_buckets=True)]
             self._cleanup_directories.append(Path(root))
             for name in files:
                 is_dsstore = False
@@ -1341,7 +1443,7 @@ class Organizer:
             if other_dir.is_dir():
                 try:
                     if not any(other_dir.iterdir()) and not self.dry_run:
-                        other_dir.rmdir()
+                        self._remove_dir(other_dir)
                 except OSError:
                     pass
 
@@ -1420,13 +1522,8 @@ class Organizer:
             external_destinations=self.routing_stats.external_moves > 0,
         )
         helper = Path(__file__).resolve().parent / "organize_by_filetype.py"
-        info = write_manifest_files(
-            self.base,
-            manifest,
-            helper_script=helper,
-            dry_run=self.dry_run,
-            create_backup=self.create_backup,
-        )
+        info = self._journal.finish() if self._journal else write_manifest_files(
+            self.base, manifest, helper_script=helper, dry_run=self.dry_run, create_backup=self.create_backup)
         if (
             info
             and self.archive_recipe is not None
@@ -1477,135 +1574,130 @@ class Organizer:
         return str(out_path)
 
     def _rename_all_files_after_organize(self) -> Dict[str, object]:
-        """Rename all files with random names after organization is complete."""
+        """Name eligible files using the same protected-tree policy as routing."""
         rename_stats = {"files_renamed": 0, "files_skipped": 0, "errors": []}
-        
-        # Collect all files from the organized structure
-        all_files = []
-        for root, dirs, files in os.walk(self.base, topdown=False):
-            root_path = Path(root)
-            
-            # Skip organizer, deletion, and duplicate-staging directories
-            if (
-                self._is_organizer_dir(root_path.name)
-                or self._is_for_deletion_name(root_path.name)
-                or self._is_duplicates_dir(root_path.name)
-                or self._is_needs_review_dir(root_path.name)
-            ):
-                dirs[:] = []
-                continue
-                
-            if not self.include_hidden:
-                dirs[:] = [d for d in dirs if self._visible_name(d)]
-                files = [f for f in files if self._visible_name(f)]
-                
-            for filename in files:
-                src = root_path / filename
-                try:
-                    st = os.lstat(src)  # one syscall replaces is_file()+is_symlink()
-                except OSError:
-                    continue
-                if not stat_module.S_ISREG(st.st_mode):
-                    continue
-                # Names from earlier runs already look random; reserving them means
-                # _generate_random_name can never emit a name that exists on disk,
-                # so no per-file dest.exists() stat is needed below.
-                if RANDOM_NAME_PATTERN.match(filename) or RANDOM_NAME_CANDIDATE_PATTERN.match(filename):
-                    self.used_random_names.add(filename)
-                all_files.append(src)
-
-        # Rename each file
+        if self._incremental_supported():
+            all_files = sorted(self._renaming_candidates)
+        else:
+            all_files = []
+            for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
+                parent = Path(root)
+                dirs[:] = [name for name in dirs if self._path_allowed(parent / name, allow_buckets=True)]
+                for name in files:
+                    source = parent / name
+                    if self._path_allowed(source, allow_buckets=True) and source.is_file():
+                        all_files.append(source)
         for src in all_files:
-            try:
-                # Skip files that appear to be already randomly renamed if flag is enabled
-                if self.skip_randomly_renamed and self._is_randomly_renamed(src.name):
-                    rename_stats["files_skipped"] += 1
-                    continue
-
-                new_name = self._generate_random_name(src.suffix)
-                dest = src.parent / new_name
-
-                if not self.dry_run:
-                    src.rename(dest)
-                    # Update the file_moves manifest with the new name
-                    rel_src = str(src.relative_to(self.base))
-                    rel_dst = str(dest.relative_to(self.base))
-                    self.file_moves.append(ManifestEntry(from_path=rel_src, to_path=rel_dst))
-                
-                rename_stats["files_renamed"] += 1
-                
-                if self.verbose and rename_stats["files_renamed"] % 100 == 0:
-                    self._progress(f"Renamed {rename_stats['files_renamed']} files after organization…\n")
-                    
-            except Exception as e:
-                rename_stats["errors"].append(f"Error renaming {src}: {e}")
-        
+            self._check_cancelled()
+            if not src.is_file() or src.is_symlink() or not self._file_ready(src):
+                continue
+            if self.skip_randomly_renamed and (RANDOM_NAME_PATTERN.match(src.name) or RANDOM_NAME_CANDIDATE_PATTERN.match(src.name)):
+                rename_stats["files_skipped"] += 1
+                continue
+            dest = src.parent / self._generate_random_name(src.suffix)
+            if not self.dry_run:
+                dest = self._fast_move(src, dest)
+                if self._hash_cache is not None:
+                    self._hash_cache.moved(src, dest)
+                if self._dup_index is not None:
+                    self._dup_index.update_location(dest.stat().st_size, src, dest)
+                self.file_moves.append(ManifestEntry(from_path=self._record_path(src), to_path=self._record_path(dest)))
+            rename_stats["files_renamed"] += 1
         return rename_stats
+
+    def _path_allowed(self, source: Path, *, allow_buckets: bool = False) -> bool:
+        try:
+            relative = source.relative_to(self.base)
+        except ValueError:
+            return False
+        parent = self.base
+        for part in relative.parts:
+            path = parent / part
+            if not self._visible_name(part) or path.is_symlink():
+                return False
+            if part.casefold() in {ORGANIZER_DIR_NAME.casefold(), FOR_DELETION_DIR_NAME.casefold(),
+                                    DUPLICATES_DIR_NAME.casefold(), NEEDS_REVIEW_DIR_NAME.casefold()}:
+                return False
+            if should_skip_traverse_dir(parent, part, self.base, self.exclude_patterns):
+                return False
+            if not allow_buckets and self._should_skip_traversal_dir(parent, part):
+                return False
+            parent = path
+        return bool(relative.parts)
+
+    def _event_path(self, raw: Path) -> Optional[Path]:
+        source = Path(os.path.abspath(raw))
+        try:
+            relative = source.relative_to(self._input_base)
+        except ValueError:
+            try:
+                relative = source.relative_to(self.base)
+            except ValueError:
+                return None
+        source = self.base / relative
+        return source if self._path_allowed(source, allow_buckets=self.empty_dirs_only) else None
 
     def _incremental_supported(self) -> bool:
         return (self.changed_paths is not None and not self.dry_run
-                and self.strategy == "flatten-root" and self.rule_set is None
-                and self.archive_recipe is None and not self.random_names_after_organize
-                and not self.ocr_index
-                and not any(Path(p).is_dir() for p in self.changed_paths))
+                and self.rule_set is None and self.archive_recipe is None and not self.ocr_index
+                and (self.empty_dirs_only or not any(Path(p).is_dir() for p in self.changed_paths)))
+
+    def _changed_parents(self) -> Set[Path]:
+        parents = set()
+        for raw in self.changed_paths or []:
+            source = self._event_path(raw)
+            if source is None:
+                continue
+            candidates = [source, *source.parents] if source.is_dir() else source.parents
+            parents.update(p for p in candidates if p != self.base and self.base in p.parents)
+        return parents
+
+    def _clean_changed_parents(self, parents: Set[Path], *, delete_only: bool = False) -> None:
+        """Only inspect direct entries of affected ancestors, deepest first."""
+        protected = {p for p in parents if self._dir_is_too_new(p)}
+        for parent in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+            if any(p == parent or p in parent.parents for p in protected):
+                continue
+            if not self._path_allowed(parent, allow_buckets=delete_only):
+                continue
+            try:
+                entries = list(parent.iterdir())
+                if any(p.name != ".DS_Store" for p in entries):
+                    continue
+                if self.collect_empty_dirs and not delete_only:
+                    self._collect_empty_dirs_batch([parent])
+                else:
+                    if not self.dry_run:
+                        for entry in entries:
+                            entry.unlink()
+                        self._remove_dir(parent)
+                        self.removed_dirs.append(str(parent.relative_to(self.base)))
+                    self.empty_dirs_removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
 
     def _run_changed_files(self) -> None:
-        """Use the ordinary collision-safe move path for validated event files."""
         touched: Set[Path] = set()
-        parents: Set[Path] = set()
+        parents = self._changed_parents()
         for raw in sorted(set(self.changed_paths or []), key=str):
-            source = Path(os.path.abspath(raw))
-            try:
-                relative = source.relative_to(self._input_base)
-            except ValueError:
-                try:
-                    relative = source.relative_to(self.base)
-                except ValueError:
-                    continue
-            source = self.base / relative
-            if not relative.parts or (not self.recursive and len(relative.parts) != 1):
+            source = self._event_path(raw)
+            if source is None or not source.is_file():
                 continue
-            # Never use an event to traverse symlinks, exclusions or hidden dirs.
-            parent = self.base
-            allowed = True
-            for part in relative.parts[:-1]:
-                child = parent / part
-                if child.is_symlink() or self._should_skip_traversal_dir(parent, part) or not self._visible_name(part):
-                    allowed = False
-                    break
-                parent = child
-            if not allowed or not self._visible_name(source.name) or source.is_symlink() or not source.is_file():
+            relative = source.relative_to(self.base)
+            if not self.recursive and len(relative.parts) != 1:
                 continue
-            decision = self._route_file(source, self.base)
+            bucket_parent = source.parent if self.recursive and self.strategy == "in-place" else self.base
+            decision = self._route_file(source, bucket_parent)
             if decision.destination is not None:
-                self._move_one_file(source, decision.destination, bucket_parent=self.base,
+                if source.parent == decision.destination:
+                    self._renaming_candidates.add(source)
+                self._move_one_file(source, decision.destination, bucket_parent=bucket_parent,
                                     bucket_name=decision.category, reason=decision.reason)
                 touched.add(source.parent)
-                parents.update(p for p in source.parents if p != self.base and self.base in p.parents)
         self.move_stats.folders_touched = len(touched)
-        # Only inspect affected ancestors; unrelated library branches are untouched.
-        candidates = []
-        for parent in sorted(parents, key=lambda p: len(p.parts)):
-            if any(self._dir_is_too_new(p) for p in [parent, *parent.parents] if p in parents):
-                continue
-            if any(ancestor == parent or ancestor in parent.parents for ancestor in candidates):
-                continue
-            collectable, _ = self._inspect_empty_dir_tree(parent)
-            if collectable:
-                candidates.append(parent)
-        if self.collect_empty_dirs:
-            if candidates:
-                self._collect_empty_dirs_batch(candidates)
-        else:
-            for parent in sorted(parents, key=lambda p: len(p.parts), reverse=True):
-                if any(self._dir_is_too_new(p) for p in [parent, *parent.parents] if p in parents):
-                    continue
-                try:
-                    parent.rmdir()
-                    self.removed_dirs.append(str(parent.relative_to(self.base)))
-                    self.empty_dirs_removed += 1
-                except OSError:
-                    pass
+        self._clean_changed_parents(parents)
 
     def _empty_recheck_seconds(self) -> Optional[float]:
         if self._empty_recheck_at is None:
@@ -1614,12 +1706,33 @@ class Organizer:
 
     def _timed(self, phase: str, callback):
         started = time.perf_counter()
+        if os.environ.get("FILE_ORG_PROGRESS"):
+            import json
+            import sys
+            print(json.dumps({"phase": phase.replace("_", " ").capitalize()}), file=sys.stderr, flush=True)
+        self._check_cancelled()
         try:
             return callback()
         finally:
             self.phase_seconds[phase] = round(time.perf_counter() - started, 6)
 
     def run(self) -> Dict[str, object]:
+        try:
+            return self._run_impl()
+        except BaseException as exc:
+            if self._journal is not None:
+                try:
+                    status = "interrupted" if isinstance(exc, (OrganizerCancelled, KeyboardInterrupt)) else "failed"
+                    self._recovery_info = self._journal.finish(status=status)
+                except OSError:
+                    self._recovery_info = {"manifest": str(self._journal.manifest_path)}
+            raise
+
+        finally:
+            if self._hash_cache is not None:
+                self._hash_cache.close()
+
+    def _run_impl(self) -> Dict[str, object]:
         started = time.perf_counter()
         try:
             self.base = self.base.resolve()
@@ -1627,11 +1740,16 @@ class Organizer:
             pass
 
         if self.empty_dirs_only:
-            self._timed("empty_delete", self._delete_empty_dirs_only)
+            incremental = self._incremental_supported()
+            self._timed("empty_delete", lambda: self._clean_changed_parents(self._changed_parents(), delete_only=True)) if incremental else self._timed("empty_delete", self._delete_empty_dirs_only)
+            manifest_info = self.save_manifest()
             self.phase_seconds["total"] = round(time.perf_counter() - started, 6)
             return {
                 "target": str(self.base),
                 "mode": "empty-dirs-only",
+                "watch_mutations": self._journal.watch_mutations if self._journal else self._watch_mutations,
+                "execution": "incremental" if incremental else "full",
+                "backup_manifest": manifest_info.get("manifest") if manifest_info else None,
                 "dry_run": self.dry_run,
                 "files_moved": 0,
                 "empty_dirs_removed": self.empty_dirs_removed,
@@ -1642,6 +1760,19 @@ class Organizer:
             }
 
         incremental = self._incremental_supported()
+        if self._hash_cache is not None and not self.dry_run and self.rule_set is None and self.archive_recipe is None:
+            scope = json.dumps({"base": str(self.base), "recursive": self.recursive,
+                                "strategy": self.strategy, "hidden": self.include_hidden,
+                                "exclude": self.exclude_patterns, "follow_symlinks": self.follow_symlinks,
+                                "mime": self.use_mime_sniff, "buckets": self._ext_bucket_map,
+                                "date_buckets": self.date_buckets, "normalize": self.normalize}, sort_keys=True)
+            self._dup_index = PersistentDuplicateIndex(self._hash_cache, scope, incremental=incremental,
+                                                       changed_paths=self.changed_paths or ())
+            if incremental and not self._dup_index.reused:
+                # An absent/corrupt/outdated index cannot establish whether an
+                # unseen existing file should be the keeper. Rebuild once.
+                self.changed_paths = None
+                incremental = False
         self._timed("duplicate_index", self._seed_duplicate_index)
         if incremental:
             self._timed("organize", self._run_changed_files)
@@ -1667,7 +1798,8 @@ class Organizer:
                 cleanup_old_manifests(self.archive_recipe.archive_root, days_to_keep=7)
         ocr_path = self._timed("ocr", self._maybe_write_ocr_index)
         if self._hash_cache is not None and not self.dry_run:
-            self._timed("hash_cache_save", self._hash_cache.save)
+            save = self._dup_index.finish if isinstance(self._dup_index, PersistentDuplicateIndex) else self._hash_cache.save
+            self._timed("hash_cache_save", save)
         verification = ({"scope": "changed-paths", "requested_paths": len(self.changed_paths or [])}
                         if incremental else self._timed("verification", self._verify))
         self.phase_seconds["total"] = round(time.perf_counter() - started, 6)
@@ -1680,6 +1812,7 @@ class Organizer:
 
         summary = {
             "target": str(self.base),
+            "watch_mutations": self._journal.watch_mutations if self._journal else self._watch_mutations,
             "mode": "recursive" if self.recursive else "non-recursive",
             "strategy": self.strategy if self.recursive else "root-only",
             "buckets": summary_buckets,
@@ -1688,6 +1821,9 @@ class Organizer:
             "normalization_mode": self.normalize,
             "dry_run": self.dry_run,
             "files_moved": self.move_stats.files_moved,
+            "deferred_files": len(self.deferred_files),
+            "deferred_paths": [str(p) for p in sorted(self.deferred_files)],
+            "file_recheck_seconds": self.file_stable_seconds if any(not self._partial_download(p) for p in self.deferred_files) else None,
             "moved_by_category": dict(sorted(self.ext_counts.items())),
             "name_collisions_resolved": self.move_stats.name_collisions_resolved,
             "folders_touched": self.move_stats.folders_touched,

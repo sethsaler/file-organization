@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import copy
+import tempfile
+from contextlib import contextmanager
 import os
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -20,11 +24,10 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_buckets import bucket_names_for_profile
-from org_manifest import ORGANIZER_DIR_NAME
 from org_rules import FALLBACK_BUCKET, VALID_FALLBACKS
 
 # Protects the read-modify-write of schedule.json when multiple threads run folders in parallel.
-_config_lock = threading.Lock()
+_config_lock = threading.RLock()
 
 # An organizer process that exits non-zero without printing anything crashed before it did
 # any work (for example a transient filesystem error while Python imported the helper's own
@@ -73,6 +76,7 @@ def default_config_path() -> Path:
 class FolderJob:
     path: str
     enabled: bool = True
+    settings_revision: int = 0  # user edits only; protects active-run result merges
     recursive: bool = True
     strategy: str = "flatten-root"
     normalize: Optional[str] = None
@@ -159,86 +163,25 @@ def wait_seconds_after_run(cfg: ScheduleConfig) -> float:
     return float(minutes * 60)
 
 
-def watch_signature(job: FolderJob) -> Tuple[float, ...]:
-    """Cheap change signature for watch mode: mtimes of the watched root and all
-    directories beneath it (one stat per directory, symlinks are not followed).
+def _snapshot_signature(job: FolderJob, *, recursive: bool) -> Tuple[int, ...]:
+    from schedule_watch import watch_snapshot
 
-    A new/removed/modified file changes the mtime of its immediate parent directory,
-    so this catches changes anywhere inside the watched tree.
-
-    The organizer's own ``.organizer`` backup directory is excluded (at any
-    depth) so manifests written during a run never look like user changes —
-    matching the event backend's noise filter in schedule_watch.is_noise_path.
-    """
-    base = normalize_folder_input(job.path)
-    try:
-        base_stat = os.stat(base)
-    except OSError:
-        return (0.0,)
-
-    base_str = str(base)
-    entries: List[Tuple[str, float]] = [(base_str, base_stat.st_mtime)]
-    stack = [base_str]
-    organizer_name = ORGANIZER_DIR_NAME.casefold()
-
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                for entry in it:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            if entry.name.casefold() == organizer_name:
-                                continue
-                            st = entry.stat(follow_symlinks=False)
-                            entries.append((entry.path, st.st_mtime))
-                            stack.append(entry.path)
-                    except OSError:
-                        continue
-        except OSError:
-            continue
-
-    # Stable ordering by absolute path; all entries share the same base prefix.
-    entries.sort(key=lambda x: x[0])
-    return tuple(mtime for _, mtime in entries)
+    digest = hashlib.blake2b(digest_size=16)
+    for path, metadata in sorted(watch_snapshot(job, recursive=recursive).items()):
+        digest.update(path.encode("utf-8", "surrogateescape"))
+        digest.update(repr(metadata).encode("ascii"))
+    value = digest.digest()
+    return tuple(int.from_bytes(value[i:i + 4], "big") for i in range(0, 16, 4))
 
 
-def watch_signature_fast(job: FolderJob) -> Tuple[float, ...]:
-    """Lightweight change signature for high-frequency polling.
+def watch_signature(job: FolderJob) -> Tuple[int, ...]:
+    """Full metadata signature, including file writes and same-size replacements."""
+    return _snapshot_signature(job, recursive=True)
 
-    Only stats the watched root and its immediate subdirectories. Files dropped at
-    the folder root or one level deep change those mtimes, so this catches the
-    common case with dramatically less work than the recursive signature. Deep
-    changes are still caught by the periodic full scan in the watch loop.
 
-    Like watch_signature, the organizer's ``.organizer`` backup directory is
-    excluded so a run's own manifest writes never look like user changes.
-    """
-    base = normalize_folder_input(job.path)
-    try:
-        base_stat = os.stat(base)
-    except OSError:
-        return (0.0,)
-
-    base_str = str(base)
-    entries: List[Tuple[str, float]] = [(base_str, base_stat.st_mtime)]
-    organizer_name = ORGANIZER_DIR_NAME.casefold()
-    try:
-        with os.scandir(base_str) as it:
-            for entry in it:
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name.casefold() == organizer_name:
-                            continue
-                        st = entry.stat(follow_symlinks=False)
-                        entries.append((entry.path, st.st_mtime))
-                except OSError:
-                    continue
-    except OSError:
-        pass
-
-    entries.sort(key=lambda x: x[0])
-    return tuple(mtime for _, mtime in entries)
+def watch_signature_fast(job: FolderJob) -> Tuple[int, ...]:
+    """Root file metadata plus immediate directories for inexpensive polling."""
+    return _snapshot_signature(job, recursive=False)
 
 
 def estimate_seconds_until_next_run(cfg: ScheduleConfig) -> float:
@@ -335,6 +278,7 @@ class ScheduleConfig:
                 FolderJob(
                     path=p,
                     enabled=bool(item.get("enabled", True)),
+                    settings_revision=int(item.get("settings_revision", 0)),
                     recursive=recursive_val,
                     strategy=str(item.get("strategy", "flatten-root")),
                     normalize=normalize_val,
@@ -406,31 +350,105 @@ def effective_normalize(job: FolderJob) -> str:
     return "standard" if job.recursive else "none"
 
 
-def save_config(path: Path, cfg: ScheduleConfig) -> None:
+@contextmanager
+def _config_transaction(path: Path):
+    """Serialize read-modify-write operations across both threads and processes."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(cfg.to_json_dict(), indent=2), encoding="utf-8")
-    tmp.replace(path)
+    with _config_lock:
+        with path.with_suffix(path.suffix + ".lock").open("a+b") as lock:
+            try:
+                import fcntl
+            except ImportError:  # Windows: process-local protection remains available.
+                fcntl = None
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _write_config(path: Path, cfg: ScheduleConfig) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".schedule-", delete=False) as stream:
+            temporary = stream.name
+            json.dump(cfg.to_json_dict(), stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
+def save_config(path: Path, cfg: ScheduleConfig) -> None:
+    with _config_transaction(path):
+        _write_config(path, cfg)
+
+
+def merge_config_edits(path: Path, baseline: ScheduleConfig, edited: ScheduleConfig) -> ScheduleConfig:
+    """Apply only explicit edits to current disk state; preserve concurrent changes.
+
+    Existing folders removed by another editor are not resurrected by stale windows.
+    A revision belongs to user settings, not run metadata, so a finishing run cannot
+    reverse a later pause, re-enable, or failure-counter reset.
+    """
+    with _config_transaction(path):
+        fresh = load_config(path)
+        for item in fields(ScheduleConfig):
+            name = item.name
+            if name not in {"folders", "version"} and getattr(baseline, name) != getattr(edited, name):
+                setattr(fresh, name, copy.deepcopy(getattr(edited, name)))
+        before = {job.path: job for job in baseline.folders}
+        after = {job.path: job for job in edited.folders}
+        removed = before.keys() - after.keys()
+        fresh.folders = [job for job in fresh.folders if job.path not in removed]
+        current = {job.path: job for job in fresh.folders}
+        for job_path, new in after.items():
+            old = before.get(job_path)
+            if old is None:
+                if job_path not in current:
+                    added = copy.deepcopy(new)
+                    added.settings_revision = time.time_ns()
+                    fresh.folders.append(added)
+                continue
+            target = current.get(job_path)
+            if target is None:
+                continue
+            changed = False
+            for item in fields(FolderJob):
+                name = item.name
+                if name not in {"path", "settings_revision"} and getattr(old, name) != getattr(new, name):
+                    setattr(target, name, copy.deepcopy(getattr(new, name)))
+                    changed = True
+            if changed:
+                target.settings_revision = max(time.time_ns(), target.settings_revision + 1)
+        _write_config(path, fresh)
+        return fresh
 
 
 def _merge_and_save_config(cfg: ScheduleConfig, config_path: Path, only_paths: Optional[Set[str]] = None) -> None:
-    """Merge per-run updates back into the latest on-disk config without overwriting concurrent runs.
-
-    Only folders named in only_paths (default: every folder in cfg) are written back, so a run
-    that touched one folder never clobbers the fresh last_run / last_error that a parallel run
-    of another folder saved a moment earlier.
-    """
-    with _config_lock:
+    """Merge run-owned fields, never stale enablement or later user edits."""
+    with _config_transaction(config_path):
         fresh = load_config(config_path)
         updated = {j.path: j for j in cfg.folders if only_paths is None or j.path in only_paths}
         for job in fresh.folders:
             if job.path in updated:
                 u = updated[job.path]
                 job.last_run = u.last_run
-                job.last_error = u.last_error
-                job.consecutive_failures = u.consecutive_failures
-                job.enabled = u.enabled
-        save_config(config_path, fresh)
+                if job.settings_revision == u.settings_revision:
+                    job.last_error = u.last_error
+                    job.consecutive_failures = u.consecutive_failures
+                    if is_auto_disabled(cfg, u):
+                        job.enabled = False
+                u.enabled = job.enabled
+        _write_config(config_path, fresh)
 
 
 def is_auto_disabled(cfg: ScheduleConfig, job: FolderJob) -> bool:
@@ -689,6 +707,8 @@ def run_enabled_folders(
     file_log_path: Optional[Path] = None,
     only_paths: Optional[Set[str]] = None,
     changed_paths: Optional[Dict[str, Set[str]]] = None,
+    deferred_paths: Optional[Dict[str, Set[str]]] = None,
+    file_stable_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """Run all runnable enabled folders; returns {"ran", "failed", "skipped", "disabled"} counts.
 
@@ -701,6 +721,7 @@ def run_enabled_folders(
 
     result: Dict[str, Any] = {"ran": 0, "failed": 0, "skipped": 0, "disabled": 0, "cleanup_only": 0}
     touched: Set[str] = set()
+    readiness_files: List[Path] = []
 
     conflicts = find_path_conflicts(cfg)
     if conflicts and log:
@@ -751,6 +772,14 @@ def run_enabled_folders(
         if changed_paths and job.path in changed_paths and not job.expand_subfolders:
             for changed in sorted(changed_paths[job.path]):
                 cmd.extend(["--changed-path", changed])
+        if file_stable_seconds > 0 and not job.empty_dirs_only:
+            cmd.extend(["--file-stable-seconds", str(file_stable_seconds)])
+        if deferred_paths and deferred_paths.get(job.path):
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="file-org-deferred-",
+                                             suffix=".json", delete=False) as stream:
+                json.dump(sorted(deferred_paths[job.path]), stream)
+                readiness_files.append(Path(stream.name))
+            cmd.extend(["--deferred-paths-file", str(readiness_files[-1])])
         tasks.append((idx, job, cmd))
 
     if not tasks:
@@ -776,6 +805,15 @@ def run_enabled_folders(
             recheck = _summary_recheck_seconds(out)
             if recheck is not None:
                 result["recheck_seconds"] = min(recheck, result.get("recheck_seconds", recheck))
+            try:
+                payload = json.loads(out[out.find("{"):]) if "{" in out else {}
+            except ValueError:
+                payload = {}
+            if isinstance(payload, dict):
+                if payload.get("deferred_paths"):
+                    result.setdefault("deferred_paths", []).extend(payload["deferred_paths"])
+                if payload.get("watch_mutations"):
+                    result.setdefault("watch_mutations", {}).update(payload["watch_mutations"])
             append_history_entry(_history_record(task_job, label, last_err, out))
             if 0 <= idx < len(cfg.folders):
                 job = cfg.folders[idx]
@@ -814,6 +852,8 @@ def run_enabled_folders(
                 path_log = cfg.folders[idx].path if 0 <= idx < len(cfg.folders) else "?"
                 append_log_line(file_log_path, f"{path_log}: {status}")
 
+    for readiness_file in readiness_files:
+        readiness_file.unlink(missing_ok=True)
     try:
         _merge_and_save_config(cfg, config_path, only_paths=touched)
     except OSError:
@@ -826,7 +866,9 @@ def _summary_recheck_seconds(out: str) -> Optional[float]:
     if start == -1:
         return None
     try:
-        value = json.loads(out[start:]).get("empty_dirs_recheck_seconds")
+        summary = json.loads(out[start:])
+        candidates = [summary.get("empty_dirs_recheck_seconds"), summary.get("file_recheck_seconds")]
+        value = min((v for v in candidates if isinstance(v, (int, float))), default=None)
     except (ValueError, AttributeError):
         return None
     return float(value) if isinstance(value, (int, float)) else None
@@ -850,7 +892,7 @@ def _history_record(job: FolderJob, label: str, last_err: Optional[str], out: st
             rec["moved_by_category"] = summary.get("moved_by_category")
             rec["name_collisions_resolved"] = summary.get("name_collisions_resolved")
             rec["backup_manifest"] = summary.get("backup_manifest")
-            for metric in ("execution", "phase_seconds", "hash_cache"):
+            for metric in ("execution", "phase_seconds", "hash_cache", "deferred_files", "recovery_journal", "interrupted"):
                 if metric in summary:
                     rec[metric] = summary[metric]
             dup = summary.get("duplicates")

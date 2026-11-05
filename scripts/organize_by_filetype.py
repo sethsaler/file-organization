@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from org_buckets import PROFILE_EXTENDED, PROFILE_STANDARD, resolve_profile
 from org_exclude import merge_exclude_patterns
 from org_manifest import restore_from_manifest
-from org_organizer import Organizer
+from org_organizer import Organizer, OrganizerCancelled
 from org_paths import normalize_folder_input
 from org_rules import VALID_FALLBACKS, RuleSet, load_archive_recipe, load_rule_set
 
@@ -28,6 +29,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--changed-path", action="append", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--deferred-paths-file", help=argparse.SUPPRESS)
+    parser.add_argument("--file-stable-seconds", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--path", help="Target directory path")
     parser.add_argument("--recursive", action="store_true", default=True, help="Enable recursive organization (default)")
     parser.add_argument("--no-recursive", dest="recursive", action="store_false", help="Disable recursive, root files only")
@@ -189,6 +192,10 @@ def main() -> None:
         print(json.dumps({"error": str(e)}, indent=2))
         sys.exit(2)
 
+    deferred_paths = []
+    if args.deferred_paths_file:
+        deferred_paths = [Path(p) for p in json.loads(Path(args.deferred_paths_file).read_text())]
+
     org = Organizer(
         base=base,
         recursive=args.recursive,
@@ -217,8 +224,26 @@ def main() -> None:
         empty_dir_min_age=args.empty_dir_min_age,
         changed_paths=[Path(p) for p in args.changed_path] if args.changed_path else None,
         empty_dirs_only=args.empty_dirs_only,
+        deferred_paths=deferred_paths,
+        file_stable_seconds=args.file_stable_seconds,
     )
-    result = org.run()
+    def cancel(_signum, _frame):
+        org.cancel_requested = True
+    previous = {}
+    for name in ("SIGINT", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.signal(signum, cancel)
+    try:
+        result = org.run()
+    except Exception as exc:
+        recovery = org._recovery_info or {}
+        print(json.dumps({"error": str(exc), "cancelled": isinstance(exc, OrganizerCancelled),
+                          "backup_manifest": recovery.get("manifest"), "status": "incomplete"}, indent=2))
+        sys.exit(1)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
     out = json.dumps(result, indent=2)
     print(out)
     if args.json_out:
