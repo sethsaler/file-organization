@@ -8,6 +8,11 @@ This project tracks changes using the Hermes skill version as its public version
 
 ### Added
 
+- Durable operation journals with interrupted-run discovery, graceful cancellation, identity-checked recovery, and collision-safe repeated Undo.
+- Search, type filters, pagination, cross-page multiselection, and grouped remembered-rule previews for large review queues.
+- Managed native-watcher runtime installation/health, preserving existing macOS TCC wrappers.
+- SQLite hash/canonical indexes, actual-mode incremental benchmarks, native daemon latency benchmarks, and macOS CI coverage.
+
 - Native command-center GUI with Overview, preview-first one-time organization, compact watched-folder management, recoverable run history, and advanced tools.
 - Human-readable dry-run move previews and macOS File/View menus with Command-number navigation.
 - Ordered deterministic routing rules with explainable preview reasons, source-URL sidecar matching, safe destination templates, and `bucket` / `needs-review` / `leave` fallback modes.
@@ -21,6 +26,10 @@ This project tracks changes using the Hermes skill version as its public version
 
 ### Changed
 
+- Incremental watch processing now covers in-place organization, random naming, and affected empty-directory cleanup, without a full signature scan after each incremental run.
+- Add-folder previews, review/safety scans, and service health checks run off the UI thread; recovery lookups share a per-refresh manifest index.
+- Watchers reconcile on startup/settings changes and verify file readiness using size and nanosecond metadata; partial downloads are deferred.
+
 - Random filename generation is opt-in across the CLI, one-time organization, and new scheduled-folder defaults.
 - Scheduler timing and per-folder options now open on demand instead of occupying the primary watched-folder view.
 - Project metadata now installs cleanly as a scripts-only distribution, so `uv run --with pytest pytest` works from a fresh checkout.
@@ -28,6 +37,12 @@ This project tracks changes using the Hermes skill version as its public version
 - Schedule schema version 6 carries rules, review fallback, Archive root, and creator mapping per watched folder.
 
 ### Fixed
+
+- Case-only and concurrent destination collisions cannot overwrite existing files; random naming respects nested protected, hidden, and excluded folders.
+- Preview completion cannot authorize newer settings; menu/window pause and per-folder enablement survive concurrent configuration writes.
+- Native watcher status distinguishes missing coverage, stale/stopped service, disabled folders, and daily/interval/watch modes.
+- Duplicate keepers and cross-volume/hardlink sources are revalidated around concurrent writes.
+- In-place runs no longer nest bucket folders inside existing root buckets.
 
 - A folder switched off by the scheduler after repeated failures is now visible everywhere the daemon looks healthy: the watch-health snapshot keeps it as `disabled`, the Overview shows “Off after failures” plus a notice, the scheduler status line and menu-bar payload (`auto_disabled_folders`) report it, and the macOS run notification says so.
 - Re-enabling a folder now also clears its failure streak, so one more hiccup can no longer switch it straight back off.

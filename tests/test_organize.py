@@ -294,19 +294,27 @@ def test_schedule_dry_run_verified_legacy_v3():
 
 
 def test_failed_schedule_preview_cannot_mark_folder_verified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import queue
+    from types import SimpleNamespace
+    callbacks = queue.Queue()
     panel = object.__new__(SchedulePanel)
     panel.cfg = ScheduleConfig()
-    panel._cfg_lock = threading.Lock()
+    panel._add_preview_cancel = None
+    panel.add_preview_status = SimpleNamespace(set=lambda _value: None)
+    panel.cancel_add_preview_button = SimpleNamespace(pack=lambda **_kwargs: None, pack_forget=lambda: None)
     panel._append_log = lambda _message: None
     panel._refresh_tree = lambda: None
+    panel._reload_config_if_changed = lambda: None
     panel._select_tree_index = lambda _index: None
     panel._save_quiet = lambda: None
-
-    monkeypatch.setattr(schedule_panel, "run_dry_run_preview", lambda _job: (False, "preview failed"))
+    panel._queue_ui = callbacks.put
+    failed = SimpleNamespace(returncode=1, communicate=lambda **_kwargs: ("", "preview failed"))
+    monkeypatch.setattr(schedule_panel.subprocess, "Popen", lambda *_args, **_kwargs: failed)
     monkeypatch.setattr(schedule_panel.messagebox, "askyesno", lambda *_args, **_kwargs: True)
-
     assert panel.add_folder_path(str(tmp_path), select=False) is True
+    callbacks.get(timeout=2)()
     assert panel.cfg.folders[0].dry_run_verified is False
+    assert panel.cfg.folders[0].enabled is False
 
 
 def test_daily_schedule_mode_roundtrip(tmp_path: Path):
@@ -370,11 +378,13 @@ def test_estimate_seconds_until_next_run_interval():
     assert 0 <= sec <= 3600
 
 
-def test_schedule_service_launchd_plist_interval_short(monkeypatch):
+def test_schedule_service_launchd_plist_interval_short(monkeypatch, tmp_path):
     """Short interval (≤ 60 min) uses StartInterval + --once (no 24/7 daemon)."""
     import schedule_service
     from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
 
+    monkeypatch.setattr(schedule_service, "launchd_plist_path", lambda: tmp_path / "service.plist")
+    monkeypatch.setenv("FILE_ORG_RUNTIME_HOME", str(tmp_path / "runtime"))
     monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("interval", "02:00", 30))
     plist = build_launchd_plist()
     assert plist["Label"] == SERVICE_LABEL
@@ -386,11 +396,13 @@ def test_schedule_service_launchd_plist_interval_short(monkeypatch):
     assert "StartCalendarInterval" not in plist
 
 
-def test_schedule_service_launchd_plist_interval_long(monkeypatch):
+def test_schedule_service_launchd_plist_interval_long(monkeypatch, tmp_path):
     """Long interval (> 60 min) uses --foreground + KeepAlive (long-running daemon)."""
     import schedule_service
     from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
 
+    monkeypatch.setattr(schedule_service, "launchd_plist_path", lambda: tmp_path / "service.plist")
+    monkeypatch.setenv("FILE_ORG_RUNTIME_HOME", str(tmp_path / "runtime"))
     monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("interval", "02:00", 120))
     plist = build_launchd_plist()
     assert plist["Label"] == SERVICE_LABEL
@@ -401,10 +413,12 @@ def test_schedule_service_launchd_plist_interval_long(monkeypatch):
     assert "StartInterval" not in plist
 
 
-def test_schedule_service_launchd_plist_daily(monkeypatch):
+def test_schedule_service_launchd_plist_daily(monkeypatch, tmp_path):
     import schedule_service
     from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
 
+    monkeypatch.setattr(schedule_service, "launchd_plist_path", lambda: tmp_path / "service.plist")
+    monkeypatch.setenv("FILE_ORG_RUNTIME_HOME", str(tmp_path / "runtime"))
     monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("daily", "02:30", 60))
     plist = build_launchd_plist()
     assert plist["Label"] == SERVICE_LABEL
@@ -908,11 +922,13 @@ def test_watch_mode_normalize_and_roundtrip():
     assert loaded.schedule_mode == SCHEDULE_MODE_WATCH
 
 
-def test_schedule_service_launchd_plist_watch(monkeypatch):
+def test_schedule_service_launchd_plist_watch(monkeypatch, tmp_path):
     """Watch mode runs the persistent event-driven daemon (no WatchPaths throttle)."""
     import schedule_service
     from schedule_service import SERVICE_LABEL, build_launchd_plist, daemon_script
 
+    monkeypatch.setattr(schedule_service, "launchd_plist_path", lambda: tmp_path / "service.plist")
+    monkeypatch.setenv("FILE_ORG_RUNTIME_HOME", str(tmp_path / "runtime"))
     monkeypatch.setattr(schedule_service, "_current_schedule", lambda: ("watch", "00:00", 60))
     plist = build_launchd_plist()
     assert plist["Label"] == SERVICE_LABEL
@@ -935,6 +951,7 @@ def test_schedule_service_prefers_stable_python_symlink(tmp_path: Path, monkeypa
 
     import schedule_service
 
+    monkeypatch.setenv("FILE_ORG_RUNTIME_HOME", str(tmp_path / "runtime"))
     stable = tmp_path / "python3"
     stable.symlink_to(Path(sys.executable).resolve())
     monkeypatch.setattr(schedule_service, "_STABLE_PYTHON_CANDIDATES", (stable,))
@@ -1376,7 +1393,8 @@ def test_watch_loop_runs_folders_concurrently(tmp_path: Path, monkeypatch):
     stop = threading.Event()
 
     def mock_run_enabled_folders(
-        c, path, *, max_parallel=None, log=None, label=None, file_log_path=None, only_paths=None
+        c, path, *, max_parallel=None, log=None, label=None, file_log_path=None, only_paths=None,
+        deferred_paths=None, file_stable_seconds=0
     ):
         p = next(iter(only_paths or []))
         start = time.monotonic()

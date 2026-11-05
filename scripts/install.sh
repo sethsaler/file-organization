@@ -75,14 +75,12 @@ exec python3 "$INSTALL_DIR/scripts/quick_controls.py" "\$@"
 WRAP
 chmod +x "$CONTROL_WRAPPER"
 
-# Best-effort: install the optional `watchdog` package so watch mode uses native
-# filesystem events (near-instant) instead of the mtime-polling fallback.
-if ! python3 -c "import watchdog" >/dev/null 2>&1; then
-  echo "Installing optional dependency: watchdog (native FS events for watch mode)…"
-  python3 -m pip install --user --quiet "watchdog>=3.0" >/dev/null 2>&1 \
-    || python3 -m pip install --user --quiet --break-system-packages "watchdog>=3.0" >/dev/null 2>&1 \
-    || echo "  Skipped (pip install failed) — watch mode will use polling fallback."
-fi
+# Keep watchdog in a verified, version-bound environment rather than whichever
+# Homebrew python3 happens to be current after an upgrade. Failure leaves the
+# previous working environment selected and reports fallback explicitly.
+echo "Preparing managed scheduler runtime (native filesystem events)…"
+python3 "$INSTALL_DIR/scripts/schedule_runtime.py" --install \
+  || echo "  Runtime setup failed — existing runtime retained; run schedule_runtime.py --install to repair."
 
 echo "Done."
 echo

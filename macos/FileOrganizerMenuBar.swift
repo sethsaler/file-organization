@@ -80,13 +80,19 @@ final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate, NSMenuDelegat
                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     let displayedKeys: Set<String> = [
                         "scheduler_enabled", "enabled_folders", "pending",
-                        "running", "backend", "folders"
+                        "running", "backend", "folders", "schedule_mode", "health_state",
+                        "health_message", "watch_stale", "auto_disabled_count", "missing_watch_count",
+                        "service_running", "runtime"
                     ]
                     let displayedStatus = object.filter { displayedKeys.contains($0.key) }
                     if !NSDictionary(dictionary: self.latestStatus).isEqual(to: displayedStatus) {
                         self.latestStatus = displayedStatus
                         self.rebuildMenu()
                     }
+                } else {
+                    self.latestStatus["health_state"] = "unavailable"
+                    self.latestStatus["health_message"] = "Could not read organizer status"
+                    self.rebuildMenu()
                 }
                 if self.statusRefreshPending {
                     self.statusRefreshPending = false
@@ -106,7 +112,12 @@ final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate, NSMenuDelegat
         let running = latestStatus["running"] as? Int ?? 0
         let backend = latestStatus["backend"] as? String
 
-        let stateText = enabled ? "Watching \(folderCount) folder\(folderCount == 1 ? "" : "s")" : "Automatic organization paused"
+        let mode = latestStatus["schedule_mode"] as? String ?? "watch"
+        let fallback = enabled ? (mode == "watch" ? "Watching \(folderCount) folder\(folderCount == 1 ? "" : "s")" : "Automatic organization scheduled") : "Automatic organization paused"
+        let stateText = latestStatus["health_message"] as? String ?? fallback
+        let healthState = latestStatus["health_state"] as? String ?? "unknown"
+        statusItem.button?.title = ["unavailable", "stale"].contains(healthState) ? "FO!" : "FO"
+        statusItem.button?.toolTip = stateText
         let state = NSMenuItem(title: stateText, action: nil, keyEquivalent: "")
         state.isEnabled = false
         menu.addItem(state)
@@ -114,7 +125,11 @@ final class FileOrganizerMenuBar: NSObject, NSApplicationDelegate, NSMenuDelegat
         var activityParts: [String] = []
         if running > 0 { activityParts.append("\(running) running") }
         if pending > 0 { activityParts.append("\(pending) waiting") }
-        if let backend, !backend.isEmpty { activityParts.append(backend) }
+        if mode == "watch", let backend, !backend.isEmpty { activityParts.append(backend) }
+        if let runtime = latestStatus["runtime"] as? [String: Any],
+           let issue = runtime["issue"] as? String, !issue.isEmpty {
+            activityParts.append(issue)
+        }
         if !activityParts.isEmpty {
             let activity = NSMenuItem(title: activityParts.joined(separator: " · "), action: nil, keyEquivalent: "")
             activity.isEnabled = false

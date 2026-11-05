@@ -15,6 +15,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import default_log_path, default_state_dir
+from schedule_runtime import managed_python
 from schedule_config import (
     SCHEDULE_MODE_DAILY,
     SCHEDULE_MODE_INTERVAL,
@@ -69,6 +70,9 @@ def _python_executable() -> str:
     run exits instantly. Prefer a stable symlink that resolves to the same
     interpreter today and keeps working after upgrades.
     """
+    managed = managed_python()
+    if managed is not None:
+        return str(managed)
     exe = Path(sys.executable)
     try:
         real = exe.resolve()
@@ -108,6 +112,18 @@ def _current_schedule() -> Tuple[str, str, int]:
         return SCHEDULE_MODE_DAILY, "00:00", 60
 
 
+def _preserve_app_wrapper(default: list) -> list:
+    """Keep permission-bearing custom app launchers when refreshing a service."""
+    try:
+        existing = plistlib.loads(launchd_plist_path().read_bytes()).get("ProgramArguments", [])
+        if (existing and isinstance(existing[0], str)
+                and ".app/Contents/MacOS/" in existing[0] and Path(existing[0]).is_file()):
+            return existing
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        pass
+    return default
+
+
 def build_launchd_plist() -> dict:
     out_log, err_log = _log_paths()
     plist: dict = {
@@ -136,8 +152,11 @@ def build_launchd_plist() -> dict:
             str(daemon_script()),
             "--once",
         ]
-        plist["ProgramArguments"] = args
+        plist["ProgramArguments"] = _preserve_app_wrapper(args)
         plist["StartCalendarInterval"] = {"Hour": hour, "Minute": minute}
+        # Custom permission-bearing wrappers may embed --foreground. Preserve
+        # the wrapper and communicate one-shot scheduling through its environment.
+        plist["EnvironmentVariables"] = {"FILE_ORG_DAEMON_ONCE": "1"}
         return plist
 
     # Watch mode: run the daemon's watch loop as a persistent agent. The loop
@@ -156,6 +175,7 @@ def build_launchd_plist() -> dict:
         ]
         plist["RunAtLoad"] = True
         plist["KeepAlive"] = True
+        plist["ProgramArguments"] = _preserve_app_wrapper(plist["ProgramArguments"])
         return plist
 
     # Interval mode with short intervals (≤ 60 min): use StartInterval + --once so
@@ -170,8 +190,9 @@ def build_launchd_plist() -> dict:
             str(daemon_script()),
             "--once",
         ]
-        plist["ProgramArguments"] = args
+        plist["ProgramArguments"] = _preserve_app_wrapper(args)
         plist["StartInterval"] = interval_minutes * 60
+        plist["EnvironmentVariables"] = {"FILE_ORG_DAEMON_ONCE": "1"}
         return plist
 
     # Long interval: keep the long-running loop alive in the background.
@@ -183,6 +204,7 @@ def build_launchd_plist() -> dict:
     ]
     plist["RunAtLoad"] = True
     plist["KeepAlive"] = True
+    plist["ProgramArguments"] = _preserve_app_wrapper(plist["ProgramArguments"])
     return plist
 
 

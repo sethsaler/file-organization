@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -44,7 +45,8 @@ from schedule_config import (
     watch_signature,
     watch_signature_fast,
 )
-from schedule_watch import create_event_monitor
+from schedule_watch import create_event_monitor, readiness_deferred, is_partial_download
+from schedule_runtime import runtime_health, activate_managed_runtime
 
 WATCH_CONFIG_RELOAD_SECONDS = 30.0
 
@@ -112,7 +114,7 @@ def _changed_watch_paths(cfg) -> Optional[Set[str]]:
             changed.add(job.path)
             continue
         try:
-            prev_sig = tuple(float(x) for x in prev)
+            prev_sig = tuple(prev)
         except (TypeError, ValueError):
             changed.add(job.path)
             continue
@@ -194,7 +196,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    activate_managed_runtime()
     args = parse_args()
+    if os.environ.get("FILE_ORG_DAEMON_ONCE") == "1":
+        args.once, args.foreground = True, False
     config_path = args.config.expanduser() if args.config else default_config_path()
 
     if args.foreground and args.once:
@@ -290,6 +295,19 @@ def main() -> None:
             remaining -= step
 
 
+def _job_settings_signature(job):
+    """Include rules/mapping content changes even when their configured path stays."""
+    import hashlib
+    parts = [tuple(build_organize_cmd(job)), job.expand_subfolders, job.min_unsorted_threshold]
+    for value in (job.rules_file, job.archive_mapping):
+        if value:
+            try:
+                parts.append(hashlib.blake2b(Path(value).expanduser().read_bytes(), digest_size=16).hexdigest())
+            except OSError:
+                parts.append(None)
+    return tuple(parts)
+
+
 def _run_watch_loop(
     config_path: Path,
     *,
@@ -322,7 +340,10 @@ def _run_watch_loop(
     maintenance_due: set = set()
     full_required: set = set()
     incremental_batches: dict = {}
-    primed_cleanup: set = set()
+    primed: dict = {}
+    retry_paths: dict = {}
+    config_stamp = None
+    settings_signatures = {}
     last_reload = 0.0
     last_full_scan = 0.0
     last_heartbeat = 0.0
@@ -347,7 +368,23 @@ def _run_watch_loop(
     if use_events:
         monitor.set_watched_paths(job.path for job in cfg.folders if job.enabled)
 
-    backend = monitor.backend_name() if use_events else "polling"
+    def native_job_paths():
+        if not use_events:
+            return set()
+        if hasattr(monitor, "watched_job_paths"):
+            return monitor.watched_job_paths()
+        return {job.path for job in cfg.folders if job.enabled}
+
+    event_backend = monitor.backend_name() if use_events else None
+
+    def current_backend():
+        active = {job.path for job in cfg.folders if job.enabled}
+        covered = native_job_paths()
+        if not use_events or (active and not covered):
+            return "polling"
+        return event_backend if active <= covered else f"{event_backend}+polling"
+
+    backend = current_backend()
     status = WatchStatus(
         backend=backend,
         poll_seconds=WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds,
@@ -357,6 +394,10 @@ def _run_watch_loop(
         folders=(job.path for job in cfg.folders if job.enabled),
         disabled={job.path: job.last_error for job in auto_disabled_jobs(cfg)},
     )
+
+    status.data["runtime"] = runtime_health()
+    status.data["missing_watch_paths"] = sorted({j.path for j in cfg.folders if j.enabled} - native_job_paths())
+    status.flush(force=True)
 
     print(json.dumps({
         "watch": True,
@@ -371,8 +412,30 @@ def _run_watch_loop(
         sub_cfg: Optional[object] = None
         summary: Optional[dict] = None
         run_error: Optional[str] = None
+        batch = incremental_batches.get(path)
+        deferred = set()
         try:
             sub_cfg = load_config(config_path)
+            job = next((j for j in sub_cfg.folders if j.path == path and j.enabled), None)
+            if job is None or (not force and not sub_cfg.scheduler_enabled) or should_stop():
+                return
+            request_signature = _job_settings_signature(job)
+            stable_seconds = max(1.0, sub_cfg.watch_quiet_seconds)
+            deferred = readiness_deferred(job, batch.get(path) if batch else None,
+                                          stable_seconds=stable_seconds, should_stop=should_stop)
+            # Re-read user intent after readiness sampling; a pause takes effect
+            # before launching the organizer even when the worker was waiting.
+            sub_cfg = load_config(config_path)
+            if should_stop() or (not force and not sub_cfg.scheduler_enabled):
+                return
+            current_job = next((j for j in sub_cfg.folders if j.path == path and j.enabled), None)
+            if current_job is None:
+                return
+            if _job_settings_signature(current_job) != request_signature:
+                with state_lock:
+                    dirty_since[path] = time.monotonic()
+                    full_required.add(path)
+                return
             summary = run_enabled_folders(
                 sub_cfg,
                 config_path,
@@ -381,9 +444,14 @@ def _run_watch_loop(
                 label="watch",
                 file_log_path=file_log_path,
                 only_paths={path},
-                **({"changed_paths": incremental_batches[path]} if path in incremental_batches else {}),
+                **({"changed_paths": batch} if batch else {}),
+                deferred_paths={path: deferred},
+                file_stable_seconds=stable_seconds,
             )
             if summary:
+                receipts = summary.pop("watch_mutations", {})
+                if use_events and hasattr(monitor, "acknowledge_mutations"):
+                    monitor.acknowledge_mutations(receipts)
                 _notify_run(sub_cfg, summary, "watch")
         except Exception as exc:
             run_error = str(exc)
@@ -393,8 +461,10 @@ def _run_watch_loop(
             job = next((j for j in sub_cfg.folders if j.path == path), None) if sub_cfg else None
             target = job if job is not None else FolderJob(path=path)
             try:
-                full_signature = watch_signature(target)
-                fast_signature = watch_signature_fast(target) if not use_events else None
+                # A delta run never pays a full-tree post-run scan. Periodic
+                # reconciliation handles its global cleanup and baseline.
+                full_signature = watch_signature(target) if not batch else None
+                fast_signature = watch_signature_fast(target) if path not in native_job_paths() else None
             except OSError:
                 full_signature = None
                 fast_signature = None
@@ -415,7 +485,13 @@ def _run_watch_loop(
                 elif not succeeded:
                     reconciled.pop(path, None)
                 in_flight.discard(path)
+                deferred.update(summary.get("deferred_paths", []) if summary else [])
+                retry = {p for p in deferred if not is_partial_download(p)}
+                if retry:
+                    retry_paths[path] = retry
                 recheck = summary.get("recheck_seconds") if summary else None
+                if retry:
+                    recheck = min(recheck, 1.0) if recheck is not None else 1.0
                 if recheck is not None:
                     # An empty folder is still inside its grace window and no further
                     # event may arrive for it: come back once it becomes removable.
@@ -439,16 +515,23 @@ def _run_watch_loop(
                         last_summary=summary,
                     )
                 else:
-                    status.update_folder(path, "idle", error="", last_summary=summary or {})
+                    status.update_folder(path, "waiting" if path in dirty_since else "idle",
+                                         error="", last_summary=summary or {})
 
     full_scan_interval = WATCH_SAFETY_SCAN_SECONDS if use_events else WATCH_FULL_SCAN_SECONDS
 
     try:
         while not should_stop():
             now = time.monotonic()
-            if now - last_reload >= WATCH_CONFIG_RELOAD_SECONDS:
+            try:
+                current_stamp = config_path.stat().st_mtime_ns
+            except OSError:
+                current_stamp = None
+            if current_stamp != config_stamp or now - last_reload >= WATCH_CONFIG_RELOAD_SECONDS:
                 cfg = load_config(config_path)
+                config_stamp = current_stamp
                 last_reload = now
+                settings_signatures = {job.path: _job_settings_signature(job) for job in cfg.folders if job.enabled}
                 if normalize_schedule_mode(cfg.schedule_mode) != SCHEDULE_MODE_WATCH:
                     print(json.dumps({"watch": False, "reason": "schedule_mode changed"}, indent=2))
                     return
@@ -460,18 +543,36 @@ def _run_watch_loop(
                     (job.path for job in cfg.folders if job.enabled),
                     disabled={job.path: job.last_error for job in auto_disabled_jobs(cfg)},
                 )
+                status.data["missing_watch_paths"] = sorted({j.path for j in cfg.folders if j.enabled} - native_job_paths())
 
+            covered_paths = native_job_paths()
+            all_paths = {j.path for j in cfg.folders if j.enabled}
+            full_scan_interval = (WATCH_SAFETY_SCAN_SECONDS if all_paths <= covered_paths
+                                  else WATCH_FULL_SCAN_SECONDS)
             do_full_scan = now - last_full_scan >= full_scan_interval
             if do_full_scan:
                 last_full_scan = now
+                settings_signatures = {job.path: _job_settings_signature(job) for job in cfg.folders if job.enabled}
+            status.data["backend"] = current_backend()
+            status.data["full_scan_seconds"] = full_scan_interval
+            status.data["poll_seconds"] = WATCH_EVENT_TICK_SECONDS if all_paths <= covered_paths else cfg.watch_poll_seconds
 
             if force or cfg.scheduler_enabled:
-                # Events only report changes, so empty folders that already exist when a
-                # cleanup-only folder starts being watched need one initial pass.
+                # Always reconcile newly watched/enabled roots and changed routing.
+                # A baseline alone misses files received while the service was down.
                 with state_lock:
+                    enabled_paths = {job.path for job in cfg.folders if job.enabled}
+                    for removed in set(primed) - enabled_paths:
+                        primed.pop(removed, None)
+                        reconciled.pop(removed, None)
                     for job in cfg.folders:
-                        if job.enabled and job.empty_dirs_only and job.path not in primed_cleanup:
-                            primed_cleanup.add(job.path)
+                        if not job.enabled:
+                            continue
+                        signature = settings_signatures[job.path]
+                        if primed.get(job.path) != signature:
+                            primed[job.path] = signature
+                            full_required.add(job.path)
+                            reconciled.pop(job.path, None)
                             dirty_since.setdefault(job.path, now)
                 due_paths = set()
                 enabled = [job for job in cfg.folders if job.enabled]
@@ -479,8 +580,7 @@ def _run_watch_loop(
                     scan_jobs = [job for job in enabled if job.path not in in_flight]
                 scan_paths = {job.path for job in scan_jobs}
                 new_fast_sigs = (
-                    {job.path: watch_signature_fast(job) for job in scan_jobs}
-                    if not use_events else {}
+                    {job.path: watch_signature_fast(job) for job in scan_jobs if job.path not in covered_paths}
                 )
                 new_full_sigs = (
                     {job.path: watch_signature(job) for job in scan_jobs}
@@ -494,7 +594,7 @@ def _run_watch_loop(
                             continue
                         sig_changed = False
 
-                        if not use_events:
+                        if path not in covered_paths:
                             fast_prev = signatures_fast.get(path)
                             fast_sig = new_fast_sigs[path]
                             signatures_fast[path] = fast_sig
@@ -519,29 +619,38 @@ def _run_watch_loop(
 
                         started = dirty_since.get(path)
                         if started is not None and now - started >= cfg.watch_quiet_seconds:
-                            due_paths.add(path)
                             del dirty_since[path]
+                            changes = (monitor.take_changes(path, directories=True) if job.empty_dirs_only
+                                       else monitor.take_changes(path)) if path in covered_paths else None
+                            retry = retry_paths.pop(path, set())
+                            if retry and path not in full_required:
+                                changes = set(changes or ()) | retry
+                            if changes == set() and path not in full_required:
+                                status.update_folder(path, "idle")
+                                continue
+                            due_paths.add(path)
                             in_flight.add(path)
-                            changes = monitor.take_changes(path) if use_events else None
                             eligible = (changes and reconciled.get(path) == build_organize_cmd(job)
                                         and path not in full_required
                                         and not job.expand_subfolders
-                                        and not job.rules_file and not job.archive_root
-                                        and not job.random_names_after_organize
-                                        and not job.empty_dirs_only
-                                        and job.strategy == "flatten-root")
+                                        and not job.rules_file and not job.archive_root)
                             if eligible:
                                 incremental_batches[path] = {path: changes}
                             status.update_folder(path, "running")
 
                 for path in due_paths:
                     executor.submit(_organize_path, path)
+            else:
+                # Resuming schedules one full reconciliation for downtime arrivals.
+                primed.clear()
 
             if now - last_heartbeat >= 5.0:
                 last_heartbeat = now
+                if use_events and hasattr(monitor, "prune_mutations"):
+                    monitor.prune_mutations()
                 status.heartbeat()
 
-            poll_seconds = WATCH_EVENT_TICK_SECONDS if use_events else cfg.watch_poll_seconds
+            poll_seconds = WATCH_EVENT_TICK_SECONDS if all_paths <= covered_paths else cfg.watch_poll_seconds
             remaining = poll_seconds
             while remaining > 0:
                 if should_stop():

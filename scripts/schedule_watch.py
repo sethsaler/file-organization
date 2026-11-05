@@ -12,6 +12,9 @@ daemon falls back to the existing mtime-polling loop unchanged.
 from __future__ import annotations
 
 import sys
+import os
+import stat
+import time
 import threading
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional
@@ -22,6 +25,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from org_manifest import ORGANIZER_DIR_NAME
 from org_paths import normalize_folder_input
+from org_exclude import merge_exclude_patterns, path_excluded
 
 try:  # pragma: no cover - import guard exercised via events_available()
     from watchdog.events import FileSystemEventHandler
@@ -54,6 +58,91 @@ def is_noise_path(path: str) -> bool:
         return True
     organizer = ORGANIZER_DIR_NAME.casefold()
     return any(part.casefold() == organizer for part in p.parts)
+
+
+# Files with these names are owned by a writer until their final rename.
+PARTIAL_SUFFIXES = (".part", ".partial", ".crdownload", ".download", ".tmp", ".filepart")
+_PROTECTED_DIRS = {".organizer", "for deletion", "duplicates", "needs review"}
+
+
+def is_partial_download(path: str) -> bool:
+    return any(part.casefold().endswith(PARTIAL_SUFFIXES) for part in Path(path).parts)
+
+
+def watch_snapshot(job, *, recursive: bool = True) -> dict:
+    """Metadata inventory without following symlinks or reading file content.
+
+    Unlike directory-only mtimes, file size and nanosecond times notice a writer
+    appending to an existing file. Fast polling reads only direct root entries;
+    periodic recursive scans handle deeper changes.
+    """
+    base = normalize_folder_input(job.path).resolve()
+    patterns = merge_exclude_patterns(job.exclude, use_defaults=job.exclude_defaults)
+    entries = {}
+    stack = [base]
+    while stack:
+        directory = stack.pop()
+        try:
+            st = directory.lstat()
+            entries[str(directory)] = (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            with os.scandir(directory) as stream:
+                for entry in stream:
+                    path = Path(entry.path)
+                    if is_noise_path(str(path)) or path_excluded(path, base, patterns):
+                        continue
+                    if not job.include_hidden and entry.name.startswith("."):
+                        continue
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(st.st_mode):
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        if entry.name.casefold() in _PROTECTED_DIRS:
+                            continue
+                        entries[str(path)] = (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+                        if recursive and job.recursive:
+                            stack.append(path)
+                    elif stat.S_ISREG(st.st_mode):
+                        entries[str(path)] = (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        except OSError:
+            continue
+    return entries
+
+
+def _candidate_snapshot(job, paths=None) -> dict:
+    if paths is None:
+        return {path: value for path, value in watch_snapshot(job).items() if stat.S_ISREG(value[2])}
+    values = {}
+    for value in paths:
+        path = Path(value)
+        try:
+            st = path.lstat()
+            if stat.S_ISREG(st.st_mode):
+                values[str(path)] = (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        except OSError:
+            continue
+    return values
+
+
+def readiness_deferred(job, paths=None, *, stable_seconds: float = 1.0, should_stop=lambda: False) -> set:
+    """Observe candidate files across a stability interval before a watch run.
+
+    This runs in the folder worker, never on the event-loop thread. A final
+    age/identity check in the organizer protects files arriving during execution.
+    """
+    if job.empty_dirs_only:
+        return set()
+    before = _candidate_snapshot(job, paths)
+    if not before:
+        return set()
+    deadline = time.monotonic() + stable_seconds
+    while time.monotonic() < deadline and not should_stop():
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    after = _candidate_snapshot(job, paths)
+    return {path for path, identity in after.items()
+            if before.get(path) != identity or is_partial_download(path)}
 
 
 def resolve_watch_root(path: str, roots: Dict[str, str]) -> Optional[str]:
@@ -120,6 +209,10 @@ class WatchEventMonitor:
         self._lock = threading.Lock()
         self._roots: Dict[str, str] = {}  # normalized root -> job path
         self._changes: Dict[str, Optional[set]] = {}
+        self._directory_changes: Dict[str, set] = {}
+        self._overflows: set = set()
+        self._directory_paths: Dict[str, set] = {}
+        self._own_mutations: dict = {}
         self._watches: Dict[str, object] = {}  # normalized root -> ObservedWatch
         self._handler = _DirtyHandler(self)
         self._observer = Observer()
@@ -161,6 +254,9 @@ class WatchEventMonitor:
                         self._watches.pop(root, None)
                     old_job = self._roots.pop(root, None)
                     self._changes.pop(old_job, None)
+                    self._directory_changes.pop(old_job, None)
+                    self._overflows.discard(old_job)
+                    self._directory_paths.pop(old_job, None)
             for root, job_path in desired.items():
                 self._roots[root] = job_path
                 if root in self._watches:
@@ -178,7 +274,50 @@ class WatchEventMonitor:
         with self._lock:
             return set(self._roots.values())
 
+    def acknowledge_mutations(self, receipts: dict) -> None:
+        """Suppress only events whose current identity equals our own mutation.
+
+        An actual concurrent edit changes the identity and remains queued. Both
+        already queued events and delayed OS events pass through the same check.
+        Receipts expire so a recreated/deleted path is not suppressed forever.
+        """
+        now = time.monotonic()
+        with self._lock:
+            existing = getattr(self, "_own_mutations", {})
+            self._own_mutations = {path: record for path, record in existing.items() if record[0] > now}
+            for path, identity in receipts.items():
+                normalized = os.path.abspath(path)
+                self._own_mutations[normalized] = (now + 120.0, identity)
+
+    def prune_mutations(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._own_mutations = {path: record for path, record in getattr(self, "_own_mutations", {}).items()
+                                   if record[0] > now}
+
+    def _is_own_mutation(self, path: str) -> bool:
+        normalized = os.path.abspath(path)
+        with self._lock:
+            record = getattr(self, "_own_mutations", {}).get(normalized)
+        if record is None or record[0] <= time.monotonic():
+            return False
+        expected = record[1]
+        try:
+            info = Path(normalized).lstat()
+        except FileNotFoundError:
+            return expected is None
+        except OSError:
+            return False
+        if expected is None:
+            return False
+        actual = {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+                  "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+                  "directory": stat.S_ISDIR(info.st_mode)}
+        return actual == expected
+
     def _dispatch(self, path: str, *, is_directory: bool = False) -> None:
+        if self._is_own_mutation(path):
+            return
         with self._lock:
             roots = dict(self._roots)
         if is_directory:
@@ -195,16 +334,46 @@ class WatchEventMonitor:
         if job_path is not None:
             with self._lock:
                 changes = self._changes.setdefault(job_path, set())
-                if is_directory or (changes is not None and len(changes) >= 512):
+                # Keep directory paths for cleanup-only jobs, which can inspect
+                # affected parents without rescanning a populated tree.
+                if not hasattr(self, "_directory_changes"):
+                    self._directory_changes = {}
+                    self._overflows = set()
+                if not hasattr(self, "_directory_paths"):
+                    self._directory_paths = {}
+                directory_changes = self._directory_changes.setdefault(job_path, set())
+                if is_directory:
+                    self._directory_paths.setdefault(job_path, set()).add(path)
+                    directory_changes.update(changes or ())
+                    directory_changes.add(path)
                     self._changes[job_path] = None
                 elif changes is not None:
                     changes.add(path)
+                elif directory_changes:
+                    directory_changes.add(path)
+                if len(changes or ()) >= 512 or len(directory_changes) >= 512:
+                    self._changes[job_path] = None
+                    self._overflows.add(job_path)
+                    directory_changes.clear()
             self._on_dirty(job_path)
 
-    def take_changes(self, job_path: str) -> Optional[set]:
-        """Drain event paths; None requests full reconciliation (dirs/overflow)."""
+    def take_changes(self, job_path: str, *, directories: bool = False) -> Optional[set]:
+        """Drain user changes; empty set means queued events were all our own."""
         with self._lock:
-            return self._changes.pop(job_path, None)
+            pending = job_path in self._changes
+            result = self._changes.pop(job_path, None)
+            paths = getattr(self, "_directory_changes", {}).pop(job_path, set())
+            directory_paths = getattr(self, "_directory_paths", {}).pop(job_path, set())
+            overflow = job_path in getattr(self, "_overflows", set())
+            if hasattr(self, "_overflows"):
+                self._overflows.discard(job_path)
+        if overflow or not pending:
+            return None
+        retained = {path for path in (result or set()) | paths if not self._is_own_mutation(path)}
+        retained_directories = directory_paths & retained
+        if retained_directories and not directories:
+            return None
+        return retained
 
     def stop(self) -> None:
         with self._lock:
@@ -212,6 +381,10 @@ class WatchEventMonitor:
             self._watches.clear()
             self._roots.clear()
             self._changes.clear()
+            self._directory_changes.clear()
+            self._overflows.clear()
+            self._directory_paths.clear()
+            self._own_mutations.clear()
         for watch in watches:
             try:
                 self._observer.unschedule(watch)

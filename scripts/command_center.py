@@ -7,7 +7,10 @@ their state through a safer preview-first workflow and a watch-folder overview.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import time
 import queue
 import subprocess
 import sys
@@ -24,7 +27,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from org_logging import append_history_entry, read_history
-from org_manifest import list_manifests
+from org_manifest import is_manifest_active, list_manifests, read_manifest_data
 from org_paths import normalize_folder_input
 from org_rules import (
     FALLBACK_BUCKET,
@@ -39,16 +42,16 @@ from org_rules import (
 )
 from org_safety import (
     SafetyItem,
+    ManifestIndex,
     approve_review_item,
     handoff_to_dedupe,
     manifest_for_item,
     move_to_trash,
-    original_source_for_review,
-    restore_item_run,
     reveal_in_file_manager,
     scan_safety_items,
 )
 from org_watch_status import read_watch_status, watch_status_path
+from quick_controls import watch_health_summary
 from schedule_config import (
     SCHEDULE_MODE_WATCH,
     auto_disabled_jobs,
@@ -93,6 +96,47 @@ def _human_size(value: int) -> str:
             return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
         amount /= 1024.0
     return f"{amount:.1f} TB"
+
+
+
+def file_content_identity(raw: str) -> tuple:
+    """Fingerprint actual rule contents, including same-size/same-mtime edits."""
+    if not raw.strip():
+        return ()
+    path = Path(raw).expanduser()
+    try:
+        return (str(path.resolve()), hashlib.sha256(path.read_bytes()).hexdigest())
+    except OSError as exc:
+        return (str(path), type(exc).__name__)
+
+
+def scan_review_queue(root: Path, cancel) -> list:
+    rows = []
+    base = root / NEEDS_REVIEW_DIR_NAME
+    for directory, dirs, names in os.walk(base, followlinks=False):
+        if cancel.is_set():
+            break
+        dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
+        for name in names:
+            if cancel.is_set():
+                break
+            path = Path(directory) / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                stat = path.stat()
+            except OSError:
+                continue
+            rows.append((path, stat.st_size, stat.st_mtime))
+    return sorted(rows, key=lambda row: (-row[2], str(row[0]).casefold()))
+
+
+def review_rule_key(source: Path, criterion: str) -> str:
+    if criterion == "Extension":
+        if not source.suffix:
+            raise ValueError("A selected file has no extension; choose Filename or Parent folder")
+        return source.suffix.casefold()
+    return source.name if criterion == "Filename" else source.parent.name
 
 
 class CollapsibleFrame(ttk.Frame):
@@ -216,6 +260,11 @@ class CompactSchedulePanel(SchedulePanel):
             side="right", padx=(0, 8)
         )
 
+        preview_row = ttk.Frame(compact)
+        preview_row.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(preview_row, textvariable=self.add_preview_status).pack(side="left")
+        self.cancel_add_preview_button = ttk.Button(preview_row, text="Cancel preview", command=self._cancel_add_preview)
+        self.next_run_var.trace_add("write", lambda *_: self.compact_status_var.set(self.next_run_var.get()))
         self._tree_item_to_index = {}
         self._refresh_tree()
 
@@ -238,8 +287,12 @@ class CompactSchedulePanel(SchedulePanel):
         if not job.dry_run_verified:
             status = "Needs preview"
         elif not job.enabled:
+            status = "Off after failures" if is_auto_disabled(self.cfg, job) else "Paused"
+        elif not self.cfg.scheduler_enabled:
             status = "Paused"
-        elif self.cfg.scheduler_enabled and mode == SCHEDULE_MODE_WATCH:
+        elif self._service_snapshot.get("running") is False:
+            status = "Service down"
+        elif mode == SCHEDULE_MODE_WATCH:
             status = "Watching"
         else:
             status = "Scheduled"
@@ -440,10 +493,16 @@ class CommandCenterApp:
 
         self._configure_styles()
         self._out_queue: queue.Queue = queue.Queue()
+        self._background_queue: queue.Queue = queue.Queue()
+        self._background_tasks = {}
+        self._closed = False
+        self._preview_request_fingerprint = None
+        self._job_generation = 0
         self._worker: threading.Thread | None = None
         self._active_proc: subprocess.Popen | None = None
         self._cancel_requested = False
         self._active_target = ""
+        self._phase_by_label = {}
         self._last_preview_fingerprint: tuple | None = None
         self._preview_change_count = 0
         self._last_manifest: str | None = None
@@ -482,6 +541,12 @@ class CommandCenterApp:
             value=str(default_config_path().parent / "rules.json")
         )
         self._review_items: list[Path] = []
+        self._review_rows = []
+        self._review_selected_paths = set()
+        self._review_page = 0
+        self.review_search_var = tk.StringVar()
+        self.review_type_var = tk.StringVar(value="All files")
+        self._safety_manifest_index = None
         self.safety_root_var = tk.StringVar()
         self.safety_status_var = tk.StringVar(value="")
         self._safety_items: list[SafetyItem] = []
@@ -530,10 +595,48 @@ class CommandCenterApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._show_page("overview")
         self._refresh_overview()
+        self._poll_background()
 
     # ------------------------------------------------------------------
     # Shell and navigation
     # ------------------------------------------------------------------
+
+    def _background(self, name, work, finish) -> None:
+        self._cancel_background(name)
+        cancel = threading.Event()
+        self._background_tasks[name] = cancel
+
+        def run():
+            try:
+                result, error = work(cancel), None
+            except Exception as exc:
+                result, error = None, str(exc)
+            self._background_queue.put((name, cancel, finish, result, error))
+
+        threading.Thread(target=run, daemon=True, name=f"organizer-{name}").start()
+
+    def _cancel_background(self, name) -> None:
+        event = self._background_tasks.pop(name, None)
+        if event is not None:
+            event.set()
+
+    def _cancel_scan(self, name) -> None:
+        self._cancel_background(name)
+        variable = self.safety_status_var if name == "safety" else self.review_status_var
+        variable.set("Scan cancelled")
+
+    def _poll_background(self) -> None:
+        if self._closed:
+            return
+        try:
+            while True:
+                name, event, finish, result, error = self._background_queue.get_nowait()
+                if self._background_tasks.get(name) is event and not event.is_set():
+                    del self._background_tasks[name]
+                    finish(result, error)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_background)
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -652,6 +755,8 @@ class CommandCenterApp:
         page = self._pages[key]
         self._current_page = key
         page.tkraise()
+        if hasattr(self, "schedule_panel"):
+            self.schedule_panel.status_visible = key == "watched"
         for name, button in self._nav_buttons.items():
             selected = name == key
             button.configure(
@@ -756,9 +861,10 @@ class CommandCenterApp:
         watching = bool(cfg.scheduler_enabled) and normalize_schedule_mode(cfg.schedule_mode) == SCHEDULE_MODE_WATCH
         watch_health = read_watch_status()
         folder_health = watch_health.get("folders") if isinstance(watch_health.get("folders"), dict) else {}
+        health_summary = watch_health_summary(cfg, watch_health, self.schedule_panel._service_snapshot.get("running"))
         if watching:
-            self.overview_status_title.set(f"Organizer is watching {len(enabled)} folder{'s' if len(enabled) != 1 else ''}")
-            self.overview_status_subtitle.set("Files will be organized automatically when they arrive.")
+            self.overview_status_title.set(health_summary["health_message"])
+            self.overview_status_subtitle.set("Files will be organized automatically when they arrive." if health_summary["health_state"] == "watching" else "Open Watched folders to check the background service.")
             self.pause_button_var.set("Pause all watching")
         elif cfg.scheduler_enabled:
             self.overview_status_title.set(f"Automatic organization is active for {len(enabled)} folder{'s' if len(enabled) != 1 else ''}")
@@ -800,6 +906,10 @@ class CommandCenterApp:
                 status = "Needs preview"
             elif not job.enabled:
                 status = "Off after failures" if is_auto_disabled(cfg, job) else "Paused"
+            elif not cfg.scheduler_enabled:
+                status = "Paused"
+            elif watching and health_summary["health_state"] != "watching":
+                status = "Check watcher"
             elif watching:
                 detail = folder_health.get(job.path) if isinstance(folder_health, dict) else None
                 state = str((detail or {}).get("state") or "idle") if isinstance(detail, dict) else "idle"
@@ -1075,6 +1185,9 @@ class CommandCenterApp:
             self.unmatched_mode_var.get(),
             self.archive_root_var.get().strip(),
             self.archive_mapping_var.get().strip(),
+            self.skip_randomly_renamed_var.get(),
+            file_content_identity(self.rules_file_var.get()),
+            file_content_identity(self.archive_mapping_var.get()),
         )
 
     # ------------------------------------------------------------------
@@ -1134,6 +1247,7 @@ class CommandCenterApp:
         self.review_status_var = tk.StringVar(value="")
         ttk.Label(review_header, textvariable=self.review_status_var, style="Muted.TLabel").pack(side="left", padx=(10, 0))
         ttk.Button(review_header, text="Refresh", command=self._refresh_review_queue).pack(side="right")
+        ttk.Button(review_header, text="Cancel", command=lambda: self._cancel_scan("review")).pack(side="right", padx=(0, 6))
 
         decision = ttk.Frame(page)
         decision.grid(row=5, column=0, sticky="ew", pady=(0, 8))
@@ -1152,11 +1266,21 @@ class CommandCenterApp:
         frame.grid(row=6, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
+        filters = ttk.Frame(frame)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(filters, text="Search").pack(side="left")
+        ttk.Entry(filters, textvariable=self.review_search_var).pack(side="left", fill="x", expand=True, padx=6)
+        self.review_type_filter = ttk.Combobox(filters, textvariable=self.review_type_var, values=("All files",), state="readonly", width=12)
+        self.review_type_filter.pack(side="right")
+        self.review_search_var.trace_add("write", lambda *_: self._filter_review())
+        self.review_type_var.trace_add("write", lambda *_: self._filter_review())
+        frame.rowconfigure(0, weight=0)
+        frame.rowconfigure(1, weight=1)
         self.review_tree = ttk.Treeview(
             frame,
             columns=("name", "location", "size", "modified"),
             show="headings",
-            selectmode="browse",
+            selectmode="extended",
         )
         for key, label in (("name", "Item"), ("location", "Review location"), ("size", "Size"), ("modified", "Modified")):
             self.review_tree.heading(key, text=label)
@@ -1164,12 +1288,17 @@ class CommandCenterApp:
         self.review_tree.column("location", width=330)
         self.review_tree.column("size", width=75, anchor="e", stretch=False)
         self.review_tree.column("modified", width=125, stretch=False)
-        self.review_tree.grid(row=0, column=0, sticky="nsew")
-        ttk.Scrollbar(frame, orient="vertical", command=self.review_tree.yview).grid(row=0, column=1, sticky="ns")
+        self.review_tree.grid(row=1, column=0, sticky="nsew")
+        self.review_tree.bind("<<TreeviewSelect>>", lambda _event: self._capture_review_selection())
+        ttk.Scrollbar(frame, orient="vertical", command=self.review_tree.yview).grid(row=1, column=1, sticky="ns")
         actions = ttk.Frame(page)
         actions.grid(row=7, column=0, sticky="ew", pady=(10, 0))
         ttk.Button(actions, text="Approve selected", style="Primary.TButton", command=self._approve_review_selected).pack(side="left")
         ttk.Button(actions, text="Reveal in Finder", command=self._reveal_review_selected).pack(side="left", padx=(8, 0))
+        self.review_next = ttk.Button(actions, text="Next →", command=lambda: self._change_review_page(1))
+        self.review_next.pack(side="right")
+        self.review_previous = ttk.Button(actions, text="← Previous", command=lambda: self._change_review_page(-1))
+        self.review_previous.pack(side="right", padx=6)
 
     def _sync_review_root_from_context(self) -> None:
         if self.review_root_var.get().strip():
@@ -1260,45 +1389,80 @@ class CommandCenterApp:
         self._show_page("organize")
 
     def _refresh_review_queue(self) -> None:
-        for item in self.review_tree.get_children():
-            self.review_tree.delete(item)
         raw = self.review_root_var.get().strip()
+        self._capture_review_selection()
+        data_root = normalize_folder_input(raw) if raw else None
+        if data_root != getattr(self, "_review_data_root", None):
+            self._review_selected_paths.clear()
+        self._review_data_root = data_root
+        self._review_rows = []
+        self._review_items = []
+        self._review_page = 0
+        self._render_review_page()
         if not raw:
             self.review_status_var.set("Choose an organizer root")
-            self._review_items = []
             return
         root = normalize_folder_input(raw)
-        review_root = root / NEEDS_REVIEW_DIR_NAME
-        if not review_root.is_dir():
-            self.review_status_var.set("Queue is empty")
-            self._review_items = []
-            return
-        try:
-            items = [path for path in review_root.rglob("*") if path.is_file()]
-        except OSError:
-            items = []
-        def modified_time(path: Path) -> float:
-            try:
-                return path.stat().st_mtime
-            except OSError:
-                return 0.0
+        self.review_status_var.set("Scanning review queue…")
+        def finish(rows, error):
+            if self.review_root_var.get().strip() != raw:
+                self.review_status_var.set("Folder changed. Refresh to load its queue.")
+                return
+            if error:
+                self.review_status_var.set(f"Could not load queue: {error}")
+                return
+            self._review_rows = rows
+            types = sorted({row[0].suffix.casefold() or "No extension" for row in rows})
+            self.review_type_filter.configure(values=("All files", *types))
+            if self.review_type_var.get() not in ("All files", *types):
+                self.review_type_var.set("All files")
+            self._render_review_page()
+        self._background("review", lambda cancel: scan_review_queue(root, cancel), finish)
 
-        items.sort(key=modified_time, reverse=True)
-        self._review_items = items[:1000]
-        for index, path in enumerate(self._review_items):
+    def _capture_review_selection(self) -> None:
+        if not hasattr(self, "_review_selected_paths"):
+            self._review_selected_paths = set()
+        self._review_selected_paths.difference_update(self._review_items)
+        for key in self.review_tree.selection():
             try:
-                stat = path.stat()
-                size = _human_size(stat.st_size)
-                modified = _display_time(datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat())
-            except OSError:
-                size, modified = "—", "Unknown"
-            self.review_tree.insert(
-                "",
-                "end",
-                iid=f"review-{index}",
-                values=(path.name, _short_path(str(path.relative_to(root)), 58), size, modified),
-            )
-        self.review_status_var.set(f"{len(self._review_items)} item{'s' if len(self._review_items) != 1 else ''}")
+                self._review_selected_paths.add(self._review_items[int(key.split("-")[-1])])
+            except (ValueError, IndexError):
+                continue
+
+    def _filter_review(self) -> None:
+        self._review_page = 0
+        self._render_review_page()
+
+    def _change_review_page(self, delta: int) -> None:
+        self._review_page = max(0, self._review_page + delta)
+        self._render_review_page()
+
+    def _render_review_page(self) -> None:
+        if not hasattr(self, "review_tree"):
+            return
+        self._capture_review_selection()
+        query = self.review_search_var.get().strip().casefold()
+        kind = self.review_type_var.get()
+        rows = [row for row in self._review_rows if query in str(row[0]).casefold()
+                and (kind == "All files" or (row[0].suffix.casefold() or "No extension") == kind)]
+        page_size = 100
+        self._review_page = min(self._review_page, max(0, (len(rows) - 1) // page_size))
+        start = self._review_page * page_size
+        visible = rows[start:start + page_size]
+        self._review_items = [row[0] for row in visible]
+        for item in self.review_tree.get_children():
+            self.review_tree.delete(item)
+        root = getattr(self, "_review_data_root", None) or normalize_folder_input(self.review_root_var.get().strip())
+        for index, (path, size, modified) in enumerate(visible):
+            self.review_tree.insert("", "end", iid=f"review-{index}", values=(
+                path.name, _short_path(str(path.relative_to(root)), 58), _human_size(size),
+                _display_time(datetime.fromtimestamp(modified).astimezone().isoformat())))
+        selected = [f"review-{index}" for index, path in enumerate(self._review_items) if path in self._review_selected_paths]
+        if selected:
+            self.review_tree.selection_set(selected)
+        self.review_status_var.set(f"{start + 1 if rows else 0}–{start + len(visible)} of {len(rows)} matching · {len(self._review_rows)} total · {len(self._review_selected_paths)} selected")
+        self.review_previous.configure(state="normal" if start else "disabled")
+        self.review_next.configure(state="normal" if start + page_size < len(rows) else "disabled")
 
     def _selected_review_item(self) -> Optional[Path]:
         selection = self.review_tree.selection()
@@ -1311,36 +1475,86 @@ class CommandCenterApp:
             return None
 
     def _approve_review_selected(self) -> None:
-        item = self._selected_review_item()
-        if item is None:
+        if any(name in self._background_tasks for name in ("review-approve", "review-prepare")):
+            messagebox.showinfo("Needs Review", "An approval is already in progress.")
+            return
+        self._capture_review_selection()
+        items = sorted(self._review_selected_paths, key=str)
+        if not items:
+            messagebox.showwarning("Needs Review", "Select one or more items first.")
             return
         root = normalize_folder_input(self.review_root_var.get().strip())
+        if root != getattr(self, "_review_data_root", root):
+            messagebox.showwarning("Needs Review", "Folder changed. Refresh its queue before approving files.")
+            return
         destination = self.review_destination_var.get().strip()
-        if not messagebox.askyesno("Approve reviewed item", f"Move:\n{item.name}\n\nTo:\n{destination}\n\nA recovery backup will be created."):
+        remember = self.review_remember_var.get()
+        criterion = self.review_criterion_var.get()
+        rules_path = Path(self.review_rules_file_var.get().strip()).expanduser()
+        if not destination or Path(destination).is_absolute() or ".." in Path(destination).parts:
+            messagebox.showerror("Needs Review", "Choose a destination folder inside this organizer root.")
             return
-        original = original_source_for_review(root, item)
-        try:
-            target, _manifest = approve_review_item(root, item, destination)
-        except (OSError, ValueError) as exc:
-            messagebox.showerror("Needs Review", str(exc))
-            return
-        rule_note = ""
-        if self.review_remember_var.get():
-            rules_path = Path(self.review_rules_file_var.get().strip()).expanduser()
-            try:
-                rule = append_rule_for_review_choice(
-                    rules_path,
-                    source=original,
-                    destination=destination,
-                    criterion=self.review_criterion_var.get(),
-                )
-                self.rules_file_var.set(str(rules_path))
-                self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
-                rule_note = f"\n\nRemembered rule: {rule.name}"
-            except (OSError, ValueError) as exc:
-                rule_note = f"\n\nThe file moved, but the rule could not be saved: {exc}"
-        messagebox.showinfo("Needs Review", f"Moved to:\n{target}{rule_note}")
-        self._refresh_review_queue()
+        self.review_status_var.set("Preparing approval preview…")
+        def prepare(cancel):
+            index = ManifestIndex([root], cancel=cancel)
+            originals = {item: index.original_source(item) for item in items}
+            groups = {}
+            if remember:
+                if rules_path.exists():
+                    load_rule_set(rules_path)
+                for item, original in originals.items():
+                    groups.setdefault(review_rule_key(original, criterion), []).append(item)
+            return originals, groups
+        def prepared(result, error):
+            if error:
+                messagebox.showerror("Approval preview", error)
+                return
+            originals, groups = result
+            preview = "\n".join(f"{item.name} → {destination}/{item.name}" for item in items[:12])
+            if len(items) > 12:
+                preview += f"\n…and {len(items) - 12} more selected files"
+            if remember:
+                preview += "\n\nRules to remember:\n" + "\n".join(f"{criterion}: {key} → {destination} ({len(group)} files)" for key, group in list(groups.items())[:12])
+                if len(groups) > 12:
+                    preview += f"\n…and {len(groups) - 12} more rule groups"
+            preview += "\n\nExisting names are preserved with numbered alternatives. Recovery backups will be created."
+            if not messagebox.askyesno(f"Approve {len(items)} files", preview):
+                return
+            self.review_status_var.set(f"Approving {len(items)} files…")
+            def approve(cancel):
+                moved, errors, remembered = [], [], set()
+                for item in items:
+                    if cancel.is_set():
+                        break
+                    try:
+                        target, _ = approve_review_item(root, item, destination)
+                        moved.append(target)
+                    except (OSError, ValueError) as exc:
+                        errors.append(f"{item.name}: {exc}")
+                        continue
+                    if remember:
+                        key = review_rule_key(originals[item], criterion)
+                        if key not in remembered:
+                            try:
+                                append_rule_for_review_choice(rules_path, source=originals[item], destination=destination, criterion=criterion)
+                                remembered.add(key)
+                            except (OSError, ValueError) as exc:
+                                errors.append(f"Rule for {item.name}: {exc}")
+                return moved, errors, remembered
+            def approved(result, error):
+                if error:
+                    messagebox.showerror("Needs Review", error)
+                else:
+                    moved, errors, remembered = result
+                    self._review_selected_paths = {path for path in self._review_selected_paths if path.exists()}
+                    if remembered:
+                        self.rules_file_var.set(str(rules_path))
+                        self.unmatched_mode_var.set(FALLBACK_NEEDS_REVIEW)
+                    messagebox.showinfo("Review complete", f"Approved {len(moved)} of {len(items)} files; saved {len(remembered)} rules." + ("\n\n" + "\n".join(errors[:10]) if errors else ""))
+                self._refresh_review_queue()
+                self._refresh_history()
+            self._background("review-approve", approve, approved)
+        self._background("review-prepare", prepare, prepared)
 
     def _reveal_review_selected(self) -> None:
         item = self._selected_review_item()
@@ -1390,27 +1604,56 @@ class CommandCenterApp:
         self.undo_history_button.pack(side="left", padx=(8, 0))
 
     def _refresh_history(self) -> None:
-        self._history_records = read_history(200)
-        for item in self.history_tree.get_children():
-            self.history_tree.delete(item)
-        for idx, rec in enumerate(self._history_records):
-            path = Path(str(rec.get("path", ""))).expanduser()
-            manifest = str(rec.get("backup_manifest") or "")
-            undo = "Undo available" if manifest and Path(manifest).is_file() else "Not available"
-            self.history_tree.insert(
-                "",
-                "end",
-                iid=f"history-{idx}",
-                values=(
-                    _display_time(rec.get("ts")),
-                    path.name or "—",
-                    "Success" if rec.get("ok") else "Failed",
-                    self._history_summary(rec),
-                    undo,
-                ),
-            )
-        self.history_status_var.set(f"{len(self._history_records)} recent run{'s' if len(self._history_records) != 1 else ''}")
-        self.undo_history_button.configure(state="disabled")
+        roots = [normalize_folder_input(job.path) for job in self.schedule_panel.cfg.folders]
+        if self.path_var.get().strip():
+            roots.append(normalize_folder_input(self.path_var.get()))
+        if self.review_root_var.get().strip():
+            roots.append(normalize_folder_input(self.review_root_var.get()))
+        self.history_status_var.set("Loading history and recovery records…")
+        def load(cancel):
+            records = read_history(200)
+            known = {record.get("backup_manifest") for record in records}
+            for root in dict.fromkeys(roots):
+                for path in list_manifests(root, limit=100):
+                    if cancel.is_set():
+                        return records
+                    if str(path) in known:
+                        continue
+                    try:
+                        data = read_manifest_data(path)
+                    except (OSError, ValueError):
+                        continue
+                    incomplete = data.get("status") in {"in-progress", "interrupted", "failed"}
+                    records.append({"path": str(root), "ts": data.get("created_at"),
+                                    "ok": not incomplete, "recovery_pending": incomplete,
+                                    "still_running": is_manifest_active(path),
+                                    "label": data.get("mode", "recovered history"),
+                                    "files_moved": len(data.get("file_moves", [])),
+                                    "backup_manifest": str(path),
+                                    "error": "Unfinished run: recovery available" if incomplete else None})
+            for record in records:
+                manifest = record.get("backup_manifest")
+                record["recoverable"] = bool(manifest and Path(str(manifest)).is_file())
+                if record["recoverable"]:
+                    record["still_running"] = is_manifest_active(Path(str(manifest)))
+            return sorted(records, key=lambda record: str(record.get("ts") or ""), reverse=True)[:300]
+        def finish(records, error):
+            if error:
+                self.history_status_var.set(f"Could not load history: {error}")
+                return
+            self._history_records = records
+            for item in self.history_tree.get_children():
+                self.history_tree.delete(item)
+            for idx, rec in enumerate(records):
+                path = Path(str(rec.get("path", ""))).expanduser()
+                self.history_tree.insert("", "end", iid=f"history-{idx}", values=(
+                    _display_time(rec.get("ts")), path.name or "—",
+                    "Running" if rec.get("still_running") else "Recovery pending" if rec.get("recovery_pending") else "Success" if rec.get("ok") else "Failed",
+                    self._history_summary(rec), "Running" if rec.get("still_running") else "Undo available" if rec.get("recoverable") else "Not available"))
+            pending = sum(bool(rec.get("recovery_pending")) for rec in records)
+            self.history_status_var.set(f"{len(records)} recent runs · {pending} unfinished runs with recovery records")
+            self.undo_history_button.configure(state="disabled")
+        self._background("history", load, finish)
 
     @staticmethod
     def _history_summary(rec: dict) -> str:
@@ -1446,7 +1689,7 @@ class CommandCenterApp:
             self.undo_history_button.configure(state="disabled")
             return
         manifest = str(rec.get("backup_manifest") or "")
-        self.undo_history_button.configure(state="normal" if manifest and Path(manifest).is_file() else "disabled")
+        self.undo_history_button.configure(state="normal" if manifest and not rec.get("still_running") and Path(manifest).is_file() else "disabled")
 
     def _undo_selected_history(self) -> None:
         selection = self.history_tree.selection()
@@ -1481,6 +1724,7 @@ class CommandCenterApp:
         ttk.Entry(chooser, textvariable=self.safety_root_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
         ttk.Button(chooser, text="Choose…", command=lambda: self._browse(self.safety_root_var, "Choose organizer root")).grid(row=0, column=2)
         ttk.Button(chooser, text="Refresh", command=self._refresh_safety_center).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(chooser, text="Cancel scan", command=lambda: self._cancel_scan("safety")).grid(row=0, column=4, padx=(8, 0))
         ttk.Label(chooser, textvariable=self.safety_status_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         ttk.Label(page, text="Held items", style="SectionTitle.TLabel").grid(row=3, column=0, sticky="w", pady=(18, 8))
@@ -1531,35 +1775,43 @@ class CommandCenterApp:
             self.safety_root_var.set(self.schedule_panel.cfg.folders[0].path)
 
     def _refresh_safety_center(self) -> None:
+        selected_path = None
+        selection = self.safety_tree.selection()
+        if selection:
+            try:
+                selected_path = self._safety_items[int(selection[0].split("-")[-1])].path
+            except (ValueError, IndexError):
+                pass
         for row in self.safety_tree.get_children():
             self.safety_tree.delete(row)
         raw = self.safety_root_var.get().strip()
-        if raw:
-            roots = [normalize_folder_input(raw)]
-        else:
-            roots = [normalize_folder_input(job.path) for job in self.schedule_panel.cfg.folders]
-        self._safety_items = scan_safety_items(roots)
-        total_files = sum(item.files for item in self._safety_items)
-        total_size = sum(item.size_bytes for item in self._safety_items)
-        for index, item in enumerate(self._safety_items):
-            recovery = "Available" if manifest_for_item(item) else "Not found"
-            self.safety_tree.insert(
-                "",
-                "end",
-                iid=f"safety-{index}",
-                values=(
-                    item.container,
-                    item.path.name,
-                    _short_path(str(item.base), 38),
-                    item.files,
-                    _human_size(item.size_bytes),
-                    item.display_modified,
-                    recovery,
-                ),
-            )
-        self.safety_status_var.set(
-            f"{len(self._safety_items)} held item{'s' if len(self._safety_items) != 1 else ''} · {total_files} file{'s' if total_files != 1 else ''} · {_human_size(total_size)}"
-        )
+        roots = [normalize_folder_input(raw)] if raw else [normalize_folder_input(job.path) for job in self.schedule_panel.cfg.folders]
+        self._safety_items = []
+        self.safety_status_var.set("Scanning held items and recovery records…")
+        def scan(cancel):
+            items = scan_safety_items(roots, cancel=cancel)
+            index = ManifestIndex(roots, cancel=cancel)
+            return items, index, [bool(index.manifest_for(item.path)) for item in items]
+        def finish(result, error):
+            if raw != self.safety_root_var.get().strip():
+                self.safety_status_var.set("Folder changed. Refresh to load its held items.")
+                return
+            if error:
+                self.safety_status_var.set(f"Scan failed: {error}")
+                return
+            items, self._safety_manifest_index, recoverable = result
+            self._safety_items = items
+            total_files = sum(item.files for item in items)
+            total_size = sum(item.size_bytes for item in items)
+            for n, item in enumerate(items):
+                self.safety_tree.insert("", "end", iid=f"safety-{n}", values=(
+                    item.container, item.path.name, _short_path(str(item.base), 38), item.files,
+                    _human_size(item.size_bytes), item.display_modified,
+                    "Available" if recoverable[n] else "Not found"))
+                if item.path == selected_path:
+                    self.safety_tree.selection_set(f"safety-{n}")
+            self.safety_status_var.set(f"{len(items)} held items · {total_files} files · {_human_size(total_size)}" + (" · first 1,000 items shown" if len(items) == 1000 else ""))
+        self._background("safety", scan, finish)
 
     def _selected_safety_item(self) -> Optional[SafetyItem]:
         selection = self.safety_tree.selection()
@@ -1580,7 +1832,7 @@ class CommandCenterApp:
         item = self._selected_safety_item()
         if item is None:
             return
-        manifest = manifest_for_item(item)
+        manifest = manifest_for_item(item, self._safety_manifest_index)
         if manifest is None:
             messagebox.showinfo("Recovery unavailable", "No recovery manifest was found for this item.")
             return
@@ -1589,9 +1841,7 @@ class CommandCenterApp:
             f"Restore the full run associated with:\n{item.path.name}\n\nBackup: {manifest.name}\n\nExisting files will not be overwritten.",
         ):
             return
-        ok, message = restore_item_run(item)
-        messagebox.showinfo("Restore complete" if ok else "Restore failed", message)
-        self._refresh_safety_center()
+        self._start_jobs([("Restore held items", [sys.executable, str(_restore_script()), str(manifest)])], "restore")
 
     def _trash_safety_selected(self) -> None:
         item = self._selected_safety_item()
@@ -1602,9 +1852,11 @@ class CommandCenterApp:
             f"Move this held item to the macOS Trash?\n\n{item.path}\n\nIt will not be permanently deleted.",
         ):
             return
-        ok, message = move_to_trash(item.path)
-        messagebox.showinfo("Moved to Trash" if ok else "Trash failed", message)
-        self._refresh_safety_center()
+        def finish(result, error):
+            ok, message = result if not error else (False, error)
+            messagebox.showinfo("Moved to Trash" if ok else "Trash failed", message)
+            self._refresh_safety_center()
+        self._background("trash", lambda _cancel: move_to_trash(item.path), finish)
 
     def _dedupe_safety_selected(self) -> None:
         item = self._selected_safety_item()
@@ -1612,17 +1864,11 @@ class CommandCenterApp:
             return
         self.safety_status_var.set("Opening Dedupe and handing off the selected item…")
 
-        def work() -> None:
-            ok, message = handoff_to_dedupe([item.path])
-            self.root.after(
-                0,
-                lambda: (
-                    self.safety_status_var.set(message),
-                    messagebox.showinfo("Dedupe" if ok else "Dedupe handoff failed", message),
-                ),
-            )
-
-        threading.Thread(target=work, daemon=True).start()
+        def finish(result, error):
+            ok, message = result if not error else (False, error)
+            self.safety_status_var.set(message)
+            messagebox.showinfo("Dedupe" if ok else "Dedupe handoff failed", message)
+        self._background("dedupe", lambda _cancel: handoff_to_dedupe([item.path]), finish)
 
     # ------------------------------------------------------------------
     # Advanced settings and standalone rename
@@ -1867,35 +2113,63 @@ class CommandCenterApp:
             return
         self._cancel_requested = False
         self._active_target = target
+        self._job_generation += 1
+        request = self._preview_fingerprint() if target == "preview" else None
+        if target == "preview":
+            self._preview_request_fingerprint = request
+            self._last_preview_fingerprint = None
         self._set_busy(True)
-        self._worker = threading.Thread(target=self._worker_main, args=(jobs, target), daemon=True)
+        self._worker = threading.Thread(target=self._worker_main, args=(jobs, target, self._job_generation, request), daemon=True)
         self._worker.start()
         self.root.after(100, self._poll_queue)
 
-    def _worker_main(self, jobs: list[tuple[str, list[str]]], target: str) -> None:
+    def _worker_main(self, jobs: list[tuple[str, list[str]]], target: str, generation: int, request) -> None:
         results: list[dict] = []
         for label, cmd in jobs:
             if self._cancel_requested:
                 break
             self._out_queue.put(("command", label, cmd))
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(os.environ, FILE_ORG_PROGRESS="1"))
             except OSError as exc:
                 results.append({"label": label, "stdout": "", "stderr": str(exc), "returncode": 1})
                 continue
             self._active_proc = proc
-            try:
-                stdout, stderr = proc.communicate(timeout=3600)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-                stderr = (stderr + "\nTimed out after 1 hour.").strip()
-            finally:
-                self._active_proc = None
+            output, errors = [], []
+            def read_output():
+                for line in proc.stdout:
+                    output.append(line)
+            def read_errors():
+                for line in proc.stderr:
+                    errors.append(line)
+                    self._out_queue.put(("progress", label, line.rstrip()))
+            readers = [threading.Thread(target=read_output, daemon=True), threading.Thread(target=read_errors, daemon=True)]
+            for reader in readers:
+                reader.start()
+            started = time.monotonic()
+            last_update = 0.0
+            timed_out = False
+            while proc.poll() is None:
+                elapsed = time.monotonic() - started
+                if elapsed - last_update >= 1:
+                    self._out_queue.put(("elapsed", label, int(elapsed)))
+                    last_update = elapsed
+                if elapsed > 3600 and not timed_out:
+                    proc.terminate()
+                    timed_out = True
+                if elapsed > 3610:
+                    proc.kill()
+                time.sleep(0.1)
+            for reader in readers:
+                reader.join()
+            stdout, stderr = "".join(output), "".join(errors)
+            if timed_out:
+                stderr += "\nTimed out after 1 hour."
+            self._active_proc = None
             result = {"label": label, "stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
             results.append(result)
             self._out_queue.put(("result", result))
-        self._out_queue.put(("done", target, results))
+        self._out_queue.put(("done", target, results, generation, request))
 
     def _poll_queue(self) -> None:
         try:
@@ -1905,6 +2179,19 @@ class CommandCenterApp:
                 if kind == "command":
                     _kind, label, cmd = item
                     self._append_details(f"\n--- {label} ---\n$ {' '.join(cmd)}\n\n")
+                elif kind == "elapsed":
+                    if not self._cancel_requested:
+                        self.preview_subtitle_var.set(f"{item[1]} · {self._phase_by_label.get(item[1], 'Working')} · {item[2]}s")
+                elif kind == "progress":
+                    text = item[2]
+                    try:
+                        event = json.loads(text)
+                        text = str(event.get("phase") or event.get("message") or text)
+                    except ValueError:
+                        pass
+                    self._phase_by_label[item[1]] = text
+                    if not self._cancel_requested:
+                        self.preview_subtitle_var.set(f"{item[1]} · {text}")
                 elif kind == "result":
                     result = item[1]
                     if result["stderr"]:
@@ -1912,7 +2199,11 @@ class CommandCenterApp:
                     if result["stdout"]:
                         self._append_details(result["stdout"].rstrip() + "\n")
                 elif kind == "done":
-                    _kind, target, results = item
+                    _kind, target, results, generation, request = item
+                    if generation != self._job_generation:
+                        continue
+                    if target == "preview":
+                        self._preview_request_fingerprint = request
                     self._set_busy(False)
                     self._handle_job_done(target, results)
                     return
@@ -1922,7 +2213,9 @@ class CommandCenterApp:
 
     def _handle_job_done(self, target: str, results: list[dict]) -> None:
         if self._cancel_requested:
-            self.preview_subtitle_var.set("Cancelled. No additional changes will be started.")
+            self.preview_subtitle_var.set("Stopped. Open History to recover any completed changes.")
+            self._last_preview_fingerprint = None
+            self._refresh_history()
             return
         if target == "preview":
             self._handle_preview_results(results)
@@ -1951,6 +2244,11 @@ class CommandCenterApp:
         return value if isinstance(value, dict) else None
 
     def _handle_preview_results(self, results: list[dict]) -> None:
+        request = self._preview_request_fingerprint
+        if request is None or request != self._preview_fingerprint():
+            self._invalidate_preview()
+            self.preview_subtitle_var.set("Settings or rules changed during the scan. Preview again before organizing.")
+            return
         if any(r["returncode"] != 0 for r in results):
             self.preview_title_var.set("Preview failed")
             self.preview_subtitle_var.set("No files were changed. Open Advanced settings for details.")
@@ -2008,7 +2306,7 @@ class CommandCenterApp:
         if not planned:
             self.planned_tree.insert("", "end", values=("No file moves needed", "Folder is already organized", ""))
 
-        self._last_preview_fingerprint = self._preview_fingerprint()
+        self._last_preview_fingerprint = request
         state = "normal" if self._preview_change_count > 0 else "disabled"
         self.organize_button.configure(state=state, text=f"Organize {moved} file{'s' if moved != 1 else ''}")
 
@@ -2068,6 +2366,7 @@ class CommandCenterApp:
 
     def _cancel(self) -> None:
         self._cancel_requested = True
+        self.preview_subtitle_var.set("Stopping after the current operation; recovery is being saved…")
         proc = self._active_proc
         if proc is not None and proc.poll() is None:
             try:
@@ -2080,6 +2379,9 @@ class CommandCenterApp:
         self.details_out.see("end")
 
     def _on_close(self) -> None:
+        self._closed = True
+        for event in self._background_tasks.values():
+            event.set()
         self._cancel()
         self.schedule_panel.shutdown()
         self.root.destroy()

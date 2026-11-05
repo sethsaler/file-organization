@@ -7,13 +7,16 @@ import argparse
 import json
 import os
 import random
+import signal
 import re
 import string
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+from org_manifest import RecoveryJournal
+from org_exclude import merge_exclude_patterns, should_skip_traverse_dir
 
 # Pattern to detect randomly renamed files: 16 alphanumeric characters before extension
 RANDOM_NAME_PATTERN = re.compile(r'^[A-Za-z0-9]{16}\.[^.]+$')
@@ -35,6 +38,7 @@ class RandomRenamer:
         dry_run: bool = False,
         verbose: bool = False,
         skip_randomly_renamed: bool = False,
+        exclude_patterns: Optional[List[str]] = None,
     ) -> None:
         self.base = base
         self.recursive = recursive
@@ -42,6 +46,9 @@ class RandomRenamer:
         self.dry_run = dry_run
         self.verbose = verbose
         self.skip_randomly_renamed = skip_randomly_renamed
+        self.exclude_patterns = exclude_patterns or []
+        self.cancel_requested = False
+        self._journal = None
         self.stats = RenameStats()
         self.used_names: Set[str] = set()
         self.renames: List[Dict[str, str]] = []
@@ -66,6 +73,8 @@ class RandomRenamer:
 
     def _rename_file(self, src: Path) -> None:
         """Rename a single file with a random name."""
+        if self.cancel_requested:
+            raise KeyboardInterrupt()
         try:
             # Skip if not a file
             if not src.is_file():
@@ -90,7 +99,9 @@ class RandomRenamer:
                 return
 
             if not self.dry_run:
-                src.rename(dest)
+                if self._journal is None:
+                    self._journal = RecoveryJournal(self.base, mode="random-rename")
+                dest = self._journal.move(src, dest)
 
             self.renames.append({
                 "from": str(src),
@@ -114,8 +125,11 @@ class RandomRenamer:
 
         if self.recursive:
             # Walk through all subdirectories
-            for root, dirs, files in os.walk(self.base, topdown=False):
+            for root, dirs, files in os.walk(self.base, topdown=True, followlinks=False):
                 root_path = Path(root)
+                protected = {".organizer", "for deletion", "needs review", "duplicates"}
+                dirs[:] = [d for d in dirs if d.casefold() not in protected and not (root_path / d).is_symlink()
+                           and not should_skip_traverse_dir(root_path, d, self.base, self.exclude_patterns)]
 
                 if not self.include_hidden:
                     dirs[:] = [d for d in dirs if self._visible_name(d)]
@@ -150,30 +164,7 @@ class RandomRenamer:
         if self.dry_run:
             return None
 
-        from org_manifest import ORGANIZER_DIR_NAME
-
-        manifest = {
-            "created_at": datetime.now().isoformat(),
-            "base_path": str(self.base),
-            "operation": "random_rename",
-            "recursive": self.recursive,
-            "include_hidden": self.include_hidden,
-            "renames": self.renames,
-        }
-
-        organizer_dir = self.base / ORGANIZER_DIR_NAME
-        if not organizer_dir.exists():
-            organizer_dir.mkdir(parents=True, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        manifest_path = organizer_dir / f"random_rename_manifest_{timestamp}.json"
-
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-
-        return {
-            "manifest": str(manifest_path),
-        }
+        return self._journal.finish(status="failed" if self.stats.errors else "complete") if self._journal else None
 
 
 def parse_args() -> argparse.Namespace:
@@ -187,6 +178,8 @@ def parse_args() -> argparse.Namespace:
     hidden_group.set_defaults(include_hidden=True)
     hidden_group.add_argument("--include-hidden", dest="include_hidden", action="store_true", help="Include hidden files (default)")
     hidden_group.add_argument("--no-include-hidden", dest="include_hidden", action="store_false", help="Exclude dotfiles")
+    parser.add_argument("--exclude", action="append", default=[])
+    parser.add_argument("--exclude-defaults", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing")
     parser.add_argument("--verbose", action="store_true", help="Progress messages on stderr")
     parser.add_argument("--skip-randomly-renamed", action="store_true", help="Skip files that appear to be already randomly renamed (16-char alphanumeric filenames)")
@@ -208,8 +201,18 @@ def main() -> None:
         dry_run=args.dry_run,
         verbose=args.verbose,
         skip_randomly_renamed=args.skip_randomly_renamed,
+        exclude_patterns=merge_exclude_patterns(args.exclude, use_defaults=args.exclude_defaults),
     )
-    result = renamer.run()
+    def cancel(_signum, _frame):
+        renamer.cancel_requested = True
+    signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGINT, cancel)
+    try:
+        result = renamer.run()
+    except KeyboardInterrupt:
+        recovery = renamer._journal.finish(status="interrupted") if renamer._journal else {}
+        print(json.dumps({"cancelled": True, "backup_manifest": recovery.get("manifest")}))
+        sys.exit(1)
     print(json.dumps(result, indent=2))
 
 

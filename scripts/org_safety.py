@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -18,11 +17,10 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 from org_manifest import (
     FOR_DELETION_DIR_NAME,
-    Manifest,
-    ManifestEntry,
+    RecoveryJournal,
     list_manifests,
     restore_from_manifest,
-    write_manifest_files,
+    read_manifest_data,
 )
 from org_rules import NEEDS_REVIEW_DIR_NAME
 
@@ -49,7 +47,7 @@ class SafetyItem:
             return "Unknown"
 
 
-def _measure(path: Path) -> Tuple[int, int, float]:
+def _measure(path: Path, cancel=None) -> Tuple[int, int, float]:
     files = 0
     size = 0
     modified = 0.0
@@ -61,6 +59,8 @@ def _measure(path: Path) -> Tuple[int, int, float]:
     if path.is_file() and not path.is_symlink():
         return 1, max(0, initial.st_size), modified
     for root, dirs, names in os.walk(path, followlinks=False):
+        if cancel is not None and cancel.is_set():
+            break
         root_path = Path(root)
         dirs[:] = [name for name in dirs if not (root_path / name).is_symlink()]
         for name in names:
@@ -76,7 +76,7 @@ def _measure(path: Path) -> Tuple[int, int, float]:
     return files, size, modified
 
 
-def scan_safety_items(roots: Iterable[Path], *, limit: int = 1000) -> List[SafetyItem]:
+def scan_safety_items(roots: Iterable[Path], *, limit: int = 1000, cancel=None) -> List[SafetyItem]:
     items: List[SafetyItem] = []
     seen = set()
     for raw_root in roots:
@@ -96,7 +96,9 @@ def scan_safety_items(roots: Iterable[Path], *, limit: int = 1000) -> List[Safet
             except OSError:
                 continue
             for child in children:
-                files, size, modified = _measure(child)
+                if cancel is not None and cancel.is_set():
+                    return items
+                files, size, modified = _measure(child, cancel)
                 items.append(
                     SafetyItem(
                         base=root,
@@ -175,46 +177,51 @@ def _entry_absolute(base: Path, value: str) -> Path:
     return candidate if candidate.is_absolute() else base / candidate
 
 
-def manifest_for_item(item: SafetyItem) -> Optional[Path]:
-    """Newest backup manifest whose destination contains the selected item."""
-    for manifest_path in list_manifests(item.base, limit=100):
-        try:
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        base = Path(str(data.get("base_path") or item.base)).expanduser()
-        for group in ("file_moves", "empty_dir_moves"):
-            for entry in data.get(group, []):
-                if not isinstance(entry, dict):
-                    continue
+class ManifestIndex:
+    """Read each manifest once and index recovery by destination and ancestor."""
+
+    def __init__(self, roots: Iterable[Path], *, cancel=None):
+        self.destinations = {}
+        self.sources = {}
+        for root in dict.fromkeys(Path(p).expanduser().resolve() for p in roots):
+            for rank, path in enumerate(list_manifests(root, limit=100)):
+                if cancel is not None and cancel.is_set():
+                    return
                 try:
-                    destination = _entry_absolute(base, str(entry.get("to") or "")).resolve()
-                except OSError:
+                    data = read_manifest_data(path)
+                except (OSError, ValueError):
                     continue
-                if destination == item.path or item.path in destination.parents or destination in item.path.parents:
-                    return manifest_path
-    return None
+                base = Path(str(data.get("base_path") or root)).expanduser()
+                for group in ("file_moves", "empty_dir_moves"):
+                    for entry in data.get(group, []):
+                        if not isinstance(entry, dict) or not entry.get("to"):
+                            continue
+                        try:
+                            destination = _entry_absolute(base, str(entry["to"])).resolve()
+                            source = _entry_absolute(base, str(entry.get("from") or destination.name))
+                        except OSError:
+                            continue
+                        self.sources.setdefault(destination, source)
+                        for ancestor in (destination, *destination.parents):
+                            if ancestor == base or ancestor == ancestor.parent:
+                                break
+                            self.destinations.setdefault(ancestor, (rank, path))
+
+    def manifest_for(self, path: Path) -> Optional[Path]:
+        path = path.expanduser().resolve()
+        candidates = [self.destinations[p] for p in (path, *path.parents) if p in self.destinations]
+        return min(candidates, key=lambda value: value[0])[1] if candidates else None
+
+    def original_source(self, path: Path) -> Path:
+        return self.sources.get(path.expanduser().resolve(), path)
 
 
-def original_source_for_review(base: Path, review_item: Path) -> Path:
-    target = review_item.expanduser().resolve()
-    for manifest_path in list_manifests(base, limit=100):
-        try:
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        manifest_base = Path(str(data.get("base_path") or base)).expanduser()
-        for entry in data.get("file_moves", []):
-            if not isinstance(entry, dict):
-                continue
-            destination = _entry_absolute(manifest_base, str(entry.get("to") or ""))
-            try:
-                same = destination.resolve() == target
-            except OSError:
-                same = destination == target
-            if same:
-                return _entry_absolute(manifest_base, str(entry.get("from") or review_item.name))
-    return review_item
+def manifest_for_item(item: SafetyItem, index: Optional[ManifestIndex] = None) -> Optional[Path]:
+    return (index or ManifestIndex([item.base])).manifest_for(item.path)
+
+
+def original_source_for_review(base: Path, review_item: Path, index: Optional[ManifestIndex] = None) -> Path:
+    return (index or ManifestIndex([base])).original_source(review_item)
 
 
 def approve_review_item(base: Path, item_path: Path, destination: str) -> Tuple[Path, Optional[str]]:
@@ -230,33 +237,9 @@ def approve_review_item(base: Path, item_path: Path, destination: str) -> Tuple[
     if root != destination_dir and root not in destination_dir.parents:
         raise ValueError("Destination escapes the organizer root")
     destination_dir.mkdir(parents=True, exist_ok=True)
-    target = destination_dir / item.name
-    index = 1
-    while target.exists():
-        target = destination_dir / f"{item.stem}_{index}{item.suffix}"
-        index += 1
-    shutil.move(str(item), str(target))
-    manifest = Manifest(
-        created_at=datetime.now().isoformat(),
-        base_path=str(root),
-        mode="review",
-        strategy="approved",
-        normalize="none",
-        profile="review-queue",
-        file_moves=[
-            ManifestEntry(
-                from_path=str(item.relative_to(root)),
-                to_path=str(target.relative_to(root)),
-            )
-        ],
-    )
-    info = write_manifest_files(
-        root,
-        manifest,
-        helper_script=Path(__file__).resolve().parent / "organize_by_filetype.py",
-        dry_run=False,
-        create_backup=True,
-    )
+    journal = RecoveryJournal(root, mode="review", strategy="approved", profile="review-queue")
+    target = journal.move(item, destination_dir / item.name)
+    info = journal.finish()
     return target, info.get("manifest") if info else None
 
 
